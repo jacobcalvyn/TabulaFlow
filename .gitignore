@@ -1,0 +1,18 @@
+node_modules/
+dist/
+coverage/
+.vite/
+
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+
+# Local prototype instructions and visual QA artifacts
+/AGENTS.md
+/design-qa.md
+/audit-ux-*/
+/comparison-*.png
+/implementation-*.png
+/source-normalized.png
