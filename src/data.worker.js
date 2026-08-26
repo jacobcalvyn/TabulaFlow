@@ -1,8 +1,5 @@
 import * as duckdb from "@duckdb/duckdb-wasm";
-import duckdbMvpWasm from "@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url";
-import duckdbMvpWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url";
-import duckdbEhWasm from "@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url";
-import duckdbEhWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url";
+import { DUCKDB_BUNDLES } from "@duckdb-bundles";
 import Papa from "papaparse";
 import { DATA_LIMITS, makeDemoRows, normalizeEmptyValues, parseDataFile, prepareSpreadsheetData } from "./data.js";
 import { compileRecipe, compileRecipeSafely, INTERNAL_ROW_ID } from "./transformations.js";
@@ -10,11 +7,6 @@ import { compileRecipe, compileRecipeSafely, INTERNAL_ROW_ID } from "./transform
 const AGGREGATE_LIMIT = 100;
 const SOURCE_TABLE = "source_data";
 const WORKING_VIEW = "working_data";
-const DUCKDB_BUNDLES = {
-  mvp: { mainModule: duckdbMvpWasm, mainWorker: duckdbMvpWorker },
-  eh: { mainModule: duckdbEhWasm, mainWorker: duckdbEhWorker },
-};
-
 let databasePromise = null;
 let database = null;
 let connection = null;
@@ -62,7 +54,7 @@ async function initializeDuckDB() {
     databasePromise = (async () => {
       try {
         const bundle = await duckdb.selectBundle(DUCKDB_BUNDLES);
-        engineWorker = new Worker(bundle.mainWorker);
+        engineWorker = await duckdb.createWorker(bundle.mainWorker);
         database = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), engineWorker);
         await database.instantiate(bundle.mainModule, bundle.pthreadWorker);
         engineVersion = await database.getVersion();
