@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "preview": "vite preview",
-    "test": "node --test tests/data.test.mjs tests/transformations.test.mjs tests/recipe-history.test.mjs tests/filter-state.test.mjs tests/sites-worker.test.mjs",
+    "test": "node --test tests/data.test.mjs tests/import-export-integration.test.mjs tests/transformations.test.mjs tests/recipe-history.test.mjs tests/filter-state.test.mjs tests/flow-model.test.mjs tests/compose-sql.test.mjs tests/source-file-handles.test.mjs tests/clean-build-catalog.test.mjs tests/recipe-storage.test.mjs tests/worker-recovery.test.mjs tests/prepared-activation.test.mjs tests/sites-worker.test.mjs",
     "test:sites": "node --test tests/sites-worker.test.mjs"
   },
   "dependencies": {
@@ -16,6 +16,7 @@
     "papaparse": "^5.7.0",
     "react": "19.2.0",
     "react-dom": "19.2.0",
+    "react-icons": "^5.7.0",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {

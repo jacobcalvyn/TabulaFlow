@@ -7,6 +7,8 @@ import {
   createStep,
   getStepLabel,
   summarizeStep,
+  transformationParamsAreComplete,
+  valueRowActionParams,
 } from "../src/transformations.js";
 
 function step(id, type, params, enabled = true) {
@@ -92,6 +94,69 @@ test("supports lowercase, uppercase, and title case normalization", () => {
     () => compileRecipe([step("invalid", "standardize-case", { column: "name", mode: "sentence" })], ["name"]),
     /Format huruf tidak didukung/,
   );
+});
+
+test("delete rows removes matching values while preserving unknown predicates", () => {
+  const result = compileRecipe([
+    step("delete", "delete-rows", { column: "status", operator: "equals", value: "cancelled" }),
+  ], ["status", "amount"]);
+
+  assert.deepEqual(result.columns, ["status", "amount"]);
+  assert.match(result.sql, /WHERE NOT COALESCE\(\(CAST\("status" AS VARCHAR\) = 'cancelled'\), FALSE\)/);
+});
+
+test("value-row actions create exact null-safe delete conditions", () => {
+  assert.deepEqual(valueRowActionParams("delete", "status", "cancelled"), {
+    column: "status",
+    operator: "equals",
+    value: "cancelled",
+    exactValue: true,
+    valueAction: "delete",
+  });
+  assert.deepEqual(valueRowActionParams("keep", "status", "paid"), {
+    column: "status",
+    operator: "not-equals",
+    value: "paid",
+    exactValue: true,
+    valueAction: "keep",
+    nullSafe: true,
+  });
+  assert.deepEqual(valueRowActionParams("delete", "status", null), {
+    column: "status",
+    operator: "is-null",
+    valueAction: "delete",
+  });
+  assert.deepEqual(valueRowActionParams("keep", "status", null), {
+    column: "status",
+    operator: "is-not-null",
+    valueAction: "keep",
+  });
+  assert.deepEqual(valueRowActionParams("keep", "status", ""), {
+    column: "status",
+    operator: "not-equals",
+    value: "",
+    exactValue: true,
+    valueAction: "keep",
+    nullSafe: true,
+  });
+  assert.equal(transformationParamsAreComplete("delete-rows", valueRowActionParams("keep", "status", "")), true);
+  assert.throws(() => valueRowActionParams("replace", "status", "paid"), /tidak didukung/);
+});
+
+test("keep value deletes every non-matching row including nulls", () => {
+  const result = compileRecipe([
+    step("keep", "delete-rows", valueRowActionParams("keep", "status", "paid")),
+  ], ["status"]);
+
+  assert.match(result.sql, /CAST\("status" AS VARCHAR\) IS DISTINCT FROM 'paid'/);
+});
+
+test("delete rows requires a comparison value unless the operator is self-contained", () => {
+  assert.equal(transformationParamsAreComplete("delete-rows", { operator: "equals", value: "" }), false);
+  assert.equal(transformationParamsAreComplete("delete-rows", { operator: "contains", value: "  " }), false);
+  assert.equal(transformationParamsAreComplete("delete-rows", { operator: "equals", value: "paid" }), true);
+  assert.equal(transformationParamsAreComplete("delete-rows", { operator: "is-null", value: "" }), true);
+  assert.equal(transformationParamsAreComplete("trim", {}), true);
 });
 
 test("keeps legacy step metadata while exposing only the current creation catalog", () => {

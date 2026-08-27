@@ -5,7 +5,6 @@ import {
   CaretDown,
   CaretLeft,
   CaretRight,
-  DownloadSimple,
   FileArrowUp,
   FileCsv,
   FileJs,
@@ -23,13 +22,56 @@ import { formatValue, isSupportedFile } from "./data.js";
 import { useDataWorker } from "./useDataWorker.js";
 import { StepsPanel, TransformationForm } from "./StepsPanel.jsx";
 import { useRecipeHistory } from "./useRecipeHistory.js";
-import { loadStoredRecipe, recipeStorageKey, saveStoredRecipe } from "./recipeStorage.js";
+import { fileFromDroppedItem, pickSourceFile, restoreFileFromHandle } from "./sourceFileHandles.js";
+import {
+  loadStoredFlow,
+  loadStoredSourceHandle,
+  deleteStoredSourceHandle,
+  saveStoredFlow,
+  saveStoredSourceHandle,
+} from "./recipeStorage.js";
 import { useI18n } from "./i18n.jsx";
-import { createStep, CREATABLE_TRANSFORMATION_TYPES, summarizeStep } from "./transformations.js";
+import { ComposeScreen } from "./ComposeScreen.jsx";
+import { activatePreparedForFlow } from "./preparedActivation.js";
+import {
+  PREPARED_RECIPE_STATUS,
+  recipeForExecution,
+} from "./preparedRecipeState.js";
+import { createStep, CREATABLE_TRANSFORMATION_TYPES, valueRowActionParams } from "./transformations.js";
+import {
+  addComposeNode,
+  addPreparedInput,
+  autoArrangeNodePositions,
+  createFlowGraph,
+  createPreparedInput,
+  createPreparedFromCompose,
+  collectDescendantNodeIds,
+  duplicatePreparedInput,
+  hydrateComposeSchemas,
+  isFlowFileSource,
+  markSourcesUnlinked,
+  matchesSourceReference,
+  removeBuiltInDemoData,
+  repairOverlappingNodePositions,
+  removeComposeNode,
+  removePreparedInput,
+  schemaFingerprint,
+  updateComposeNode,
+  updateNodePosition,
+  updatePreparedInput,
+  validateFlowGraph,
+} from "./flowModel.js";
 
 const ACCEPTED_FILES = ".xlsx,.xls,.csv,.json,.jsonl,.ndjson";
 const PREVIEW_ROW_HEIGHT = 36;
 const PREVIEW_OVERSCAN = 4;
+const PREVIEW_COLUMN_WIDTH = 150;
+const PREVIEW_COLUMN_OVERSCAN = 2;
+const FREQUENCY_ROW_HEIGHT = 34;
+const FREQUENCY_HEADER_HEIGHT = 32;
+const FREQUENCY_VALUE_OVERSCAN = 3;
+const FREQUENCY_CARD_GAP = 12;
+const FREQUENCY_CARD_OVERSCAN = 2;
 const AGGREGATE_SORT_MODES = Object.freeze([
   { value: "count-desc", labelKey: "sortCountDesc", token: "#↓" },
   { value: "value-asc", labelKey: "sortValueAsc", token: "A–Z" },
@@ -81,7 +123,7 @@ function FileTypeIcons() {
   );
 }
 
-function Sidebar({ screen, collapsed, hasDataset, onNavigate, onCollapse }) {
+function Sidebar({ screen, collapsed, hasDataset, hasPrepared, hasFlow, onNavigate, onCollapse }) {
   const { language, setLanguage, t } = useI18n();
   return (
     <aside className={`sidebar ${collapsed ? "sidebar--collapsed" : ""}`}>
@@ -95,9 +137,13 @@ function Sidebar({ screen, collapsed, hasDataset, onNavigate, onCollapse }) {
           <span className="step-dot"><FileArrowUp weight="bold" /></span>
           {!collapsed && <span>{t("source")}</span>}
         </button>
-        <button type="button" className={`step ${screen === "data" ? "step--active" : ""}`} onClick={() => onNavigate("data")} disabled={!hasDataset} aria-current={screen === "data" ? "page" : undefined} title={t("profileData")}>
+        <button type="button" className={`step ${screen === "data" ? "step--active" : ""}`} onClick={() => onNavigate("data")} disabled={!hasDataset && !hasPrepared} aria-current={screen === "data" ? "page" : undefined} title={t("profileData")}>
           <span className="step-dot"><Rows weight="bold" /></span>
           {!collapsed && <span>{t("profile")}</span>}
+        </button>
+        <button type="button" className={`step ${screen === "compose" ? "step--active" : ""}`} onClick={() => onNavigate("compose")} disabled={!hasFlow} aria-current={screen === "compose" ? "page" : undefined} title={t("composeData")}>
+          <span className="step-dot"><MagicWand weight="bold" /></span>
+          {!collapsed && <span>{t("compose")}</span>}
         </button>
       </nav>
 
@@ -114,7 +160,6 @@ function Sidebar({ screen, collapsed, hasDataset, onNavigate, onCollapse }) {
           <GlobeSimple weight="bold" />
           <span>{language === "en" ? t("english") : t("indonesian")}</span>
         </button>
-        <div id="sidebar-data-actions" className="sidebar-data-actions" />
       </div>
 
       <button className="collapse-button" type="button" onClick={onCollapse} aria-label={collapsed ? t("showSidebar") : t("hideSidebar")}>
@@ -125,15 +170,43 @@ function Sidebar({ screen, collapsed, hasDataset, onNavigate, onCollapse }) {
   );
 }
 
-function InputScreen({ file, loading, error, onFile, onDemo, workerReady, openedSources }) {
+function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, workerReady, openedSources }) {
   const { formatNumber, t } = useI18n();
   const inputRef = useRef(null);
+  const [relinkSourceId, setRelinkSourceId] = useState(null);
   const [dragging, setDragging] = useState(false);
 
-  const chooseFile = () => inputRef.current?.click();
-  const handleDrop = (event) => {
+  const chooseFile = async () => {
+    try {
+      const picked = await pickSourceFile();
+      if (!picked.supported) inputRef.current?.click();
+      else if (picked.selection) onFile(picked.selection.file, picked.selection.handle);
+    } catch {
+      inputRef.current?.click();
+    }
+  };
+  const chooseRelinkFile = async (sourceId) => {
+    try {
+      const picked = await pickSourceFile();
+      if (!picked.supported) {
+        setRelinkSourceId(sourceId);
+        inputRef.current?.click();
+      } else if (picked.selection) {
+        onRelinkSource(sourceId, picked.selection.file, picked.selection.handle);
+      }
+    } catch {
+      setRelinkSourceId(sourceId);
+      inputRef.current?.click();
+    }
+  };
+  const handleDrop = async (event) => {
     event.preventDefault();
     setDragging(false);
+    const handleSelection = await fileFromDroppedItem(event.dataTransfer.items?.[0]);
+    if (handleSelection) {
+      onFile(handleSelection.file, handleSelection.handle);
+      return;
+    }
     const dropped = event.dataTransfer.files?.[0];
     if (dropped) onFile(dropped);
   };
@@ -158,36 +231,29 @@ function InputScreen({ file, loading, error, onFile, onDemo, workerReady, opened
           ref={inputRef}
           type="file"
           accept={ACCEPTED_FILES}
-          onChange={(event) => event.target.files?.[0] && onFile(event.target.files[0])}
+          onChange={(event) => {
+            const nextFile = event.target.files?.[0];
+            if (nextFile) {
+              if (relinkSourceId) onRelinkSource(relinkSourceId, nextFile, null);
+              else onFile(nextFile, null);
+            }
+            setRelinkSourceId(null);
+            event.target.value = "";
+          }}
         />
         <span className="upload-symbol"><UploadSimple weight="duotone" /></span>
         <h2>{t("dragFile")}</h2>
         <p>{t("chooseFromDevice")}</p>
-        <button className="button button--secondary" type="button" onClick={chooseFile} disabled={!workerReady}>{t("chooseFile")}</button>
+        <button className="button button--secondary" type="button" onClick={chooseFile} disabled={!workerReady || loading}>{loading ? t("preparing") : t("chooseFile")}</button>
         <FileTypeIcons />
         <p className="format-copy">Excel · CSV · JSON · JSONL · NDJSON</p>
       </section>
 
-      {file && (
-        <section className="selected-file" aria-live="polite">
-          <span className="selected-file__icon"><FileArrowUp weight="duotone" /></span>
-          <div>
-            <strong>{file.name}</strong>
-            <span>{formatNumber(file.size)} byte</span>
-          </div>
-          <span className={`file-state ${error ? "file-state--error" : ""}`}>{loading ? t("preparing") : error ? t("failed") : t("ready")}</span>
-        </section>
-      )}
-
       {error && <p className="error-message" role="alert">{error}</p>}
-
-      <div className="input-actions">
-        <button className="button button--ghost" type="button" onClick={onDemo} disabled={!workerReady || loading}>{t("useDemo")}</button>
-      </div>
 
       <section className="opened-sources" aria-labelledby="opened-sources-title">
         <header>
-          <div>
+          <div className="file-heading__content">
             <h2 id="opened-sources-title">{t("openedFiles")}</h2>
             <p>{t("openedFilesDescription")}</p>
           </div>
@@ -196,16 +262,20 @@ function InputScreen({ file, loading, error, onFile, onDemo, workerReady, opened
         {openedSources.length > 0 ? (
           <ul>
             {openedSources.map((source) => (
-              <li key={source.key} className={source.active ? "opened-source--active" : ""}>
+              <li key={source.key}>
                 <span className="opened-source__icon"><FileArrowUp weight="duotone" /></span>
-                <div>
+                <button className="opened-source__main" type="button" onClick={() => onOpenSource(source.preparedId)} disabled={source.status !== "linked"}>
                   <strong title={source.name}>{source.name}</strong>
                   <span>
-                    {source.kind === "demo" ? t("builtInSample") : t("localDevice")}
+                    {source.kind === "compose" ? t("composeResult") : t("localDevice")}
                     {source.size !== null && source.size !== undefined ? ` · ${formatNumber(source.size)} byte` : ""}
                   </span>
-                </div>
-                {source.active && <span className="opened-source__status">{t("activeFile")}</span>}
+                </button>
+                {source.status !== "linked" && (
+                  <button className="opened-source__relink" type="button" disabled={loading || source.status === "restoring"} onClick={() => chooseRelinkFile(source.sourceAssetId)}>
+                    {source.status === "restoring" ? t("restoringSource") : t("relink")}
+                  </button>
+                )}
               </li>
             ))}
           </ul>
@@ -217,7 +287,7 @@ function InputScreen({ file, loading, error, onFile, onDemo, workerReady, opened
   );
 }
 
-function FrequencyTable({ aggregate, selectedKey, onSelect, onSearch, onTransform, onRename, onChangeType, onReplaceValue, transformOpen, transformUsed, filterSignature }) {
+function FrequencyTable({ aggregate, selectedKey, onSelect, onSearch, onTransform, onRename, onChangeType, onReplaceValue, onValueAction, transformOpen, transformUsed, filterSignature, style }) {
   const { formatNumber, language, t } = useI18n();
   const valueLocale = language === "id" ? "id-ID" : "en-US";
   const { column, type, values, distinctCount } = aggregate;
@@ -240,6 +310,9 @@ function FrequencyTable({ aggregate, selectedKey, onSelect, onSearch, onTransfor
   const [valueDraft, setValueDraft] = useState("");
   const [valueSaving, setValueSaving] = useState(false);
   const [valueError, setValueError] = useState("");
+  const [valueMenu, setValueMenu] = useState(null);
+  const [valueActionApplying, setValueActionApplying] = useState(false);
+  const [valueActionError, setValueActionError] = useState("");
   const rowClickTimerRef = useRef(null);
   const renameInputRef = useRef(null);
   const cancelRenameRef = useRef(false);
@@ -247,6 +320,11 @@ function FrequencyTable({ aggregate, selectedKey, onSelect, onSearch, onTransfor
   const typeMenuRef = useRef(null);
   const typeOptionRefs = useRef(new Map());
   const valueInputRef = useRef(null);
+  const valuesScrollRef = useRef(null);
+  const valueMenuRef = useRef(null);
+  const valueMenuTriggerRef = useRef(null);
+  const [valuesViewportHeight, setValuesViewportHeight] = useState(240);
+  const [valuesScrollTop, setValuesScrollTop] = useState(0);
   const cancelValueEditRef = useRef(false);
   const valueEditing = editingValueKey !== null;
   const inlineEditing = typeEditing || valueEditing;
@@ -258,6 +336,26 @@ function FrequencyTable({ aggregate, selectedKey, onSelect, onSearch, onTransfor
     if (sortMode === "value-desc") return next.sort((left, right) => compareLabel(right, left));
     return next.sort((left, right) => right.count - left.count || compareLabel(left, right));
   }, [displayValues, sortMode]);
+
+  useEffect(() => {
+    const element = valuesScrollRef.current;
+    if (!element) return undefined;
+    const observer = new ResizeObserver((entries) => setValuesViewportHeight(entries[0].contentRect.height));
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    setValuesScrollTop(0);
+    if (valuesScrollRef.current) valuesScrollRef.current.scrollTop = 0;
+  }, [column, query]);
+
+  const valueStart = Math.max(0, Math.floor(Math.max(0, valuesScrollTop - FREQUENCY_HEADER_HEIGHT) / FREQUENCY_ROW_HEIGHT) - FREQUENCY_VALUE_OVERSCAN);
+  const valueVisibleCount = Math.ceil(valuesViewportHeight / FREQUENCY_ROW_HEIGHT) + FREQUENCY_VALUE_OVERSCAN * 2;
+  const valueEnd = Math.min(sortedDisplayValues.length, valueStart + valueVisibleCount);
+  const visibleDisplayValues = sortedDisplayValues.slice(valueStart, valueEnd);
+  const valueTopSpace = valueStart * FREQUENCY_ROW_HEIGHT;
+  const valueBottomSpace = Math.max(0, (sortedDisplayValues.length - valueEnd) * FREQUENCY_ROW_HEIGHT);
 
   const activeSort = AGGREGATE_SORT_MODES.find((item) => item.value === sortMode) ?? AGGREGATE_SORT_MODES[0];
   const cycleSort = () => {
@@ -302,12 +400,45 @@ function FrequencyTable({ aggregate, selectedKey, onSelect, onSearch, onTransfor
     document.addEventListener("pointerdown", closeOnOutsideClick, true);
     document.addEventListener("keydown", closeOnEscape);
     window.addEventListener("resize", closeOnResize);
+    window.addEventListener("scroll", closeOnResize, true);
     return () => {
       document.removeEventListener("pointerdown", closeOnOutsideClick, true);
       document.removeEventListener("keydown", closeOnEscape);
       window.removeEventListener("resize", closeOnResize);
+      window.removeEventListener("scroll", closeOnResize, true);
     };
   }, [typeEditing]);
+
+  useEffect(() => {
+    if (!valueMenu) return undefined;
+    window.requestAnimationFrame(() => valueMenuRef.current?.querySelector("[role='menuitem']")?.focus());
+    const closeOnOutsideClick = (event) => {
+      if (valueMenuRef.current?.contains(event.target)) return;
+      setValueMenu(null);
+      setValueActionError("");
+    };
+    const closeOnEscape = (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setValueMenu(null);
+      setValueActionError("");
+      valueMenuTriggerRef.current?.focus();
+    };
+    const closeOnResize = () => {
+      setValueMenu(null);
+      setValueActionError("");
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick, true);
+    document.addEventListener("keydown", closeOnEscape);
+    window.addEventListener("resize", closeOnResize);
+    window.addEventListener("scroll", closeOnResize, true);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick, true);
+      document.removeEventListener("keydown", closeOnEscape);
+      window.removeEventListener("resize", closeOnResize);
+      window.removeEventListener("scroll", closeOnResize, true);
+    };
+  }, [valueMenu]);
 
   const startRename = () => {
     setRenameDraft(column);
@@ -428,6 +559,57 @@ function FrequencyTable({ aggregate, selectedKey, onSelect, onSearch, onTransfor
     }
   };
 
+  const openValueMenu = (event, item) => {
+    if (renaming || inlineEditing) return;
+    event.preventDefault();
+    event.stopPropagation();
+    window.clearTimeout(rowClickTimerRef.current);
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const menuWidth = 164;
+    const menuHeight = 86;
+    const pointerTriggered = event.type === "contextmenu" && event.clientX > 0;
+    const requestedLeft = pointerTriggered ? event.clientX : bounds.left + 12;
+    const requestedTop = pointerTriggered ? event.clientY : bounds.bottom - 4;
+    valueMenuTriggerRef.current = event.currentTarget;
+    setValueActionError("");
+    setValueMenu({
+      item,
+      left: Math.min(Math.max(8, requestedLeft), window.innerWidth - menuWidth - 8),
+      top: Math.min(Math.max(8, requestedTop), window.innerHeight - menuHeight - 8),
+      width: menuWidth,
+    });
+  };
+
+  const navigateValueMenu = (event) => {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const items = [...(valueMenuRef.current?.querySelectorAll("[role='menuitem']:not(:disabled)") ?? [])];
+    if (!items.length) return;
+    const currentIndex = items.indexOf(document.activeElement);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? items.length - 1
+        : event.key === "ArrowDown"
+          ? (currentIndex + 1 + items.length) % items.length
+          : (currentIndex - 1 + items.length) % items.length;
+    items[nextIndex].focus();
+  };
+
+  const commitValueAction = async (action) => {
+    if (!valueMenu || valueActionApplying) return;
+    setValueActionApplying(true);
+    setValueActionError("");
+    try {
+      await onValueAction(action, column, valueMenu.item);
+      setValueMenu(null);
+    } catch (cause) {
+      setValueActionError(cause instanceof Error ? cause.message : t("valueActionFailed"));
+    } finally {
+      setValueActionApplying(false);
+    }
+  };
+
   useEffect(() => {
     if (!query.trim()) {
       setDisplayValues(values);
@@ -462,7 +644,7 @@ function FrequencyTable({ aggregate, selectedKey, onSelect, onSearch, onTransfor
 
   return (
     <>
-    <article className="frequency-card" data-column={column}>
+    <article className="frequency-card" data-column={column} style={style}>
       <header>
         <div className="frequency-card__title">
           {renaming ? (
@@ -535,16 +717,19 @@ function FrequencyTable({ aggregate, selectedKey, onSelect, onSearch, onTransfor
           {query && <button type="button" onClick={() => setQuery("")} aria-label={t("clearSearch", { column })}><X weight="bold" /></button>}
         </label>
       </header>
-      <div className={`frequency-card__scroll ${searching ? "frequency-card__scroll--loading" : ""}`}>
+      <div ref={valuesScrollRef} className={`frequency-card__scroll ${searching ? "frequency-card__scroll--loading" : ""}`} onScroll={(event) => setValuesScrollTop(event.currentTarget.scrollTop)} data-virtualized="true">
         <table>
           <thead><tr><th>{t("value")}</th><th>{t("count")}</th></tr></thead>
           <tbody>
-            {sortedDisplayValues.map((item) => (
+            {valueTopSpace > 0 && <tr className="frequency-virtual-spacer"><td colSpan="2" style={{ height: valueTopSpace }} /></tr>}
+            {visibleDisplayValues.map((item) => (
               <tr
                 key={item.key}
                 className={selectedKey === item.key ? "frequency-row-item--selected" : ""}
                 tabIndex={0}
                 aria-selected={selectedKey === item.key}
+                aria-haspopup="menu"
+                onContextMenu={(event) => openValueMenu(event, item)}
                 onClick={() => {
                   if (renaming || inlineEditing) return;
                   window.clearTimeout(rowClickTimerRef.current);
@@ -558,7 +743,9 @@ function FrequencyTable({ aggregate, selectedKey, onSelect, onSearch, onTransfor
                 }}
                 onKeyDown={(event) => {
                   if (inlineEditing) return;
-                  if (event.key === "Enter" || event.key === " ") {
+                  if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+                    openValueMenu(event, item);
+                  } else if (event.key === "Enter" || event.key === " ") {
                     event.preventDefault();
                     onSelect(column, item);
                   }
@@ -595,6 +782,7 @@ function FrequencyTable({ aggregate, selectedKey, onSelect, onSearch, onTransfor
                 <td>{formatNumber(item.count)}</td>
               </tr>
             ))}
+            {valueBottomSpace > 0 && <tr className="frequency-virtual-spacer"><td colSpan="2" style={{ height: valueBottomSpace }} /></tr>}
             {!searching && displayValues.length === 0 && (
               <tr><td className="aggregate-empty" colSpan="2">{t("noValuesFound")}</td></tr>
             )}
@@ -638,7 +826,64 @@ function FrequencyTable({ aggregate, selectedKey, onSelect, onSearch, onTransfor
       </div>,
       document.body,
     )}
+    {valueMenu && createPortal(
+      <div
+        ref={valueMenuRef}
+        className="frequency-value-menu"
+        style={{ top: valueMenu.top, left: valueMenu.left, width: valueMenu.width }}
+        role="menu"
+        aria-label={t("valueActions", {
+          value: valueMenu.item.raw === null || valueMenu.item.raw === undefined || valueMenu.item.raw === "" ? t("emptyValue") : valueMenu.item.label,
+          column,
+        })}
+        aria-busy={valueActionApplying}
+      >
+        <button type="button" role="menuitem" disabled={valueActionApplying} onClick={() => commitValueAction("keep")} onKeyDown={navigateValueMenu}>{t("keepValue")}</button>
+        <button className="frequency-value-menu__delete" type="button" role="menuitem" disabled={valueActionApplying} onClick={() => commitValueAction("delete")} onKeyDown={navigateValueMenu}>{t("deleteValue")}</button>
+        {valueActionError && <div className="frequency-value-menu__error" role="alert">{valueActionError}</div>}
+      </div>,
+      document.body,
+    )}
     </>
+  );
+}
+
+function VirtualAggregateRow({ aggregates, renderAggregate }) {
+  const scrollRef = useRef(null);
+  const [viewportWidth, setViewportWidth] = useState(900);
+  const [scrollLeft, setScrollLeft] = useState(0);
+  const aggregateSignature = aggregates.map((aggregate) => aggregate.column).join("\u001f");
+
+  useEffect(() => {
+    const element = scrollRef.current;
+    if (!element) return undefined;
+    const observer = new ResizeObserver((entries) => setViewportWidth(entries[0].contentRect.width));
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    setScrollLeft(0);
+    if (scrollRef.current) scrollRef.current.scrollLeft = 0;
+  }, [aggregateSignature]);
+
+  const cardWidth = viewportWidth <= 520 ? 154 : Math.min(195, Math.max(174, (viewportWidth - 72) / 7));
+  const stride = cardWidth + FREQUENCY_CARD_GAP;
+  const start = Math.max(0, Math.floor(scrollLeft / stride) - FREQUENCY_CARD_OVERSCAN);
+  const visibleCount = Math.ceil(viewportWidth / stride) + FREQUENCY_CARD_OVERSCAN * 2;
+  const end = Math.min(aggregates.length, start + visibleCount);
+  const trackWidth = Math.max(0, aggregates.length * stride - FREQUENCY_CARD_GAP);
+
+  return (
+    <div className="frequency-row" ref={scrollRef} onScroll={(event) => setScrollLeft(event.currentTarget.scrollLeft)} data-virtualized="true">
+      <div className="frequency-row__track" style={{ width: trackWidth, "--frequency-card-width": `${cardWidth}px` }}>
+        {aggregates.slice(start, end).map((aggregate, offset) => renderAggregate(aggregate, {
+          position: "absolute",
+          top: 0,
+          left: (start + offset) * stride,
+        }))}
+      </div>
+    </div>
   );
 }
 
@@ -646,12 +891,17 @@ function VirtualPreview({ rows, columns, datasetId, locale }) {
   const { t } = useI18n();
   const scrollRef = useRef(null);
   const [viewportHeight, setViewportHeight] = useState(320);
+  const [viewportWidth, setViewportWidth] = useState(900);
   const [scrollTop, setScrollTop] = useState(0);
+  const [scrollLeft, setScrollLeft] = useState(0);
 
   useEffect(() => {
     const element = scrollRef.current;
     if (!element) return undefined;
-    const observer = new ResizeObserver((entries) => setViewportHeight(entries[0].contentRect.height));
+    const observer = new ResizeObserver((entries) => {
+      setViewportHeight(entries[0].contentRect.height);
+      setViewportWidth(entries[0].contentRect.width);
+    });
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
@@ -667,31 +917,42 @@ function VirtualPreview({ rows, columns, datasetId, locale }) {
   const visibleRows = rows.slice(start, end);
   const topSpace = start * PREVIEW_ROW_HEIGHT;
   const bottomSpace = Math.max(0, (rows.length - end) * PREVIEW_ROW_HEIGHT);
+  const columnStart = Math.max(0, Math.floor(Math.max(0, scrollLeft - 48) / PREVIEW_COLUMN_WIDTH) - PREVIEW_COLUMN_OVERSCAN);
+  const visibleColumnCount = Math.ceil(viewportWidth / PREVIEW_COLUMN_WIDTH) + PREVIEW_COLUMN_OVERSCAN * 2;
+  const columnEnd = Math.min(columns.length, columnStart + visibleColumnCount);
+  const visibleColumns = columns.slice(columnStart, columnEnd);
+  const leftColumnSpace = columnStart * PREVIEW_COLUMN_WIDTH;
+  const rightColumnSpace = Math.max(0, (columns.length - columnEnd) * PREVIEW_COLUMN_WIDTH);
+  const renderedColumnCount = visibleColumns.length + (leftColumnSpace > 0 ? 1 : 0) + (rightColumnSpace > 0 ? 1 : 0);
 
   return (
-    <div className="data-grid-wrap" ref={scrollRef} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)} data-virtualized="true">
-      <table className="data-grid">
+    <div className="data-grid-wrap" ref={scrollRef} onScroll={(event) => { setScrollTop(event.currentTarget.scrollTop); setScrollLeft(event.currentTarget.scrollLeft); }} data-virtualized="true">
+      <table className="data-grid" style={{ width: 48 + columns.length * PREVIEW_COLUMN_WIDTH }}>
         <thead>
           <tr>
             <th className="row-number" aria-label={t("rowNumber")} />
-            {columns.map((column) => <th key={column} title={column}>{column}</th>)}
+            {leftColumnSpace > 0 && <th className="virtual-column-spacer" aria-hidden="true" style={{ width: leftColumnSpace, minWidth: leftColumnSpace }} />}
+            {visibleColumns.map((column) => <th key={column} title={column}>{column}</th>)}
+            {rightColumnSpace > 0 && <th className="virtual-column-spacer" aria-hidden="true" style={{ width: rightColumnSpace, minWidth: rightColumnSpace }} />}
           </tr>
         </thead>
         <tbody>
-          {topSpace > 0 && <tr className="virtual-spacer"><td colSpan={columns.length + 1} style={{ height: topSpace }} /></tr>}
+          {topSpace > 0 && <tr className="virtual-spacer"><td colSpan={renderedColumnCount + 1} style={{ height: topSpace }} /></tr>}
           {visibleRows.map((row, index) => {
             const rowIndex = start + index;
             const displayValue = (value) => value === null || value === undefined || value === "" ? t("emptyValue") : formatValue(value, locale);
             return (
               <tr key={rowIndex} data-preview-row={rowIndex}>
                 <td className="row-number">{rowIndex + 1}</td>
-                {columns.map((column) => <td key={column} title={displayValue(row[column])}>{displayValue(row[column])}</td>)}
+                {leftColumnSpace > 0 && <td className="virtual-column-spacer" aria-hidden="true" style={{ width: leftColumnSpace, minWidth: leftColumnSpace }} />}
+                {visibleColumns.map((column) => <td key={column} title={displayValue(row[column])}>{displayValue(row[column])}</td>)}
+                {rightColumnSpace > 0 && <td className="virtual-column-spacer" aria-hidden="true" style={{ width: rightColumnSpace, minWidth: rightColumnSpace }} />}
               </tr>
             );
           })}
-          {bottomSpace > 0 && <tr className="virtual-spacer"><td colSpan={columns.length + 1} style={{ height: bottomSpace }} /></tr>}
+          {bottomSpace > 0 && <tr className="virtual-spacer"><td colSpan={renderedColumnCount + 1} style={{ height: bottomSpace }} /></tr>}
           {rows.length === 0 && (
-            <tr><td className="empty-preview" colSpan={columns.length + 1}>{t("noMatchingRows")}</td></tr>
+            <tr><td className="empty-preview" colSpan={renderedColumnCount + 1}>{t("noMatchingRows")}</td></tr>
           )}
         </tbody>
       </table>
@@ -701,6 +962,9 @@ function VirtualPreview({ rows, columns, datasetId, locale }) {
 
 function DataScreen({
   dataset,
+  activePreparedId,
+  preparedName,
+  preparedOptions,
   filters,
   loading,
   error,
@@ -711,22 +975,20 @@ function DataScreen({
   canRedo,
   onFiltersChange,
   onAggregateSearch,
-  onExport,
   onRecipeChange,
   onRecipeUndo,
   onRecipeRedo,
   onRecipePreview,
+  onPreparedChange,
 }) {
   const { formatNumber, language, t, toolLabel } = useI18n();
   const valueLocale = language === "id" ? "id-ID" : "en-US";
   const [topHeight, setTopHeight] = useState(430);
   const [updating, setUpdating] = useState(false);
-  const [openMenu, setOpenMenu] = useState(null);
   const [columnMenuOpen, setColumnMenuOpen] = useState(false);
   const [aggregateColumns, setAggregateColumns] = useState(dataset.aggregateColumns);
   const [columnDraft, setColumnDraft] = useState(dataset.aggregateColumns);
   const [columnQuery, setColumnQuery] = useState("");
-  const [exporting, setExporting] = useState(false);
   const [actionError, setActionError] = useState("");
   const [actionNotice, setActionNotice] = useState("");
   const [transformPopover, setTransformPopover] = useState(null);
@@ -737,22 +999,21 @@ function DataScreen({
   const [invalidStepId, setInvalidStepId] = useState(null);
   const [stepPreview, setStepPreview] = useState(null);
   const [previewingStep, setPreviewingStep] = useState(false);
+  const [preparedMenuOpen, setPreparedMenuOpen] = useState(false);
   const splitRef = useRef(null);
-  const toolbarActionsRef = useRef(null);
+  const preparedSelectorRef = useRef(null);
   const columnPickerRef = useRef(null);
   const transformPopoverRef = useRef(null);
-  const [sidebarActionsTarget, setSidebarActionsTarget] = useState(null);
   const [sidebarStepsTarget, setSidebarStepsTarget] = useState(null);
   const activeFilterCount = Object.keys(filters).length;
   const filterSignature = JSON.stringify(filters);
 
   useEffect(() => {
-    setSidebarActionsTarget(document.getElementById("sidebar-data-actions"));
     setSidebarStepsTarget(document.getElementById("sidebar-steps"));
   }, []);
 
   useEffect(() => {
-    setOpenMenu(null);
+    setPreparedMenuOpen(false);
     setColumnMenuOpen(false);
     setTransformPopover(null);
     setTransformError("");
@@ -760,6 +1021,22 @@ function DataScreen({
     setColumnDraft(dataset.aggregateColumns);
     setColumnQuery("");
   }, [dataset.datasetId]);
+
+  useEffect(() => {
+    if (!preparedMenuOpen) return undefined;
+    const closeOnOutsideClick = (event) => {
+      if (!preparedSelectorRef.current?.contains(event.target)) setPreparedMenuOpen(false);
+    };
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") setPreparedMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick, true);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick, true);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [preparedMenuOpen]);
 
   useEffect(() => {
     setRecipeError(initialRecipeError ?? "");
@@ -771,24 +1048,6 @@ function DataScreen({
     const timer = window.setTimeout(() => setActionNotice(""), 4500);
     return () => window.clearTimeout(timer);
   }, [actionNotice]);
-
-  useEffect(() => {
-    if (!openMenu) return undefined;
-
-    const closeOnOutsideClick = (event) => {
-      if (!toolbarActionsRef.current?.contains(event.target)) setOpenMenu(null);
-    };
-    const closeOnEscape = (event) => {
-      if (event.key === "Escape") setOpenMenu(null);
-    };
-
-    document.addEventListener("pointerdown", closeOnOutsideClick, true);
-    document.addEventListener("keydown", closeOnEscape);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsideClick, true);
-      document.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [openMenu]);
 
   useEffect(() => {
     if (!columnMenuOpen) return undefined;
@@ -861,7 +1120,7 @@ function DataScreen({
       setRecipeError("");
       setInvalidStepId(null);
     }
-  }, [t]);
+  }, []);
 
   const toggleAggregateColumn = (column) => {
     setColumnDraft((current) => {
@@ -912,7 +1171,6 @@ function DataScreen({
   );
 
   const openColumnTransformation = (column, tool, initialParams, anchor) => {
-    setOpenMenu(null);
     setColumnMenuOpen(false);
     setTransformError("");
     const bounds = anchor.getBoundingClientRect();
@@ -992,6 +1250,10 @@ function DataScreen({
     return applyInlineTransformation("replace-value", { column, from: item.raw, to: nextValue }, t("valueFailed"));
   };
 
+  const applyValueRowAction = async (action, column, item) => (
+    applyInlineTransformation("delete-rows", valueRowActionParams(action, column, item.raw), t("valueActionFailed"))
+  );
+
   const startResize = useCallback((event) => {
     event.preventDefault();
     const container = splitRef.current;
@@ -1007,19 +1269,6 @@ function DataScreen({
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop);
   }, []);
-
-  const exportFiltered = async (format) => {
-    setExporting(true);
-    setOpenMenu(null);
-    setActionError("");
-    try {
-      await onExport(format, filters);
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : t("exportFailed"));
-    } finally {
-      setExporting(false);
-    }
-  };
 
   const applyRecipeMutation = async (nextRecipe, changedStepId) => {
     setRecipeApplying(true);
@@ -1080,38 +1329,63 @@ function DataScreen({
       <header className="file-toolbar">
         <div className="file-heading">
           <span className="file-heading__icon"><FileXls weight="duotone" /></span>
-          <div>
-            <strong title={dataset.filename}>{dataset.filename}</strong>
-            <span>{formatNumber(dataset.rowCount)} {t("rows")} <i /> {formatNumber(dataset.columns.length)} {t("columns")}</span>
-            <span
-              className={`file-quality-summary ${hasQualityIssues ? "file-quality-summary--issues" : ""}`}
-              aria-label={qualityLabel}
-              title={hasQualityIssues ? qualityLabel : `${qualityLabel}. ${t("noBasicIssues")}`}
-            >
-              {hasQualityIssues ? <WarningCircle weight="fill" aria-hidden="true" /> : <ShieldCheck weight="bold" aria-hidden="true" />}
-              {formatNumber(dataset.quality.emptyCells)} {t("emptyCells")} · {formatNumber(dataset.quality.mixedColumns)} {t("mixedColumns")}
+          <div className="file-heading__content">
+            <div className="prepared-selector" ref={preparedSelectorRef}>
+              <button
+                className="prepared-selector__trigger"
+                type="button"
+                onClick={() => setPreparedMenuOpen((current) => !current)}
+                disabled={loading}
+                aria-label={t("selectPreparedDataset")}
+                aria-haspopup="listbox"
+                aria-expanded={preparedMenuOpen}
+                title={`${preparedName ?? dataset.filename} · ${dataset.filename}`}
+              >
+                <strong>{preparedName ?? dataset.filename}</strong>
+                <CaretDown weight="bold" aria-hidden="true" />
+              </button>
+              {preparedMenuOpen && (
+                <div className="prepared-selector__menu" role="listbox" aria-label={t("preparedDatasets")}>
+                  {preparedOptions.map((option) => {
+                    const active = option.id === activePreparedId;
+                    return (
+                      <button
+                        key={option.id}
+                        className={active ? "prepared-selector__option prepared-selector__option--active" : "prepared-selector__option"}
+                        type="button"
+                        role="option"
+                        aria-selected={active}
+                        onClick={() => {
+                          setPreparedMenuOpen(false);
+                          if (!active) void onPreparedChange(option.id);
+                        }}
+                      >
+                        <span>
+                          <strong>{option.name}</strong>
+                          <small>{option.sourceName}</small>
+                        </span>
+                        {active && <Check weight="bold" aria-hidden="true" />}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+            <span className="file-heading__stats" aria-label={`${formatNumber(dataset.rowCount)} ${t("rows")}, ${formatNumber(dataset.columns.length)} ${t("columns")}. ${qualityLabel}`}>
+              <span><strong>{formatNumber(dataset.rowCount)}</strong> {t("rows")}</span>
+              <span><strong>{formatNumber(dataset.columns.length)}</strong> {t("columns")}</span>
+              <span
+                className={`file-heading__quality ${hasQualityIssues ? "file-heading__quality--issues" : ""}`}
+                title={hasQualityIssues ? qualityLabel : `${qualityLabel}. ${t("noBasicIssues")}`}
+              >
+                {hasQualityIssues ? <WarningCircle weight="fill" aria-hidden="true" /> : <ShieldCheck weight="bold" aria-hidden="true" />}
+                <span><strong>{formatNumber(dataset.quality.emptyCells)}</strong> {t("emptyCells")}</span>
+                <span><strong>{formatNumber(dataset.quality.mixedColumns)}</strong> {t("mixedColumns")}</span>
+              </span>
             </span>
           </div>
         </div>
       </header>
-
-      {sidebarActionsTarget && createPortal(
-        <div className="sidebar-action-stack" ref={toolbarActionsRef}>
-          <div className="toolbar-menu">
-            <button className="button button--export sidebar-action-button" type="button" onClick={() => setOpenMenu((value) => value === "export" ? null : "export")} disabled={exporting} aria-expanded={openMenu === "export"} title={t("export")}>
-              <DownloadSimple weight="bold" />
-              <span className="sidebar-action-label">{exporting ? t("exporting") : t("export")}</span>
-            </button>
-            {openMenu === "export" && (
-              <div className="export-menu" role="menu">
-                <button type="button" onClick={() => exportFiltered("csv")} role="menuitem"><FileCsv weight="duotone" /><span><strong>{t("exportCsv")}</strong><small>{t("currentFilteredData")}</small></span></button>
-                <button type="button" onClick={() => exportFiltered("xlsx")} role="menuitem"><FileXls weight="duotone" /><span><strong>{t("exportExcel")}</strong><small>{t("excelReady")}</small></span></button>
-              </div>
-            )}
-          </div>
-        </div>,
-        sidebarActionsTarget,
-      )}
 
       {transformPopover && createPortal(
         <section
@@ -1141,18 +1415,15 @@ function DataScreen({
             <div className="transform-tool-picker">
               <header><div><strong>{t("chooseTool")}</strong><span>{t("column")}: {transformPopover.column}</span></div><button type="button" onClick={() => setTransformPopover(null)} aria-label={t("closeToolPicker")}><X /></button></header>
               <div className="transform-tool-picker__groups">
-                {["Clean", "Build"].map((group) => (
-                  <section key={group}>
-                    <h3>{group === "Clean" ? t("clean") : t("build")}</h3>
-                    <div>
-                      {CREATABLE_TRANSFORMATION_TYPES.filter((item) => item.group === group).map((item) => (
-                        <button key={item.type} type="button" onClick={() => setTransformPopover((current) => current ? { ...current, tool: item.type } : null)}>
-                          <span>{toolLabel(item.type)}</span><CaretRight weight="bold" />
-                        </button>
-                      ))}
-                    </div>
-                  </section>
-                ))}
+                <section>
+                  <div>
+                    {CREATABLE_TRANSFORMATION_TYPES.map((item) => (
+                      <button key={item.type} type="button" onClick={() => setTransformPopover((current) => current ? { ...current, tool: item.type } : null)}>
+                        <span>{toolLabel(item.type)}</span><CaretRight weight="bold" />
+                      </button>
+                    ))}
+                  </div>
+                </section>
               </div>
             </div>
           )}
@@ -1206,11 +1477,13 @@ function DataScreen({
               )}
             </div>
           </header>
-          <div className="frequency-row">
-            {dataset.aggregates.map((aggregate) => (
+          <VirtualAggregateRow
+            aggregates={dataset.aggregates}
+            renderAggregate={(aggregate, style) => (
               <FrequencyTable
                 key={aggregate.column}
                 aggregate={aggregate}
+                style={style}
                 selectedKey={filters[aggregate.column]?.key}
                 onSelect={toggleFilter}
                 onSearch={searchAggregate}
@@ -1218,12 +1491,13 @@ function DataScreen({
                 onRename={renameColumnInline}
                 onChangeType={changeColumnTypeInline}
                 onReplaceValue={replaceValueInline}
+                onValueAction={applyValueRowAction}
                 transformOpen={transformPopover?.column === aggregate.column}
                 transformUsed={recipe.some((step) => step.enabled !== false && stepTouchesColumn(step, aggregate.column))}
                 filterSignature={filterSignature}
               />
-            ))}
-          </div>
+            )}
+          />
         </section>
 
         <button className="resize-handle" type="button" onPointerDown={startResize} aria-label={t("resizePanels")}><span /><span /><span /></button>
@@ -1276,131 +1550,185 @@ function DataScreen({
   );
 }
 
-function RecipeRestoreDialog({ pending, applying, onIgnore, onApply }) {
-  const { t, toolLabel } = useI18n();
-  const [inspecting, setInspecting] = useState(false);
-  const stepCount = pending.recipe.length;
-
-  useEffect(() => {
-    const closeOnEscape = (event) => {
-      if (event.key === "Escape" && !applying) onIgnore();
-    };
-    document.addEventListener("keydown", closeOnEscape);
-    return () => document.removeEventListener("keydown", closeOnEscape);
-  }, [applying, onIgnore]);
-
-  return createPortal(
-    <div className="recipe-restore-backdrop" role="presentation">
-      <section className="recipe-restore-dialog" role="dialog" aria-modal="true" aria-labelledby="recipe-restore-title">
-        <header>
-          <div>
-            <span>{t("savedRecipe")}</span>
-            <h2 id="recipe-restore-title">{t("applyPreviousSteps")}</h2>
-          </div>
-          <button type="button" onClick={onIgnore} disabled={applying} aria-label={t("ignoreSavedRecipe")}><X weight="bold" /></button>
-        </header>
-        <p>{t("savedRecipeFound", { count: stepCount, filename: pending.filename })}</p>
-        {inspecting && (
-          <ol className="recipe-restore-list">
-            {pending.recipe.map((step) => (
-              <li key={step.id}>
-                <strong>{toolLabel(step.type)}</strong>
-                <span>{summarizeStep(step)}</span>
-              </li>
-            ))}
-          </ol>
-        )}
-        <footer>
-          <button type="button" onClick={onIgnore} disabled={applying}>{t("ignore")}</button>
-          <button type="button" onClick={() => setInspecting((value) => !value)} disabled={applying}>{inspecting ? t("closeDetails") : t("inspect")}</button>
-          <button className="button--primary" type="button" onClick={onApply} disabled={applying}>{applying ? t("applying") : t("applyRecipe")}</button>
-        </footer>
-      </section>
-    </div>,
-    document.body,
-  );
-}
-
 export function App() {
   const { t } = useI18n();
   const worker = useDataWorker();
   const recipeHistory = useRecipeHistory();
-  const demoLoadedRef = useRef(false);
   const [screen, setScreen] = useState("input");
-  const [file, setFile] = useState(null);
   const [dataset, setDataset] = useState(null);
   const [filters, setFilters] = useState({});
-  const [openedSources, setOpenedSources] = useState([]);
+  const [flow, setFlow] = useState(createFlowGraph);
+  const flowRef = useRef(flow);
+  const [activePreparedId, setActivePreparedId] = useState(null);
+  const [composePreview, setComposePreview] = useState(null);
+  const [composeLoading, setComposeLoading] = useState(false);
+  const [composeError, setComposeError] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [collapsed, setCollapsed] = useState(false);
-  const [activeRecipeKey, setActiveRecipeKey] = useState("");
   const [recipeRecovery, setRecipeRecovery] = useState({ error: "", invalidStepId: null });
-  const [pendingRecipeRestore, setPendingRecipeRestore] = useState(null);
-  const [restoringRecipe, setRestoringRecipe] = useState(false);
+  const [flowHydrated, setFlowHydrated] = useState(false);
+  const [flowDirty, setFlowDirty] = useState(false);
+  const restoreStartedRef = useRef(false);
+  const flowHydratedRef = useRef(false);
 
-  const activateDataset = async (result, source = null) => {
+  useEffect(() => { flowRef.current = flow; }, [flow]);
+
+  const commitFlow = useCallback(async (nextFlow) => {
+    flowRef.current = nextFlow;
+    setFlow(nextFlow);
+    if (flowHydratedRef.current) {
+      try {
+        await saveStoredFlow(nextFlow);
+        setFlowDirty(false);
+      } catch {
+        setFlowDirty(true);
+      }
+    }
+    return nextFlow;
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const stored = await loadStoredFlow();
+        if (cancelled || !stored) return;
+        const restored = markSourcesUnlinked(repairOverlappingNodePositions(removeBuiltInDemoData(validateFlowGraph(stored))));
+        flowRef.current = restored;
+        setFlow(restored);
+      } catch {
+        if (!cancelled) setError(t("flowRestoreFailed"));
+      } finally {
+        if (!cancelled) {
+          flowHydratedRef.current = true;
+          setFlowHydrated(true);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [t]);
+
+  const openedSources = useMemo(() => flow.sourceAssets.filter(isFlowFileSource).map((source) => {
+    const prepared = flow.preparedInputs.find((item) => item.sourceAssetId === source.id);
+    return {
+      key: source.id,
+      sourceAssetId: source.id,
+      preparedId: prepared?.id ?? null,
+      name: source.name,
+      kind: "local",
+      size: source.size,
+      status: source.status ?? "unlinked",
+    };
+  }), [flow.preparedInputs, flow.sourceAssets]);
+
+  const relinkSource = useCallback(async (sourceAssetId, nextFile, handle = null, automatic = false) => {
+    const source = flowRef.current.sourceAssets.find((item) => item.id === sourceAssetId);
+    const preparedInputs = flowRef.current.preparedInputs.filter((item) => item.sourceAssetId === sourceAssetId);
+    const primaryPrepared = preparedInputs[0];
+    if (!source || !primaryPrepared) throw new Error(t("relinkFailed"));
+    const inspected = await worker.inspectFile(nextFile);
+    if (!matchesSourceReference(source, nextFile, inspected.sourceColumns)) {
+      const mismatch = new Error(t("relinkMismatch"));
+      mismatch.code = "SOURCE_MISMATCH";
+      throw mismatch;
+    }
+    await worker.loadFile(nextFile, { sourceId: source.id, preparedId: primaryPrepared.id });
+    for (const prepared of preparedInputs) {
+      await worker.registerPreparedCopy(prepared.id, primaryPrepared.id, recipeForExecution(prepared, []));
+    }
+    await worker.activatePrepared(primaryPrepared.id, {}, primaryPrepared.schema.map((column) => column.name));
+    const linkedFlow = {
+      ...flowRef.current,
+      sourceAssets: flowRef.current.sourceAssets.map((item) => item.id === source.id ? { ...item, status: "linked" } : item),
+    };
+    await commitFlow(linkedFlow);
+    if (handle) await saveStoredSourceHandle(source.id, handle);
+    if (!automatic) setError("");
+    return true;
+  }, [commitFlow, t, worker]);
+
+  const relinkSourceFromPicker = useCallback(async (sourceAssetId, nextFile, handle) => {
+    setLoading(true);
+    setError("");
+    try {
+      await relinkSource(sourceAssetId, nextFile, handle, false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("relinkFailed"));
+    } finally {
+      setLoading(false);
+    }
+  }, [relinkSource, t]);
+
+  useEffect(() => {
+    if (!flowHydrated || !worker.ready || restoreStartedRef.current) return;
+    restoreStartedRef.current = true;
+    (async () => {
+      let nextFlow = flowRef.current;
+      for (const source of nextFlow.sourceAssets.filter(isFlowFileSource)) {
+        try {
+          const handle = await loadStoredSourceHandle(source.id);
+          const restored = await restoreFileFromHandle(handle);
+          if (restored.status !== "ready") throw new Error("SOURCE_HANDLE_UNAVAILABLE");
+          await relinkSource(source.id, restored.file, handle, true);
+          nextFlow = flowRef.current;
+        } catch {
+          nextFlow = {
+            ...flowRef.current,
+            sourceAssets: flowRef.current.sourceAssets.map((item) => item.id === source.id ? { ...item, status: "unlinked" } : item),
+          };
+          flowRef.current = nextFlow;
+          setFlow(nextFlow);
+        }
+      }
+      await commitFlow(nextFlow);
+    })();
+  }, [commitFlow, flowHydrated, relinkSource, worker.ready]);
+
+  const preparedOptions = useMemo(() => flow.preparedInputs.flatMap((prepared) => {
+    const source = flow.sourceAssets.find((item) => item.id === prepared.sourceAssetId);
+    const isActive = prepared.id === activePreparedId;
+    if (!source) return [];
+    return [{
+      id: prepared.id,
+      name: prepared.name,
+      sourceName: isActive ? dataset?.filename ?? source.name : source.name,
+    }];
+  }), [activePreparedId, dataset?.filename, flow.preparedInputs, flow.sourceAssets]);
+  const composeSchemaState = useMemo(() => hydrateComposeSchemas(flow), [flow]);
+
+  useEffect(() => {
+    if (screen !== "compose" || composeSchemaState.graph === flow) return;
+    void commitFlow(composeSchemaState.graph);
+  }, [commitFlow, composeSchemaState.graph, flow, screen]);
+
+  useEffect(() => {
+    if (!flowHydrated || !dataset || !activePreparedId) return;
+    const prepared = flowRef.current.preparedInputs.find((item) => item.id === activePreparedId);
+    if (!prepared || prepared.rowCount === dataset.rowCount) return;
+    void commitFlow(updatePreparedInput(flowRef.current, activePreparedId, { rowCount: dataset.rowCount }));
+  }, [activePreparedId, commitFlow, dataset, flowHydrated]);
+
+  const activateDataset = async (result, source = null, recipe = []) => {
     setDataset(result);
+    setActivePreparedId(result.preparedId ?? null);
     setFilters({});
     if (source) {
-      setOpenedSources((current) => {
-        const nextSource = { ...source, name: result.filename, active: true };
-        const previous = current
-          .filter((item) => item.key !== source.key)
-          .map((item) => ({ ...item, active: false }));
-        return [nextSource, ...previous].slice(0, 20);
-      });
+      const created = createPreparedInput(source, result, recipe);
+      await commitFlow(addPreparedInput(flowRef.current, created.sourceAsset, created.preparedInput));
     }
-    recipeHistory.reset([]);
+    recipeHistory.reset(recipe);
     setRecipeRecovery({ error: "", invalidStepId: null });
-    setPendingRecipeRestore(null);
-    const storageKey = recipeStorageKey(result);
-    setActiveRecipeKey(storageKey);
-    try {
-      const storedRecipe = await loadStoredRecipe(storageKey);
-      if (storedRecipe.length) {
-        setPendingRecipeRestore({ recipe: storedRecipe, storageKey, filename: result.filename });
-      }
-    } catch (cause) {
-      setError(cause instanceof Error ? `${t("storedRecipeReadFailed")} ${cause.message}` : t("storedRecipeReadFailed"));
-    }
     return result;
   };
 
-  const applyPendingRecipe = async () => {
-    if (!pendingRecipeRestore) return;
-    const storedRecipe = pendingRecipeRestore.recipe;
-    setRestoringRecipe(true);
-    setRecipeRecovery({ error: "", invalidStepId: null });
-    try {
-      const restored = await worker.applyRecipe(storedRecipe, filters, dataset?.aggregateColumns ?? []);
-      setDataset(restored);
-      setFilters(restored.appliedFilters ?? filters);
-      recipeHistory.reset(storedRecipe);
-      setRecipeRecovery(restored.recipeError
-        ? { error: restored.recipeError.message, invalidStepId: restored.recipeError.stepId ?? null }
-        : { error: "", invalidStepId: null });
-      setPendingRecipeRestore(null);
-    } catch (cause) {
-      const message = cause instanceof Error ? cause.message : t("storedRecipeApplyFailed");
-      setRecipeRecovery({
-        error: `${t("storedRecipeApplyFailed")} ${message}`,
-        invalidStepId: cause?.stepId ?? (Number.isInteger(cause?.stepIndex) ? storedRecipe[cause.stepIndex]?.id ?? null : null),
-      });
-    } finally {
-      setRestoringRecipe(false);
+  const registerSiblingPreparations = async (primaryPrepared) => {
+    if (!primaryPrepared) return;
+    const siblings = flowRef.current.preparedInputs.filter((item) => item.sourceAssetId === primaryPrepared.sourceAssetId && item.id !== primaryPrepared.id);
+    for (const sibling of siblings) {
+      await worker.registerPreparedCopy(sibling.id, primaryPrepared.id, recipeForExecution(sibling, []));
     }
   };
-
-  useEffect(() => {
-    if (!worker.ready || demoLoadedRef.current || new URLSearchParams(window.location.search).get("demo") !== "1") return;
-    demoLoadedRef.current = true;
-    setLoading(true);
-    worker.loadDemo()
-      .then(async (result) => { await activateDataset(result, { key: "demo", kind: "demo", size: null }); setScreen("data"); })
-      .catch((cause) => setError(cause instanceof Error ? cause.message : t("demoFailed")))
-      .finally(() => setLoading(false));
-  }, [worker]);
 
   useEffect(() => {
     if (screen !== "data" || !error) return undefined;
@@ -1408,7 +1736,7 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [error, screen]);
 
-  const loadFile = async (nextFile) => {
+  const loadFile = async (nextFile, handle = null) => {
     setError("");
     if (!isSupportedFile(nextFile.name)) {
       if (!dataset) setDataset(null);
@@ -1419,30 +1747,15 @@ export function App() {
     setLoading(true);
     try {
       const result = await worker.loadFile(nextFile);
-      setFile(nextFile);
       await activateDataset(result, {
-        key: `local:${nextFile.name}:${nextFile.size}:${nextFile.lastModified}`,
         kind: "local",
         size: nextFile.size,
-      });
-      setScreen("data");
+        lastModified: nextFile.lastModified,
+      }, []);
+      if (handle && result.sourceId) await saveStoredSourceHandle(result.sourceId, handle);
     } catch (cause) {
       if (!dataset) setDataset(null);
       setError(cause instanceof Error ? cause.message : t("fileReadFailed"));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const showDemo = async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const result = await worker.loadDemo();
-      await activateDataset(result, { key: "demo", kind: "demo", size: null });
-      setScreen("data");
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : t("demoFailed"));
     } finally {
       setLoading(false);
     }
@@ -1460,8 +1773,248 @@ export function App() {
     [worker],
   );
 
-  const exportData = useCallback(async (format, filters) => {
-    const result = await worker.exportData(format, filters);
+  const persistPreparedRecipe = async (recipe, result, preparedId = activePreparedId) => {
+    if (!preparedId) return;
+    const prepared = flowRef.current.preparedInputs.find((item) => item.id === preparedId);
+    const descendantIds = collectDescendantNodeIds(flowRef.current, [preparedId]);
+    const updated = updatePreparedInput(flowRef.current, preparedId, {
+      recipe,
+      recipeStatus: PREPARED_RECIPE_STATUS.APPLIED,
+      recipeVersion: (prepared?.recipeVersion ?? 0) + 1,
+      rowCount: result.rowCount,
+      schema: result.columns.map((name) => ({ name, type: result.columnTypes?.[name] ?? null })),
+    });
+    const nextFlow = {
+      ...updated,
+      composeNodes: updated.composeNodes.map((node) => descendantIds.has(node.id)
+        ? { ...node, schema: [], validationStatus: "needs-validation" }
+        : node),
+    };
+    await commitFlow(nextFlow);
+    setComposePreview(null);
+    setComposeError("");
+  };
+
+  const applyRecipeChange = async (recipe) => {
+    const result = await worker.applyRecipe(recipe, filters, dataset?.aggregateColumns ?? [], activePreparedId);
+    const next = recipeHistory.commit(recipe);
+    setDataset(result);
+    setFilters(result.appliedFilters ?? filters);
+    await persistPreparedRecipe(next, result);
+    return result;
+  };
+
+  const undoRecipe = async () => {
+    const next = recipeHistory.undoTarget;
+    if (!next) return null;
+    const result = await worker.applyRecipe(next, filters, dataset?.aggregateColumns ?? [], activePreparedId);
+    recipeHistory.undo();
+    setDataset(result);
+    setFilters(result.appliedFilters ?? filters);
+    await persistPreparedRecipe(next, result);
+    return result;
+  };
+
+  const redoRecipe = async () => {
+    const next = recipeHistory.redoTarget;
+    if (!next) return null;
+    const result = await worker.applyRecipe(next, filters, dataset?.aggregateColumns ?? [], activePreparedId);
+    recipeHistory.redo();
+    setDataset(result);
+    setFilters(result.appliedFilters ?? filters);
+    await persistPreparedRecipe(next, result);
+    return result;
+  };
+
+  const openPrepared = async (preparedId) => {
+    const prepared = flowRef.current.preparedInputs.find((item) => item.id === preparedId);
+    const source = flowRef.current.sourceAssets.find((item) => item.id === prepared?.sourceAssetId);
+    if (!prepared || !source) return;
+    if (source.status !== "linked" && source.location === "local-device") {
+      setError(t("relinkRequired"));
+      setScreen("input");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const result = await activatePreparedForFlow({
+        worker,
+        graph: flowRef.current,
+        prepared,
+        source,
+        filters: {},
+        aggregateColumns: prepared.schema.map((column) => column.name),
+      });
+      setDataset(result);
+      setFilters({});
+      setActivePreparedId(preparedId);
+      recipeHistory.reset(result.recipe ?? []);
+      setRecipeRecovery({ error: "", invalidStepId: null });
+      await commitFlow(updatePreparedInput(flowRef.current, preparedId, {
+        rowCount: result.rowCount,
+        schema: result.columns.map((name) => ({ name, type: result.columnTypes?.[name] ?? null })),
+      }));
+      setScreen("data");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("fileReadFailed"));
+      setScreen("input");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const duplicatePreparation = async (preparedId) => {
+    setComposeError("");
+    try {
+      const duplicated = duplicatePreparedInput(flowRef.current, preparedId);
+      await worker.registerPreparedCopy(duplicated.preparedInput.id, preparedId, duplicated.preparedInput.recipe);
+      await commitFlow(duplicated.graph);
+      setComposePreview(null);
+      return { ok: true, preparedInputId: duplicated.preparedInput.id };
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : t("duplicateFailed");
+      setComposeError(message);
+      return { ok: false, error: message };
+    }
+  };
+
+  const createPreparationFromCompose = async (nodeId) => {
+    setComposeError("");
+    try {
+      const candidate = createPreparedFromCompose(flowRef.current, nodeId);
+      const materialized = await worker.materializeComposePrepared(flowRef.current, nodeId, {
+        sourceId: candidate.sourceAsset.id,
+        preparedId: candidate.preparedInput.id,
+        filename: candidate.preparedInput.name,
+      });
+      const nextGraph = {
+        ...candidate.graph,
+        sourceAssets: candidate.graph.sourceAssets.map((item) => item.id === candidate.sourceAsset.id
+          ? { ...item, sourceColumns: materialized.schema.map((column) => column.name), schemaFingerprint: schemaFingerprint(materialized.schema) }
+          : item),
+        preparedInputs: candidate.graph.preparedInputs.map((item) => item.id === candidate.preparedInput.id
+          ? { ...item, rowCount: materialized.rowCount, schema: materialized.schema.map((column) => ({ ...column })) }
+          : item),
+      };
+      await commitFlow(nextGraph);
+      setComposePreview(null);
+      return { ok: true, preparedInputId: candidate.preparedInput.id };
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : t("createPreparedFailed");
+      setComposeError(message);
+      return { ok: false, error: message };
+    }
+  };
+
+  const deletePreparedDataset = async (preparedId) => {
+    setComposeError("");
+    try {
+      const candidate = removePreparedInput(flowRef.current, preparedId);
+      await worker.unregisterPrepared(preparedId);
+      await commitFlow(candidate.graph);
+      if (candidate.removedSourceAssetId) await deleteStoredSourceHandle(candidate.removedSourceAssetId);
+      if (activePreparedId === preparedId) {
+        setActivePreparedId(null);
+        setDataset(null);
+        setFilters({});
+        recipeHistory.reset([]);
+      }
+      setComposePreview(null);
+      return true;
+    } catch (cause) {
+      const message = cause?.code === "PREPARED_INPUT_HAS_DESCENDANTS"
+        ? t("deleteDownstreamFirst")
+        : cause instanceof Error ? cause.message : t("deletePreparedFailed");
+      setComposeError(message);
+      return false;
+    }
+  };
+
+  const selectComposeNode = async (nodeId) => {
+    const nextFlow = { ...flowRef.current, activeNodeId: nodeId };
+    await commitFlow(nextFlow);
+    setComposeLoading(true);
+    setComposeError("");
+    try {
+      const preview = await worker.previewCompose(nextFlow, nodeId);
+      if (nextFlow.composeNodes.some((node) => node.id === nodeId)) {
+        await commitFlow({
+          ...nextFlow,
+          revision: nextFlow.revision + 1,
+          composeNodes: nextFlow.composeNodes.map((node) => node.id === nodeId ? { ...node, rowCount: preview.rowCount, schema: preview.schema, validationStatus: "valid" } : node),
+          updatedAt: new Date().toISOString(),
+        });
+      }
+      setComposePreview(preview);
+    } catch (cause) {
+      setComposePreview(null);
+      setComposeError(cause instanceof Error ? cause.message : t("composePreviewFailed"));
+    } finally {
+      setComposeLoading(false);
+    }
+  };
+
+  const createComposeNode = async (draft) => {
+    const candidate = addComposeNode(flowRef.current, draft);
+    const preview = await worker.previewCompose(candidate.graph, candidate.node.id);
+    const committed = {
+      ...candidate.graph,
+      composeNodes: candidate.graph.composeNodes.map((node) => node.id === candidate.node.id ? { ...node, rowCount: preview.rowCount, schema: preview.schema, validationStatus: "valid" } : node),
+    };
+    await commitFlow(committed);
+    setComposePreview(preview);
+    setComposeError("");
+  };
+
+  const updateComposeOperation = async (nodeId, draft) => {
+    const candidate = updateComposeNode(flowRef.current, nodeId, draft);
+    const preview = await worker.previewCompose(candidate.graph, nodeId);
+    const committed = {
+      ...candidate.graph,
+      composeNodes: candidate.graph.composeNodes.map((node) => node.id === nodeId
+        ? { ...node, rowCount: preview.rowCount, schema: preview.schema, validationStatus: "valid" }
+        : node),
+    };
+    await commitFlow(committed);
+    setComposePreview(preview);
+    setComposeError("");
+  };
+
+  const deleteComposeOperation = async (nodeId) => {
+    const candidate = removeComposeNode(flowRef.current, nodeId);
+    await commitFlow(candidate.graph);
+    setComposePreview(null);
+    setComposeError("");
+  };
+
+  const previewComposeDraft = async (draft, nodeId = null) => {
+    const candidate = nodeId
+      ? updateComposeNode(flowRef.current, nodeId, draft)
+      : addComposeNode(flowRef.current, draft);
+    return worker.previewCompose(candidate.graph, candidate.node.id);
+  };
+
+  const moveComposeNode = async (nodeId, position) => {
+    try {
+      await commitFlow(updateNodePosition(flowRef.current, nodeId, position));
+    } catch (cause) {
+      setComposeError(cause instanceof Error ? cause.message : t("composeUpdateFailed"));
+    }
+  };
+
+  const autoArrangeComposeNodes = async () => {
+    try {
+      return await commitFlow(autoArrangeNodePositions(flowRef.current));
+    } catch (cause) {
+      setComposeError(cause instanceof Error ? cause.message : t("composeUpdateFailed"));
+      return null;
+    }
+  };
+
+  const exportComposeNode = async (format) => {
+    if (!flow.activeNodeId) return;
+    const result = await worker.exportCompose(flowRef.current, flow.activeNodeId, format);
     const blob = new Blob([result.bytes], { type: result.mime });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
@@ -1469,68 +2022,59 @@ export function App() {
     anchor.download = result.filename;
     anchor.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }, [worker]);
-
-  const persistRecipe = async (recipe) => {
-    if (!activeRecipeKey) return;
-    try {
-      await saveStoredRecipe(activeRecipeKey, recipe);
-    } catch {
-      setError(t("recipeSaveFailed"));
-    }
-  };
-
-  const applyRecipeChange = async (recipe) => {
-    const result = await worker.applyRecipe(recipe, filters, dataset?.aggregateColumns ?? []);
-    const next = recipeHistory.commit(recipe);
-    setDataset(result);
-    setFilters(result.appliedFilters ?? filters);
-    void persistRecipe(next);
-    return result;
-  };
-
-  const undoRecipe = async () => {
-    const next = recipeHistory.undoTarget;
-    if (!next) return null;
-    const result = await worker.applyRecipe(next, filters, dataset?.aggregateColumns ?? []);
-    recipeHistory.undo();
-    setDataset(result);
-    setFilters(result.appliedFilters ?? filters);
-    void persistRecipe(next);
-    return result;
-  };
-
-  const redoRecipe = async () => {
-    const next = recipeHistory.redoTarget;
-    if (!next) return null;
-    const result = await worker.applyRecipe(next, filters, dataset?.aggregateColumns ?? []);
-    recipeHistory.redo();
-    setDataset(result);
-    setFilters(result.appliedFilters ?? filters);
-    void persistRecipe(next);
-    return result;
   };
 
   const previewRecipe = (recipe, stepIndex) => worker.previewRecipe(recipe, stepIndex);
 
   return (
     <div className={`app-shell ${collapsed ? "app-shell--collapsed" : ""}`}>
-      <Sidebar screen={screen} collapsed={collapsed} hasDataset={Boolean(dataset)} onNavigate={(nextScreen) => {
-        if (nextScreen === "input" || dataset) setScreen(nextScreen);
+      <Sidebar screen={screen} collapsed={collapsed} hasDataset={Boolean(dataset)} hasPrepared={flow.preparedInputs.length > 0} hasFlow={flow.preparedInputs.length > 0} onNavigate={(nextScreen) => {
+        if (nextScreen === "input" || (nextScreen === "compose" && flow.preparedInputs.length)) {
+          setScreen(nextScreen);
+          return;
+        }
+        if (nextScreen !== "data") return;
+        const preparedId = flowRef.current.preparedInputs.some((item) => item.id === flowRef.current.activeNodeId)
+          ? flowRef.current.activeNodeId
+          : activePreparedId ?? flowRef.current.preparedInputs[0]?.id;
+        if (preparedId) void openPrepared(preparedId);
       }} onCollapse={() => setCollapsed((value) => !value)} />
       {screen === "input" ? (
         <InputScreen
-          file={file}
           loading={loading}
           error={error}
           onFile={loadFile}
-          onDemo={showDemo}
+          onOpenSource={openPrepared}
+          onRelinkSource={relinkSourceFromPicker}
           workerReady={worker.ready}
           openedSources={openedSources}
+        />
+      ) : screen === "compose" ? (
+        <ComposeScreen
+          flow={composeSchemaState.graph}
+          dirty={flowDirty}
+          preview={composePreview}
+          loading={composeLoading}
+          error={composeError}
+          onSelectNode={selectComposeNode}
+          onPreviewDraft={previewComposeDraft}
+          onCreateNode={createComposeNode}
+          onUpdateNode={updateComposeOperation}
+          onDeleteNode={deleteComposeOperation}
+          onDeletePrepared={deletePreparedDataset}
+          onMoveNode={moveComposeNode}
+          onAutoArrange={autoArrangeComposeNodes}
+          onDuplicate={duplicatePreparation}
+          onCreatePrepared={createPreparationFromCompose}
+          onEditPreparation={openPrepared}
+          onExport={exportComposeNode}
         />
       ) : dataset ? (
         <DataScreen
           dataset={dataset}
+          activePreparedId={activePreparedId}
+          preparedName={flow.preparedInputs.find((item) => item.id === activePreparedId)?.name}
+          preparedOptions={preparedOptions}
           filters={filters}
           loading={loading}
           error={error}
@@ -1541,21 +2085,13 @@ export function App() {
           canRedo={recipeHistory.canRedo}
           onFiltersChange={applyFilters}
           onAggregateSearch={searchAggregate}
-          onExport={exportData}
           onRecipeChange={applyRecipeChange}
           onRecipeUndo={undoRecipe}
           onRecipeRedo={redoRecipe}
           onRecipePreview={previewRecipe}
+          onPreparedChange={openPrepared}
         />
       ) : null}
-      {pendingRecipeRestore && (
-        <RecipeRestoreDialog
-          pending={pendingRecipeRestore}
-          applying={restoringRecipe}
-          onIgnore={() => setPendingRecipeRestore(null)}
-          onApply={applyPendingRecipe}
-        />
-      )}
     </div>
   );
 }

@@ -2,7 +2,7 @@ import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-export default defineConfig(({ command }) => ({
+export default defineConfig(() => ({
   build: {
     outDir: "dist/client",
   },
@@ -19,7 +19,7 @@ export default defineConfig(({ command }) => ({
   resolve: {
     alias: {
       "@duckdb-bundles": fileURLToPath(
-        new URL(command === "build" ? "./src/duckdbBundles.cdn.js" : "./src/duckdbBundles.local.js", import.meta.url),
+        new URL("./src/duckdbBundles.cdn.js", import.meta.url),
       ),
     },
   },

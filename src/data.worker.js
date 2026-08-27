@@ -1,7 +1,10 @@
 import * as duckdb from "@duckdb/duckdb-wasm";
 import { DUCKDB_BUNDLES } from "@duckdb-bundles";
-import Papa from "papaparse";
-import { DATA_LIMITS, makeDemoRows, normalizeEmptyValues, parseDataFile, prepareSpreadsheetData } from "./data.js";
+import { compileComposeOperation } from "./composeSql.js";
+import { DATA_LIMITS, makeDemoRows, normalizeEmptyValues, parseDataFile } from "./data.js";
+import { encodeSpreadsheetExport } from "./dataExport.js";
+import { recipeForExecution } from "./preparedRecipeState.js";
+import { collectSourceColumns } from "./sourceInspection.js";
 import { compileRecipe, compileRecipeSafely, INTERNAL_ROW_ID } from "./transformations.js";
 
 const AGGREGATE_LIMIT = 100;
@@ -23,6 +26,23 @@ let currentRecipe = [];
 let stepStates = [];
 let engineVersion = "";
 let requestQueue = Promise.resolve();
+let activeRequestId = null;
+const sourceRegistry = new Map();
+const preparedRegistry = new Map();
+let activePreparedId = null;
+
+function reportProgress(phase, percent) {
+  if (activeRequestId === null) return;
+  self.postMessage({ kind: "progress", requestId: activeRequestId, phase, percent });
+}
+
+function registryTableName(sequence) {
+  return `source_${sequence}`;
+}
+
+function cloneRecipe(recipe = []) {
+  return recipe.map((step) => ({ ...step, params: { ...step.params } }));
+}
 
 function quoteIdentifier(identifier) {
   return `"${String(identifier).replaceAll('"', '""')}"`;
@@ -53,12 +73,17 @@ async function initializeDuckDB() {
   if (!databasePromise) {
     databasePromise = (async () => {
       try {
+        reportProgress("engine_select", 5);
         const bundle = await duckdb.selectBundle(DUCKDB_BUNDLES);
+        reportProgress("engine_worker", 15);
         engineWorker = await duckdb.createWorker(bundle.mainWorker);
         database = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), engineWorker);
+        reportProgress("engine_wasm", 30);
         await database.instantiate(bundle.mainModule, bundle.pthreadWorker);
+        reportProgress("engine_connect", 75);
         engineVersion = await database.getVersion();
         connection = await database.connect();
+        reportProgress("engine_ready", 100);
       } catch (error) {
         try {
           await database?.terminate();
@@ -174,9 +199,21 @@ function normalizeAggregateColumns(requestedColumns) {
   });
 }
 
-async function loadRows(rows, filename) {
+function createRegistryId(prefix) {
+  const value = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${prefix}-${value}`;
+}
+
+async function loadRows(rows, filename, identifiers = {}) {
+  reportProgress("engine_check", 10);
   await initializeDuckDB();
   const nextDatasetId = datasetId + 1;
+  const sourceId = identifiers.sourceId ?? createRegistryId("source");
+  const preparedId = identifiers.preparedId ?? createRegistryId("prepared");
+  const previousSourceEntry = sourceRegistry.get(sourceId);
+  const previousPreparedEntry = preparedRegistry.get(preparedId);
+  const tableName = previousSourceEntry?.tableName ?? registryTableName(nextDatasetId);
   const importPath = `tabulaflow-import-${nextDatasetId}.json`;
   const previousState = {
     datasetId,
@@ -189,14 +226,17 @@ async function loadRows(rows, filename) {
     qualityCache,
     currentRecipe,
     stepStates,
+    activePreparedId,
   };
 
+  reportProgress("register_data", 35);
   await database.registerFileText(importPath, JSON.stringify(rows));
   let transactionStarted = false;
   try {
     await query("BEGIN TRANSACTION");
     transactionStarted = true;
-    await query(`CREATE OR REPLACE TABLE ${SOURCE_TABLE} AS
+    reportProgress("create_table", 50);
+    await query(`CREATE OR REPLACE TABLE ${quoteIdentifier(tableName)} AS
       SELECT ROW_NUMBER() OVER () AS ${quoteIdentifier(INTERNAL_ROW_ID)}, *
       FROM read_json_auto(
         '${importPath}',
@@ -205,7 +245,8 @@ async function loadRows(rows, filename) {
         map_inference_threshold = -1,
         field_appearance_threshold = 0.0
       )`);
-    await query(`CREATE OR REPLACE TEMP VIEW ${WORKING_VIEW} AS SELECT * FROM ${SOURCE_TABLE}`);
+    await query(`CREATE OR REPLACE TEMP VIEW ${WORKING_VIEW} AS SELECT * FROM ${quoteIdentifier(tableName)}`);
+    reportProgress("profile_data", 70);
     await refreshMetadata();
     sourceColumns = [...columns];
     aggregateColumns = normalizeAggregateColumns();
@@ -214,9 +255,15 @@ async function loadRows(rows, filename) {
     qualityCache = null;
     currentRecipe = [];
     stepStates = [];
+    activePreparedId = preparedId;
+    const sourceEntry = { id: sourceId, tableName, filename, sourceColumns: [...sourceColumns] };
+    sourceRegistry.set(sourceId, sourceEntry);
+    preparedRegistry.set(preparedId, { id: preparedId, sourceId, recipe: [], sourceColumns: [...sourceColumns], filename });
     const result = await buildDataset();
+    reportProgress("commit_data", 95);
     await query("COMMIT");
-    return result;
+    await query(`CREATE OR REPLACE TEMP VIEW ${SOURCE_TABLE} AS SELECT * FROM ${quoteIdentifier(tableName)}`);
+    return { ...result, sourceId, preparedId };
   } catch (error) {
     if (transactionStarted) {
       try {
@@ -225,7 +272,11 @@ async function loadRows(rows, filename) {
         // Preserve the original import error; a failed rollback will require worker recovery.
       }
     }
-    ({ datasetId, sourceName, rowCount, columns, sourceColumns, columnTypes, aggregateColumns, qualityCache, currentRecipe, stepStates } = previousState);
+    if (previousSourceEntry) sourceRegistry.set(sourceId, previousSourceEntry);
+    else sourceRegistry.delete(sourceId);
+    if (previousPreparedEntry) preparedRegistry.set(preparedId, previousPreparedEntry);
+    else preparedRegistry.delete(preparedId);
+    ({ datasetId, sourceName, rowCount, columns, sourceColumns, columnTypes, aggregateColumns, qualityCache, currentRecipe, stepStates, activePreparedId } = previousState);
     throw error;
   } finally {
     try {
@@ -358,6 +409,9 @@ async function buildDataset(filters = {}, requestedAggregateColumns) {
     recipe: currentRecipe,
     stepStates,
     sourceColumns,
+    columnTypes: Object.fromEntries(columnTypes),
+    preparedId: activePreparedId,
+    sourceId: activePreparedId ? preparedRegistry.get(activePreparedId)?.sourceId ?? null : null,
     engine: { name: "DuckDB-Wasm", version: engineVersion },
   };
 }
@@ -395,20 +449,172 @@ async function exportRows(format, filters) {
     throw new Error(`Ekspor dibatasi ${DATA_LIMITS.maxExportRows.toLocaleString("id-ID")} baris. Persempit data dengan filter.`);
   }
   const filteredRows = await query(`SELECT ${displayProjection()} FROM ${WORKING_VIEW} ${where.sql}`, where.parameters);
-  const spreadsheet = prepareSpreadsheetData(filteredRows, columns);
   const baseName = sourceName.replace(/\.[^.]+$/, "") || "tabulaflow-data";
-  if (format === "csv") {
-    const text = `\uFEFF${Papa.unparse({ fields: spreadsheet.headers, data: spreadsheet.data })}`;
-    return { bytes: new TextEncoder().encode(text).buffer, filename: `${baseName}-filtered.csv`, mime: "text/csv;charset=utf-8" };
+  return encodeSpreadsheetExport(filteredRows, columns, format, `${baseName}-filtered`);
+}
+
+async function activatePrepared(preparedId, filters = {}, requestedAggregateColumns) {
+  const prepared = preparedRegistry.get(preparedId);
+  const source = prepared ? sourceRegistry.get(prepared.sourceId) : null;
+  if (!prepared || !source) {
+    const error = new Error("Source is unavailable in this session.");
+    error.code = "SOURCE_REQUIRED";
+    throw error;
   }
-  const XLSX = await import("xlsx");
-  const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([spreadsheet.headers, ...spreadsheet.data]), "Filtered Data");
-  return {
-    bytes: XLSX.write(workbook, { bookType: "xlsx", type: "array" }),
-    filename: `${baseName}-filtered.xlsx`,
-    mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  const compiled = compileRecipeSafely(prepared.recipe, prepared.sourceColumns, source.tableName);
+  const previousState = {
+    sourceName,
+    sourceColumns,
+    rowCount,
+    columns,
+    columnTypes,
+    aggregateColumns,
+    qualityCache,
+    currentRecipe,
+    stepStates,
+    activePreparedId,
   };
+  await query("BEGIN TRANSACTION");
+  try {
+    await query(`CREATE OR REPLACE TEMP VIEW ${SOURCE_TABLE} AS SELECT * FROM ${quoteIdentifier(source.tableName)}`);
+    await query(`CREATE OR REPLACE TEMP VIEW ${WORKING_VIEW} AS ${compiled.sql}`);
+    sourceName = source.filename;
+    sourceColumns = [...prepared.sourceColumns];
+    currentRecipe = cloneRecipe(prepared.recipe);
+    stepStates = compiled.stepStates;
+    activePreparedId = preparedId;
+    qualityCache = null;
+    await refreshMetadata();
+    aggregateColumns = normalizeAggregateColumns(requestedAggregateColumns);
+    const filterState = reconcileWorkerFilters(filters);
+    const result = await buildDataset(filterState.appliedFilters, aggregateColumns);
+    await query("COMMIT");
+    return { ...result, ...filterState, recipeError: compiled.recipeError };
+  } catch (error) {
+    try { await query("ROLLBACK"); } catch { /* recovery owns a failed rollback */ }
+    ({ sourceName, sourceColumns, rowCount, columns, columnTypes, aggregateColumns, qualityCache, currentRecipe, stepStates, activePreparedId } = previousState);
+    throw error;
+  }
+}
+
+function registerPreparedCopy(preparedId, sourcePreparedId, recipe = null) {
+  const source = preparedRegistry.get(sourcePreparedId);
+  if (!source) throw new Error("Preparation sumber untuk duplikasi tidak tersedia.");
+  preparedRegistry.set(preparedId, {
+    ...source,
+    id: preparedId,
+    recipe: cloneRecipe(recipe ?? source.recipe),
+  });
+  return { preparedId, sourceId: source.sourceId };
+}
+
+function unregisterPrepared(preparedId) {
+  const prepared = preparedRegistry.get(preparedId);
+  if (!prepared) return { preparedId, removed: false };
+  preparedRegistry.delete(preparedId);
+  const sourceStillUsed = [...preparedRegistry.values()].some((entry) => entry.sourceId === prepared.sourceId);
+  if (!sourceStillUsed) sourceRegistry.delete(prepared.sourceId);
+  if (activePreparedId === preparedId) activePreparedId = null;
+  return { preparedId, sourceId: prepared.sourceId, removed: true, sourceRemoved: !sourceStillUsed };
+}
+
+async function materializeComposePrepared(graph, nodeId, identifiers) {
+  const relation = await compileGraphNode(graph, nodeId);
+  const described = relation.schema?.length ? relation.schema : await describeRelation(relation.sql);
+  const schema = described.filter((column) => column.name !== INTERNAL_ROW_ID);
+  if (!schema.length) throw new Error("Hasil Compose tidak memiliki kolom untuk disiapkan.");
+  const sourceId = identifiers.sourceId;
+  const preparedId = identifiers.preparedId;
+  const filename = identifiers.filename;
+  const tableName = `source_compose_${String(sourceId).replaceAll(/[^a-zA-Z0-9_]/g, "_")}`;
+  const previousSourceEntry = sourceRegistry.get(sourceId);
+  const previousPreparedEntry = preparedRegistry.get(preparedId);
+  const projection = schema.map((column) => quoteIdentifier(column.name)).join(", ");
+  await query("BEGIN TRANSACTION");
+  try {
+    await query(`CREATE OR REPLACE TABLE ${quoteIdentifier(tableName)} AS
+      SELECT ROW_NUMBER() OVER () AS ${quoteIdentifier(INTERNAL_ROW_ID)}, ${projection}
+      FROM (${relation.sql}) AS compose_materialized`);
+    const count = await query(`SELECT COUNT(*) AS row_count FROM ${quoteIdentifier(tableName)}`);
+    const sourceColumns = schema.map((column) => column.name);
+    sourceRegistry.set(sourceId, { id: sourceId, tableName, filename, sourceColumns });
+    preparedRegistry.set(preparedId, { id: preparedId, sourceId, recipe: [], sourceColumns, filename });
+    await query("COMMIT");
+    return { sourceId, preparedId, schema, rowCount: Number(count[0]?.row_count ?? 0) };
+  } catch (error) {
+    try { await query("ROLLBACK"); } catch { /* recovery owns a failed rollback */ }
+    if (previousSourceEntry) sourceRegistry.set(sourceId, previousSourceEntry);
+    else sourceRegistry.delete(sourceId);
+    if (previousPreparedEntry) preparedRegistry.set(preparedId, previousPreparedEntry);
+    else preparedRegistry.delete(preparedId);
+    throw error;
+  }
+}
+
+async function describeRelation(sql) {
+  const rows = await query(`DESCRIBE SELECT * FROM (${sql}) AS relation_schema`);
+  return rows.map((row) => ({ name: row.column_name, type: row.column_type }));
+}
+
+async function preparedRelation(preparedId, graphPrepared) {
+  const prepared = preparedRegistry.get(preparedId);
+  const source = prepared ? sourceRegistry.get(prepared.sourceId) : null;
+  if (!prepared || !source) throw new Error(`Source is unavailable in this session for ${graphPrepared?.name ?? preparedId}.`);
+  const recipe = recipeForExecution(graphPrepared, prepared.recipe);
+  const compiled = compileRecipe(recipe, prepared.sourceColumns, source.tableName);
+  const schema = await describeRelation(compiled.sql);
+  return { sql: compiled.sql, schema };
+}
+
+async function compileGraphNode(graph, nodeId, cache = new Map(), visiting = new Set()) {
+  if (cache.has(nodeId)) return cache.get(nodeId);
+  if (visiting.has(nodeId)) throw new Error("Flow tidak boleh memiliki siklus.");
+  visiting.add(nodeId);
+  const graphPrepared = graph.preparedInputs?.find((item) => item.id === nodeId);
+  if (graphPrepared) {
+    const sourceAsset = graph.sourceAssets?.find((item) => item.id === graphPrepared.sourceAssetId);
+    if (sourceAsset?.status === "unlinked") throw new Error(`Source is unavailable in this session for ${graphPrepared.name ?? nodeId}.`);
+    const relation = await preparedRelation(nodeId, graphPrepared);
+    cache.set(nodeId, relation);
+    visiting.delete(nodeId);
+    return relation;
+  }
+  const node = graph.composeNodes?.find((item) => item.id === nodeId);
+  if (!node) throw new Error(`Node ${nodeId} tidak tersedia.`);
+  const inputs = [];
+  for (const inputId of node.inputIds ?? []) inputs.push(await compileGraphNode(graph, inputId, cache, visiting));
+  const relation = compileComposeOperation(node.kind, inputs, node.config ?? {});
+  cache.set(nodeId, relation);
+  visiting.delete(nodeId);
+  return relation;
+}
+
+async function previewComposeNode(graph, nodeId) {
+  const relation = await compileGraphNode(graph, nodeId);
+  const schema = relation.schema?.length ? relation.schema : await describeRelation(relation.sql);
+  const visibleSchema = schema.filter((column) => column.name !== INTERNAL_ROW_ID);
+  const projection = visibleSchema.map((column) => {
+    const identifier = quoteIdentifier(column.name);
+    return /DATE|TIME/.test(String(column.type).toUpperCase()) ? `CAST(${identifier} AS VARCHAR) AS ${identifier}` : identifier;
+  }).join(", ");
+  const count = await query(`SELECT COUNT(*) AS row_count FROM (${relation.sql}) AS compose_count`);
+  const preview = await query(`SELECT ${projection} FROM (${relation.sql}) AS compose_preview LIMIT 100`);
+  return {
+    nodeId,
+    columns: visibleSchema.map((column) => column.name),
+    columnTypes: Object.fromEntries(visibleSchema.map((column) => [column.name, column.type])),
+    schema: visibleSchema,
+    rowCount: Number(count[0]?.row_count ?? 0),
+    preview,
+  };
+}
+
+async function exportComposeNode(graph, nodeId, format) {
+  const result = await previewComposeNode(graph, nodeId);
+  if (result.rowCount > DATA_LIMITS.maxExportRows) throw new Error(`Ekspor dibatasi ${DATA_LIMITS.maxExportRows.toLocaleString("id-ID")} baris.`);
+  const relation = await compileGraphNode(graph, nodeId);
+  const rows = await query(`SELECT ${result.columns.map(quoteIdentifier).join(", ")} FROM (${relation.sql}) AS compose_export`);
+  return encodeSpreadsheetExport(rows, result.columns, format, `tabulaflow-${nodeId}`, "Composed Data");
 }
 
 function reconcileWorkerFilters(filters = {}) {
@@ -421,7 +627,8 @@ function reconcileWorkerFilters(filters = {}) {
   return { appliedFilters, removedFilterColumns };
 }
 
-async function applyRecipe(recipe, filters = {}, requestedAggregateColumns) {
+async function applyRecipe(recipe, filters = {}, requestedAggregateColumns, preparedId = activePreparedId) {
+  if (preparedId && preparedId !== activePreparedId) await activatePrepared(preparedId);
   const compiled = compileRecipeSafely(recipe, sourceColumns);
   const previousState = {
     rowCount,
@@ -445,6 +652,9 @@ async function applyRecipe(recipe, filters = {}, requestedAggregateColumns) {
     const filterState = reconcileWorkerFilters(filters);
     const result = await buildDataset(filterState.appliedFilters, aggregateColumns);
     await query("COMMIT");
+    if (activePreparedId && preparedRegistry.has(activePreparedId)) {
+      preparedRegistry.set(activePreparedId, { ...preparedRegistry.get(activePreparedId), recipe: cloneRecipe(recipe) });
+    }
     return { ...result, ...filterState, recipeError: compiled.recipeError };
   } catch (error) {
     if (transactionStarted) {
@@ -484,22 +694,44 @@ async function previewRecipe(recipe, stepIndex) {
 }
 
 async function handleRequest(type, payload) {
-  if (type === "load-file") return loadRows(normalizeEmptyValues(await parseDataFile(payload.file)), payload.file.name);
-  if (type === "load-demo") return loadRows(makeDemoRows(), "penjualan_agustus.xlsx");
+  if (type === "initialize") return initializeDuckDB().then(() => ({ engineVersion }));
+  if (type === "load-file") {
+    reportProgress("read_file", 5);
+    const rows = normalizeEmptyValues(await parseDataFile(payload.file));
+    reportProgress("normalize_data", 20);
+    return loadRows(rows, payload.file.name, payload);
+  }
+  if (type === "inspect-file") {
+    const rows = normalizeEmptyValues(await parseDataFile(payload.file));
+    return { sourceColumns: collectSourceColumns(rows) };
+  }
+  if (type === "load-demo") return loadRows(makeDemoRows(), "penjualan_agustus.xlsx", payload);
+  if (type === "activate-prepared") return activatePrepared(payload.preparedId, payload.filters, payload.aggregateColumns);
+  if (type === "register-prepared-copy") return registerPreparedCopy(payload.preparedId, payload.sourcePreparedId, payload.recipe);
+  if (type === "unregister-prepared") return unregisterPrepared(payload.preparedId);
+  if (type === "materialize-compose-prepared") return materializeComposePrepared(payload.graph, payload.nodeId, payload.identifiers);
   if (type === "filter") return buildDataset(payload.filters, payload.aggregateColumns);
   if (type === "search-aggregate") return searchAggregate(payload.column, payload.query, payload.filters);
   if (type === "export") return exportRows(payload.format, payload.filters);
-  if (type === "apply-recipe") return applyRecipe(payload.recipe, payload.filters, payload.aggregateColumns);
+  if (type === "apply-recipe") return applyRecipe(payload.recipe, payload.filters, payload.aggregateColumns, payload.preparedId);
   if (type === "preview-recipe") return previewRecipe(payload.recipe, payload.stepIndex);
+  if (type === "compose-preview") return previewComposeNode(payload.graph, payload.nodeId);
+  if (type === "compose-export") return exportComposeNode(payload.graph, payload.nodeId, payload.format);
   throw new Error("Operasi worker tidak dikenal.");
 }
 
 self.addEventListener("message", (event) => {
   const { requestId, type, payload = {} } = event.data;
   requestQueue = requestQueue.then(async () => {
-    const result = await handleRequest(type, payload);
-    self.postMessage({ requestId, ok: true, result }, type === "export" ? [result.bytes] : []);
+    activeRequestId = requestId;
+    try {
+      const result = await handleRequest(type, payload);
+      self.postMessage({ requestId, ok: true, result }, type === "export" || type === "compose-export" ? [result.bytes] : []);
+    } finally {
+      activeRequestId = null;
+    }
   }).catch((error) => {
+    activeRequestId = null;
     self.postMessage({
       requestId,
       ok: false,

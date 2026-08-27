@@ -10,6 +10,7 @@ export const TRANSFORMATION_TYPES = Object.freeze([
   { type: "remove-duplicates", group: "Clean", label: "Hapus duplikat" },
   { type: "standardize-case", group: "Clean", label: "Seragamkan huruf" },
   { type: "parse-date", group: "Clean", label: "Baca tanggal" },
+  { type: "delete-rows", group: "Clean", label: "Hapus baris" },
   { type: "select-columns", group: "Build", label: "Pilih kolom" },
   { type: "remove-columns", group: "Build", label: "Hapus kolom" },
   { type: "sort", group: "Build", label: "Urutkan baris" },
@@ -35,6 +36,32 @@ const CASE_MODES = new Set(["lower", "upper", "title"]);
 const CALCULATION_OPERATORS = new Set(["+", "-", "*", "/"]);
 const COMPARISON_OPERATORS = new Set(["=", "!=", ">", ">=", "<", "<="]);
 const AGGREGATE_FUNCTIONS = new Set(["COUNT", "SUM", "AVG", "MIN", "MAX"]);
+const VALUELESS_DELETE_OPERATORS = new Set(["is-null", "is-not-null", "is-empty", "is-not-empty"]);
+
+export function transformationParamsAreComplete(type, params = {}) {
+  if (type !== "delete-rows") return true;
+  const operator = String(params.operator ?? "");
+  if (!operator) return false;
+  if (VALUELESS_DELETE_OPERATORS.has(operator)) return true;
+  if (params.exactValue === true && params.value !== null && params.value !== undefined) return true;
+  return String(params.value ?? "").trim().length > 0;
+}
+
+export function valueRowActionParams(action, column, value) {
+  if (action !== "keep" && action !== "delete") throw new Error("Aksi nilai tidak didukung.");
+  if (!String(column ?? "").trim()) throw new Error("Kolom aksi nilai wajib diisi.");
+  if (value === null || value === undefined) {
+    return { column, operator: action === "keep" ? "is-not-null" : "is-null", valueAction: action };
+  }
+  return {
+    column,
+    operator: action === "keep" ? "not-equals" : "equals",
+    value,
+    exactValue: true,
+    valueAction: action,
+    ...(action === "keep" ? { nullSafe: true } : {}),
+  };
+}
 
 export function createStep(type, params = {}) {
   if (!TYPE_LABELS.has(type)) throw new Error("Tipe langkah tidak dikenal.");
@@ -91,8 +118,8 @@ function requireColumns(columns, requested, minimum = 1) {
   return selected;
 }
 
-function stepInputName(index) {
-  return index === 0 ? "source_data" : `step_${index}`;
+function stepInputName(index, sourceRelation) {
+  return index === 0 ? sourceRelation : `step_${index}`;
 }
 
 function compileEnabledStep(step, input, columns) {
@@ -142,6 +169,27 @@ function compileEnabledStep(step, input, columns) {
     const identifier = requireColumn(columns, params.column);
     const format = String(params.format ?? "%Y-%m-%d");
     sql = `SELECT * REPLACE (TRY_STRPTIME(CAST(${identifier} AS VARCHAR), ${sqlLiteral(format)})::DATE AS ${identifier}) FROM ${source}`;
+  } else if (step.type === "delete-rows") {
+    const identifier = requireColumn(columns, params.column);
+    const operator = String(params.operator ?? "equals");
+    const textValue = sqlLiteral(String(params.value ?? ""));
+    let predicate;
+    if (operator === "equals") predicate = `CAST(${identifier} AS VARCHAR) = ${textValue}`;
+    else if (operator === "not-equals") predicate = params.nullSafe === true
+      ? `CAST(${identifier} AS VARCHAR) IS DISTINCT FROM ${textValue}`
+      : `CAST(${identifier} AS VARCHAR) <> ${textValue}`;
+    else if (operator === "contains") predicate = `STRPOS(CAST(${identifier} AS VARCHAR), ${textValue}) > 0`;
+    else if (operator === "not-contains") predicate = `STRPOS(CAST(${identifier} AS VARCHAR), ${textValue}) = 0`;
+    else if (operator === "greater-than") predicate = `TRY_CAST(${identifier} AS DOUBLE) > TRY_CAST(${textValue} AS DOUBLE)`;
+    else if (operator === "greater-or-equal") predicate = `TRY_CAST(${identifier} AS DOUBLE) >= TRY_CAST(${textValue} AS DOUBLE)`;
+    else if (operator === "less-than") predicate = `TRY_CAST(${identifier} AS DOUBLE) < TRY_CAST(${textValue} AS DOUBLE)`;
+    else if (operator === "less-or-equal") predicate = `TRY_CAST(${identifier} AS DOUBLE) <= TRY_CAST(${textValue} AS DOUBLE)`;
+    else if (operator === "is-null") predicate = `${identifier} IS NULL`;
+    else if (operator === "is-not-null") predicate = `${identifier} IS NOT NULL`;
+    else if (operator === "is-empty") predicate = `${identifier} IS NULL OR TRIM(CAST(${identifier} AS VARCHAR)) = ''`;
+    else if (operator === "is-not-empty") predicate = `${identifier} IS NOT NULL AND TRIM(CAST(${identifier} AS VARCHAR)) <> ''`;
+    else throw new Error("Kondisi hapus baris tidak didukung.");
+    sql = `SELECT * FROM ${source} WHERE NOT COALESCE((${predicate}), FALSE)`;
   } else if (step.type === "select-columns") {
     const selected = requireColumns(columns, params.columns);
     sql = `SELECT ${quoteIdentifier(INTERNAL_ROW_ID)}, ${selected.map(quoteIdentifier).join(", ")} FROM ${source}`;
@@ -189,7 +237,7 @@ function compileEnabledStep(step, input, columns) {
   return { sql, columns: nextColumns };
 }
 
-export function compileRecipe(recipe, sourceColumns) {
+export function compileRecipe(recipe, sourceColumns, sourceRelation = "source_data") {
   if (!Array.isArray(recipe)) throw new Error("Recipe harus berupa array.");
   const ids = new Set();
   let columns = [...sourceColumns];
@@ -217,7 +265,7 @@ export function compileRecipe(recipe, sourceColumns) {
       stepStates.push({ id: step.id, status: "disabled", inputColumns: [...columns], outputColumns: [...columns] });
       return;
     }
-    const input = stepInputName(enabledIndex);
+    const input = stepInputName(enabledIndex, sourceRelation);
     let compiled;
     try {
       compiled = compileEnabledStep(step, input, columns);
@@ -235,7 +283,7 @@ export function compileRecipe(recipe, sourceColumns) {
     columns = compiled.columns;
   });
 
-  const finalSource = enabledIndex === 0 ? quoteIdentifier("source_data") : quoteIdentifier(`step_${enabledIndex}`);
+  const finalSource = enabledIndex === 0 ? quoteIdentifier(sourceRelation) : quoteIdentifier(`step_${enabledIndex}`);
   return {
     sql: ctes.length ? `WITH ${ctes.join(",\n")} SELECT * FROM ${finalSource}` : `SELECT * FROM ${finalSource}`,
     columns,
@@ -243,13 +291,13 @@ export function compileRecipe(recipe, sourceColumns) {
   };
 }
 
-export function compileRecipeSafely(recipe, sourceColumns) {
+export function compileRecipeSafely(recipe, sourceColumns, sourceRelation = "source_data") {
   try {
-    return { ...compileRecipe(recipe, sourceColumns), recipeError: null };
+    return { ...compileRecipe(recipe, sourceColumns, sourceRelation), recipeError: null };
   } catch (error) {
     if (error?.code !== "INVALID_RECIPE_STEP" || !Number.isInteger(error.stepIndex)) throw error;
     const validPrefix = recipe.slice(0, error.stepIndex);
-    const compiled = compileRecipe(validPrefix, sourceColumns);
+    const compiled = compileRecipe(validPrefix, sourceColumns, sourceRelation);
     const invalidStep = recipe[error.stepIndex];
     const trailingStates = recipe.slice(error.stepIndex).map((step, offset) => ({
       id: step?.id ?? `invalid-${error.stepIndex + offset}`,
@@ -275,6 +323,7 @@ export function summarizeStep(step) {
   if (step.type === "rename-column") return `${params.column ?? "?"} → ${params.newName ?? "?"}`;
   if (step.type === "change-type") return `${params.column ?? "?"} → ${params.targetType ?? "?"}`;
   if (["trim", "remove-empty-rows", "standardize-case", "parse-date", "sort"].includes(step.type)) return String(params.column ?? "Pilih kolom");
+  if (step.type === "delete-rows") return `${params.column ?? "?"}: ${params.operator ?? "equals"}${params.value === undefined ? "" : ` ${params.value}`}`;
   if (["remove-duplicates", "select-columns", "remove-columns"].includes(step.type)) return normalizeColumns(params.columns).join(", ") || "Pilih kolom";
   if (step.type === "replace-value") return `${params.column ?? "?"}: ${params.from ?? ""} → ${params.to ?? ""}`;
   if (step.type === "fill-empty") return `${params.column ?? "?"} → ${params.value ?? ""}`;

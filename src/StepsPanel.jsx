@@ -18,6 +18,7 @@ import {
   CREATABLE_TRANSFORMATION_TYPES,
   summarizeStep,
   TRANSFORMATION_TYPES,
+  transformationParamsAreComplete,
 } from "./transformations.js";
 import { useI18n } from "./i18n.jsx";
 
@@ -32,6 +33,7 @@ const FIELD_DEFINITIONS = {
   "remove-duplicates": [["columns", "fieldKeyColumns", "text"], ["keep", "fieldKeep", "keep"]],
   "standardize-case": [["column", "fieldColumn", "column"], ["mode", "fieldFormat", "case-mode"]],
   "parse-date": [["column", "fieldColumn", "column"], ["format", "fieldDateFormat", "text"]],
+  "delete-rows": [["column", "fieldColumn", "column"], ["operator", "fieldDeleteCondition", "delete-condition"], ["value", "fieldComparison", "text"]],
   "select-columns": [["columns", "fieldColumns", "text"]],
   "remove-columns": [["columns", "fieldColumns", "text"]],
   sort: [["column", "fieldColumn", "column"], ["direction", "fieldDirection", "direction"]],
@@ -46,6 +48,7 @@ const DEFAULT_PARAMS = {
   "remove-duplicates": { keep: "first" },
   "standardize-case": { mode: "lower" },
   "parse-date": { format: "%Y-%m-%d" },
+  "delete-rows": { operator: "equals" },
   sort: { direction: "asc" },
   "calculated-column": { operator: "+", value: 0 },
   "conditional-column": { operator: "=" },
@@ -62,6 +65,17 @@ const BOUND_COLUMN_FIELD = {
 
 function boundColumnFieldFor(type) {
   return BOUND_COLUMN_FIELD[type] ?? "column";
+}
+
+function valueRowActionFor(step) {
+  if (step.type !== "delete-rows") return null;
+  const params = step.params ?? {};
+  if (params.valueAction === "keep" || params.valueAction === "delete") return params.valueAction;
+  if (params.operator === "is-not-null") return "keep";
+  if (params.operator === "is-null") return "delete";
+  if (params.exactValue === true && params.operator === "not-equals" && params.nullSafe === true) return "keep";
+  if (params.exactValue === true && params.operator === "equals") return "delete";
+  return null;
 }
 
 function defaultParamsFor(type, availableColumns, initialColumn = availableColumns[0] ?? "") {
@@ -110,6 +124,21 @@ function StepField({ definition, value, columns, onChange }) {
     control = <SelectField value={value} onChange={onChange} options={["+", "-", "*", "/"]} />;
   } else if (kind === "comparison") {
     control = <SelectField value={value} onChange={onChange} options={["=", "!=", ">", ">=", "<", "<="]} />;
+  } else if (kind === "delete-condition") {
+    control = <SelectField value={value} onChange={onChange} options={[
+      { value: "equals", label: t("equals") },
+      { value: "not-equals", label: t("notEquals") },
+      { value: "contains", label: t("contains") },
+      { value: "not-contains", label: t("notContains") },
+      { value: "greater-than", label: t("greaterThan") },
+      { value: "greater-or-equal", label: t("greaterOrEqual") },
+      { value: "less-than", label: t("lessThan") },
+      { value: "less-or-equal", label: t("lessOrEqual") },
+      { value: "is-null", label: t("isNull") },
+      { value: "is-not-null", label: t("isNotNull") },
+      { value: "is-empty", label: t("isEmpty") },
+      { value: "is-not-empty", label: t("isNotEmpty") },
+    ]} />;
   } else if (kind === "aggregate") {
     control = <SelectField value={value} onChange={onChange} options={["COUNT", "SUM", "AVG", "MIN", "MAX"]} />;
   } else {
@@ -142,6 +171,7 @@ export function TransformationForm({
     if (!currentType || CREATABLE_TRANSFORMATION_TYPES.some((item) => item.type === draftType)) return CREATABLE_TRANSFORMATION_TYPES;
     return [currentType, ...CREATABLE_TRANSFORMATION_TYPES];
   }, [draftType]);
+  const paramsComplete = transformationParamsAreComplete(draftType, params);
 
   const changeType = (type) => {
     setDraftType(type);
@@ -149,7 +179,7 @@ export function TransformationForm({
   };
 
   return (
-    <form className="step-form" onSubmit={(event) => { event.preventDefault(); onSubmit(draftType, { ...params }); }}>
+    <form className="step-form" onSubmit={(event) => { event.preventDefault(); if (paramsComplete) onSubmit(draftType, { ...params }); }}>
       <header>
         <div className="step-form__heading">
           {onBack && <button type="button" onClick={onBack} aria-label={t("backToTools")}><ArrowLeft /></button>}
@@ -160,9 +190,11 @@ export function TransformationForm({
       {!hideModule && <label className="step-field"><span>{t("module")}</span><select value={draftType} onChange={(event) => changeType(event.target.value)}>{["Clean", "Build"].map((group) => <optgroup key={group} label={group === "Clean" ? t("clean") : t("build")}>{selectableTypes.filter((item) => item.group === group).map((item) => <option key={item.type} value={item.type}>{toolLabel(item.type)}</option>)}</optgroup>)}</select></label>}
       {FIELD_DEFINITIONS[draftType]
         .filter(([name]) => !hideBoundColumn || name !== boundColumnFieldFor(draftType))
+        .filter(([name]) => !(draftType === "delete-rows" && name === "value" && ["is-null", "is-not-null", "is-empty", "is-not-empty"].includes(params.operator)))
         .map((definition) => <StepField key={definition[0]} definition={definition} value={params[definition[0]]} columns={availableColumns} onChange={(value) => setParams((current) => ({ ...current, [definition[0]]: value }))} />)}
       {error && <div className="step-form__error" role="alert"><WarningCircle weight="fill" />{error}</div>}
-      <footer><button type="button" onClick={onCancel}>{t("cancel")}</button><button type="submit" disabled={applying}>{applying ? t("applying") : submitLabel}</button></footer>
+      {!paramsComplete && <div className="step-form__validation" role="status">{t("comparisonRequired")}</div>}
+      <footer><button type="button" onClick={onCancel}>{t("cancel")}</button><button type="submit" disabled={applying || !paramsComplete}>{applying ? t("applying") : submitLabel}</button></footer>
     </form>
   );
 }
@@ -314,6 +346,15 @@ export function StepsPanel({
         {recipe.map((step, index) => {
           const state = stateById.get(step.id);
           const invalid = invalidStepId === step.id || state?.status === "invalid" || state?.status === "blocked";
+          const valueRowAction = valueRowActionFor(step);
+          const stepTitle = valueRowAction === "keep" ? t("keepRows") : valueRowAction === "delete" ? t("deleteRows") : toolLabel(step.type);
+          const stepSummary = valueRowAction
+            ? t("valueRowStepSummary", {
+              column: step.params?.column ?? "?",
+              value: step.params?.value === null || step.params?.value === undefined ? t("emptyValue") : String(step.params.value),
+            })
+            : summarizeStep(step);
+          const statusLabel = invalid ? t("invalid") : state?.status === "disabled" || step.enabled === false ? t("inactive") : null;
           return (
             <article
               key={step.id}
@@ -326,9 +367,9 @@ export function StepsPanel({
               <span className="step-card__index">{index + 1}</span>
               <DotsSixVertical className="step-card__drag" aria-hidden="true" />
               <div className="step-card__body">
-                <strong>{toolLabel(step.type)}</strong>
-                <span>{summarizeStep(step)}</span>
-                <small>{invalid ? t("invalid") : state?.status === "disabled" || step.enabled === false ? t("inactive") : t("valid")}</small>
+                <strong>{stepTitle}</strong>
+                <span>{stepSummary}</span>
+                {statusLabel && <small>{statusLabel}</small>}
               </div>
               <div className="step-card__actions">
                 <button type="button" onClick={() => move(index, -1)} disabled={index === 0 || applying} aria-label={t("moveStepUp")}><ArrowUp /></button>
