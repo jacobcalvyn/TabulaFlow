@@ -21,7 +21,7 @@ window.matchMedia = () => ({
 });
 window.requestAnimationFrame = (callback) => { callback(); return 1; };
 
-const { cleanup, fireEvent, render, within } = await import("@testing-library/react");
+const { act, cleanup, fireEvent, render, within } = await import("@testing-library/react");
 const vite = await createServer({
   appType: "custom",
   configFile: false,
@@ -123,6 +123,7 @@ test("a WebMCP delete request opens the existing confirmation without deleting",
   const view = renderCompose({
     deleteRequest: { target: "prepared-dataset", targetId: "prepared-a", token: "request-1" },
     onDeleteRequestShown(token) { calls.push(["shown", token]); },
+    onDeleteConfirmation(target, targetId, outcome) { calls.push(["confirmation", target, targetId, outcome]); },
     async onDeletePrepared(nodeId) { calls.push(["delete", nodeId]); return true; },
   });
 
@@ -130,9 +131,24 @@ test("a WebMCP delete request opens the existing confirmation without deleting",
   assert.deepEqual(calls, [["shown", "request-1"]]);
   assert.equal(calls.some(([type]) => type === "delete"), false);
 
-  fireEvent.click(within(confirmation).getByRole("button", { name: "Delete" }));
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.deepEqual(calls, [["shown", "request-1"], ["delete", "prepared-a"]]);
+  await act(async () => {
+    fireEvent.click(within(confirmation).getByRole("button", { name: "Delete" }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  assert.deepEqual(calls, [["shown", "request-1"], ["delete", "prepared-a"], ["confirmation", "prepared-dataset", "prepared-a", "confirmed"]]);
+  view.unmount();
+});
+
+test("cancelling a WebMCP delete request reports a terminal cancellation", () => {
+  const calls = [];
+  const view = renderCompose({
+    deleteRequest: { target: "prepared-dataset", targetId: "prepared-a", token: "request-cancel" },
+    onDeleteRequestShown(token) { calls.push(["shown", token]); },
+    onDeleteConfirmation(target, targetId, outcome) { calls.push(["confirmation", target, targetId, outcome]); },
+  });
+  const confirmation = view.getByText("Delete this dataset?").closest("div");
+  fireEvent.click(within(confirmation).getByRole("button", { name: "Cancel" }));
+  assert.deepEqual(calls, [["shown", "request-cancel"], ["confirmation", "prepared-dataset", "prepared-a", "cancelled"]]);
   view.unmount();
 });
 
@@ -158,11 +174,12 @@ test("a WebMCP recipe deletion also waits for visible confirmation", () => {
     previewedStepId: null,
     deleteRequest: { target: "recipe-step", targetId: "step-a", token: "request-2" },
     onDeleteRequestShown(token) { calls.push(["shown", token]); },
+    onDeleteConfirmation(target, targetId, outcome) { calls.push(["confirmation", target, targetId, outcome]); },
   })));
 
   const confirmation = view.getByText("Delete this step?").closest("div");
   assert.deepEqual(calls, [["shown", "request-2"]]);
   fireEvent.click(within(confirmation).getByRole("button", { name: "Delete" }));
-  assert.deepEqual(calls, [["shown", "request-2"], ["change", []]]);
+  assert.deepEqual(calls, [["shown", "request-2"], ["change", []], ["confirmation", "recipe-step", "step-a", "confirmed"]]);
   view.unmount();
 });

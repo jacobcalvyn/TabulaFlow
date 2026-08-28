@@ -1,6 +1,6 @@
 export const ACTIVITY_ACTORS = Object.freeze(["user", "agent", "system"]);
 export const ACTIVITY_ORIGINS = Object.freeze(["ui", "webmcp", "recovery"]);
-export const ACTIVITY_STATUSES = Object.freeze(["committed", "pending-confirmation", "failed"]);
+export const ACTIVITY_STATUSES = Object.freeze(["committed", "pending-confirmation", "cancelled", "failed"]);
 
 const SAFE_SUMMARY_KEYS = new Set([
   "aggregateColumnCount", "columnCount", "enabled", "filterCount", "format",

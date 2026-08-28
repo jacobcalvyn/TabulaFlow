@@ -2,7 +2,9 @@ import * as duckdb from "@duckdb/duckdb-wasm";
 import { DUCKDB_BUNDLES } from "@duckdb-bundles";
 import { compileComposeOperation } from "./composeSql.js";
 import { DATA_LIMITS, makeDemoRows, normalizeEmptyValues, parseDataFile } from "./data.js";
-import { encodeSpreadsheetExport } from "./dataExport.js";
+import { canExposeProfileRange, classifyColumnSemantics } from "./dataPrivacy.js";
+import { encodeSpreadsheetExport, sanitizeExportBaseName } from "./dataExport.js";
+import { buildJoinKeyCandidates, rankJoinKeyCandidates } from "./joinRecommendations.js";
 import { recipeForExecution } from "./preparedRecipeState.js";
 import { collectSourceColumns } from "./sourceInspection.js";
 import { compileRecipe, compileRecipeSafely, INTERNAL_ROW_ID } from "./transformations.js";
@@ -10,6 +12,8 @@ import { compileRecipe, compileRecipeSafely, INTERNAL_ROW_ID } from "./transform
 const AGGREGATE_LIMIT = 100;
 const WEBMCP_PREVIEW_COLUMN_LIMIT = 100;
 const WEBMCP_PROFILE_COLUMN_LIMIT = 50;
+const WEBMCP_DRY_RUN_PREVIEW_COLUMN_LIMIT = 20;
+const WEBMCP_DRY_RUN_PREVIEW_ROW_LIMIT = 20;
 const SOURCE_TABLE = "source_data";
 const WORKING_VIEW = "working_data";
 let databasePromise = null;
@@ -542,18 +546,20 @@ async function previewPreparedData(filters = {}, requestedColumns, offset = 0, l
 async function profileDataColumns(requestedColumns) {
   const selectedColumns = selectedKnownColumns(requestedColumns, WEBMCP_PROFILE_COLUMN_LIMIT);
   if (!qualityCache) qualityCache = await analyzeQuality();
+  const semanticsByColumn = new Map(selectedColumns.map((column) => [column, classifyColumnSemantics(column, columnTypes.get(column))]));
   const expressions = selectedColumns.flatMap((column, index) => {
     const identifier = quoteIdentifier(column);
     const type = String(columnTypes.get(column)).toUpperCase();
     const comparable = type.includes("JSON") || type.includes("UNION") || type.includes("STRUCT") || type.includes("[]")
       ? `CAST(${identifier} AS VARCHAR)`
       : identifier;
-    return [
+    const baseExpressions = [
       `COUNT(*) FILTER (WHERE ${identifier} IS NULL OR TRIM(CAST(${identifier} AS VARCHAR)) = '') AS missing_${index}`,
       `COUNT(DISTINCT CAST(${identifier} AS VARCHAR)) AS distinct_${index}`,
-      `MIN(${comparable}) AS min_${index}`,
-      `MAX(${comparable}) AS max_${index}`,
     ];
+    return canExposeProfileRange(semanticsByColumn.get(column), type)
+      ? [...baseExpressions, `MIN(${comparable}) AS min_${index}`, `MAX(${comparable}) AS max_${index}`]
+      : baseExpressions;
   });
   const stats = expressions.length ? (await query(`SELECT ${expressions.join(", ")} FROM ${WORKING_VIEW}`))[0] ?? {} : {};
   const qualityByColumn = new Map((qualityCache?.affectedColumns ?? []).map((item) => [item.column, item]));
@@ -566,22 +572,25 @@ async function profileDataColumns(requestedColumns) {
     quality: qualityCache,
     columns: selectedColumns.map((column, index) => {
       const issue = qualityByColumn.get(column);
+      const semantics = semanticsByColumn.get(column);
+      const exposeRange = canExposeProfileRange(semantics, columnTypes.get(column));
       return {
         name: column,
         type: columnTypes.get(column),
         missingCount: Number(stats[`missing_${index}`] ?? issue?.missing ?? 0),
         distinctCount: Number(stats[`distinct_${index}`] ?? 0),
-        min: stats[`min_${index}`] ?? null,
-        max: stats[`max_${index}`] ?? null,
+        min: exposeRange ? stats[`min_${index}`] ?? null : null,
+        max: exposeRange ? stats[`max_${index}`] ?? null : null,
+        rangeRedacted: !exposeRange,
         mixedType: Boolean(issue?.mixed),
         observedTypes: issue?.types ?? [typeToUi(columnTypes.get(column))],
-        semantics: { unit: null, currency: null, sensitivity: "unknown", requiresReview: true, source: "not-defined" },
+        semantics,
       };
     }),
   };
 }
 
-async function exportRows(format, filters) {
+async function exportRows(format, filters, requestedBaseName = null) {
   const where = buildWhere(filters);
   const countRows = await query(`SELECT COUNT(*) AS export_count FROM ${WORKING_VIEW} ${where.sql}`, where.parameters);
   const exportCount = Number(countRows[0]?.export_count ?? 0);
@@ -589,7 +598,7 @@ async function exportRows(format, filters) {
     throw new Error(`Ekspor dibatasi ${DATA_LIMITS.maxExportRows.toLocaleString("id-ID")} baris. Persempit data dengan filter.`);
   }
   const filteredRows = await query(`SELECT ${displayProjection()} FROM ${WORKING_VIEW} ${where.sql}`, where.parameters);
-  const baseName = sourceName.replace(/\.[^.]+$/, "") || "tabulaflow-data";
+  const baseName = sanitizeExportBaseName(requestedBaseName || sourceName);
   const hasFilters = Object.values(filters ?? {}).some(Boolean);
   return encodeSpreadsheetExport(filteredRows, columns, format, hasFilters ? `${baseName}-filtered` : baseName);
 }
@@ -734,9 +743,12 @@ async function previewComposeNode(graph, nodeId, options = {}) {
   const relation = await compileGraphNode(graph, nodeId);
   const schema = relation.schema?.length ? relation.schema : await describeRelation(relation.sql);
   const visibleSchema = schema.filter((column) => column.name !== INTERNAL_ROW_ID);
-  const requestedColumns = Array.isArray(options.columns) && options.columns.length
-    ? options.columns.map(String)
-    : visibleSchema.slice(0, WEBMCP_PREVIEW_COLUMN_LIMIT).map((column) => column.name);
+  const includeRows = options.includeRows !== false;
+  const requestedColumns = includeRows
+    ? (Array.isArray(options.columns) && options.columns.length
+      ? options.columns.map(String)
+      : visibleSchema.slice(0, WEBMCP_PREVIEW_COLUMN_LIMIT).map((column) => column.name))
+    : [];
   if (requestedColumns.length > WEBMCP_PREVIEW_COLUMN_LIMIT) throw new Error(`A maximum of ${WEBMCP_PREVIEW_COLUMN_LIMIT} columns can be returned per request.`);
   const schemaByName = new Map(visibleSchema.map((column) => [column.name, column]));
   const selectedSchema = requestedColumns.map((column) => {
@@ -750,7 +762,9 @@ async function previewComposeNode(graph, nodeId, options = {}) {
     return /DATE|TIME/.test(String(column.type).toUpperCase()) ? `CAST(${identifier} AS VARCHAR) AS ${identifier}` : identifier;
   }).join(", ");
   const count = await query(`SELECT COUNT(*) AS row_count FROM (${relation.sql}) AS compose_count`);
-  const preview = await query(`SELECT ${projection} FROM (${relation.sql}) AS compose_preview LIMIT ${page.limit} OFFSET ${page.offset}`);
+  const preview = includeRows
+    ? await query(`SELECT ${projection} FROM (${relation.sql}) AS compose_preview LIMIT ${page.limit} OFFSET ${page.offset}`)
+    : [];
   return {
     nodeId,
     columns: selectedSchema.map((column) => column.name),
@@ -767,12 +781,91 @@ async function previewComposeNode(graph, nodeId, options = {}) {
 }
 
 async function exportComposeNode(graph, nodeId, format) {
-  const result = await previewComposeNode(graph, nodeId);
+  const result = await previewComposeNode(graph, nodeId, { includeRows: false });
   if (result.rowCount > DATA_LIMITS.maxExportRows) throw new Error(`Ekspor dibatasi ${DATA_LIMITS.maxExportRows.toLocaleString("id-ID")} baris.`);
   const relation = await compileGraphNode(graph, nodeId);
   const exportColumns = result.schema.map((column) => column.name);
   const rows = await query(`SELECT ${exportColumns.map(quoteIdentifier).join(", ")} FROM (${relation.sql}) AS compose_export`);
-  return encodeSpreadsheetExport(rows, exportColumns, format, `tabulaflow-${nodeId}`, "Composed Data");
+  const node = graph.preparedInputs?.find((item) => item.id === nodeId) ?? graph.composeNodes?.find((item) => item.id === nodeId);
+  return encodeSpreadsheetExport(rows, exportColumns, format, sanitizeExportBaseName(node?.name, "tabulaflow-compose"), "Composed Data");
+}
+
+async function profileJoinColumns(relation, requestedColumns) {
+  const names = [...new Set(requestedColumns)].filter(Boolean);
+  if (!names.length) return new Map();
+  const expressions = ["COUNT(*) AS total_rows", ...names.flatMap((name, index) => {
+    const identifier = quoteIdentifier(name);
+    return [
+      `COUNT(*) FILTER (WHERE ${identifier} IS NULL OR TRIM(CAST(${identifier} AS VARCHAR)) = '') AS null_${index}`,
+      `COUNT(DISTINCT CAST(${identifier} AS VARCHAR)) AS distinct_${index}`,
+    ];
+  })];
+  const row = (await query(`SELECT ${expressions.join(", ")} FROM (${relation.sql}) AS join_profile`))[0] ?? {};
+  const totalRows = Number(row.total_rows ?? 0);
+  return new Map(names.map((name, index) => {
+    const missing = Number(row[`null_${index}`] ?? 0);
+    const nonMissing = Math.max(0, totalRows - missing);
+    const distinct = Number(row[`distinct_${index}`] ?? 0);
+    return [name, {
+      nullRatio: totalRows ? missing / totalRows : 1,
+      uniquenessRatio: nonMissing ? distinct / nonMissing : 0,
+    }];
+  }));
+}
+
+async function composeConnectionOptions(graph, nodeId) {
+  const graphNodes = [
+    ...(graph.preparedInputs ?? []).map((item) => ({ ...item, kind: "dataset" })),
+    ...(graph.composeNodes ?? []),
+  ];
+  const sourceNode = graphNodes.find((item) => item.id === nodeId);
+  if (!sourceNode) throw new Error(`Compose node not found: ${nodeId}`);
+  const sourceRelation = await compileGraphNode(graph, nodeId);
+  const sourceSchema = (sourceRelation.schema?.length ? sourceRelation.schema : await describeRelation(sourceRelation.sql))
+    .filter((column) => column.name !== INTERNAL_ROW_ID);
+  const preliminaryTargets = [];
+  const profiledSourceColumns = new Set();
+
+  for (const target of graphNodes.filter((item) => item.id !== nodeId)) {
+    try {
+      const targetRelation = await compileGraphNode(graph, target.id);
+      const targetSchema = (targetRelation.schema?.length ? targetRelation.schema : await describeRelation(targetRelation.sql))
+        .filter((column) => column.name !== INTERNAL_ROW_ID);
+      const candidateSet = buildJoinKeyCandidates(sourceSchema, targetSchema, { limit: 32 });
+      candidateSet.candidates.forEach((candidate) => profiledSourceColumns.add(candidate.left));
+      preliminaryTargets.push({ target, targetRelation, targetSchema, candidateSet });
+    } catch (error) {
+      preliminaryTargets.push({ target, error: error instanceof Error ? error.message : "Target could not be inspected." });
+    }
+  }
+
+  const sourceStats = await profileJoinColumns(sourceRelation, [...profiledSourceColumns]);
+  const targets = [];
+  for (const entry of preliminaryTargets) {
+    if (entry.error) {
+      targets.push({ targetNodeId: entry.target.id, targetName: entry.target.name, operations: [], appendCompatible: false, appendConflicts: [], keyPairCount: 0, compatibleKeyPairCount: 0, keyPairsTruncated: false, keyPairs: [], diagnostic: entry.error });
+      continue;
+    }
+    const targetStats = await profileJoinColumns(entry.targetRelation, entry.candidateSet.candidates.map((candidate) => candidate.right));
+    const keyPairs = rankJoinKeyCandidates(entry.candidateSet.candidates, sourceStats, targetStats, { limit: 12 })
+      .map((pair) => ({ ...pair, recommended: pair.exactName || pair.score >= 0.55 }));
+    const targetTypes = new Map(entry.targetSchema.map(({ name, type }) => [name, String(type).toUpperCase().replace(/\s+/g, " ").trim()]));
+    const appendConflicts = sourceSchema.filter(({ name, type }) => targetTypes.has(name) && targetTypes.get(name) !== String(type).toUpperCase().replace(/\s+/g, " ").trim());
+    const appendCompatible = appendConflicts.length === 0;
+    targets.push({
+      targetNodeId: entry.target.id,
+      targetName: entry.target.name,
+      operations: [...(appendCompatible ? ["append"] : []), ...(keyPairs.length ? ["join", "difference"] : [])],
+      appendCompatible,
+      appendConflicts: appendConflicts.map(({ name, type }) => ({ column: name, sourceType: type, targetType: targetTypes.get(name) })),
+      keyPairCount: keyPairs.length,
+      compatibleKeyPairCount: entry.candidateSet.compatiblePairCount,
+      keyPairsTruncated: entry.candidateSet.compatiblePairCount > keyPairs.length,
+      ranking: ["exact-name", "normalized-name-similarity", "uniqueness", "null-ratio"],
+      keyPairs,
+    });
+  }
+  return { nodeId, targets };
 }
 
 function reconcileWorkerFilters(filters = {}) {
@@ -827,13 +920,20 @@ async function applyRecipe(recipe, filters = {}, requestedAggregateColumns, prep
   }
 }
 
-async function previewRecipe(recipe, stepIndex) {
+async function previewRecipe(recipe, stepIndex, options = {}) {
   const lastIndex = Math.min(Math.max(Number(stepIndex), 0), recipe.length - 1);
   const selectedRecipe = recipe.slice(0, lastIndex + 1);
   const compiled = compileRecipe(selectedRecipe, sourceColumns);
   const description = await query(`DESCRIBE SELECT * FROM (${compiled.sql}) AS recipe_preview_schema`);
   const previewTypes = new Map(description.map((item) => [item.column_name, item.column_type]));
-  const projection = compiled.columns.map((column) => {
+  const includeRows = options.includeRows !== false;
+  const requestedColumns = includeRows && Array.isArray(options.columns) && options.columns.length
+    ? options.columns.map(String)
+    : includeRows ? compiled.columns : [];
+  if (options.columns?.length > WEBMCP_DRY_RUN_PREVIEW_COLUMN_LIMIT) throw new Error(`A dry-run preview can return at most ${WEBMCP_DRY_RUN_PREVIEW_COLUMN_LIMIT} columns.`);
+  const unknownColumns = requestedColumns.filter((column) => !previewTypes.has(column));
+  if (unknownColumns.length) throw new Error(`Recipe preview columns not found: ${unknownColumns.join(", ")}`);
+  const projection = requestedColumns.map((column) => {
     const identifier = quoteIdentifier(column);
     const type = String(previewTypes.get(column)).toUpperCase();
     return type.includes("DATE") || type.includes("TIME")
@@ -841,12 +941,17 @@ async function previewRecipe(recipe, stepIndex) {
       : identifier;
   }).join(", ");
   const countRows = await query(`SELECT COUNT(*) AS preview_count FROM (${compiled.sql}) AS recipe_preview`);
-  const preview = await query(`SELECT ${projection} FROM (${compiled.sql}) AS recipe_preview LIMIT 100`);
+  const previewLimit = options.limit === undefined
+    ? 100
+    : Math.min(WEBMCP_DRY_RUN_PREVIEW_ROW_LIMIT, Math.max(1, Number(options.limit) || WEBMCP_DRY_RUN_PREVIEW_ROW_LIMIT));
+  const preview = includeRows ? await query(`SELECT ${projection} FROM (${compiled.sql}) AS recipe_preview LIMIT ${previewLimit}`) : [];
   return {
     stepIndex: lastIndex,
     stepId: selectedRecipe.at(-1)?.id ?? null,
-    columns: compiled.columns,
+    schema: compiled.columns.map((name) => ({ name, type: previewTypes.get(name) ?? null })),
+    columns: requestedColumns,
     rowCount: Number(countRows[0]?.preview_count ?? 0),
+    previewRowCount: preview.length,
     preview,
   };
 }
@@ -872,11 +977,12 @@ async function handleRequest(type, payload) {
   if (type === "search-aggregate") return searchAggregate(payload.column, payload.query, payload.filters, payload.offset, payload.limit);
   if (type === "prepare-preview") return previewPreparedData(payload.filters, payload.columns, payload.offset, payload.limit);
   if (type === "data-profile") return profileDataColumns(payload.columns);
-  if (type === "export") return exportRows(payload.format, payload.filters);
+  if (type === "export") return exportRows(payload.format, payload.filters, payload.baseName);
   if (type === "apply-recipe") return applyRecipe(payload.recipe, payload.filters, payload.aggregateColumns, payload.preparedId);
-  if (type === "preview-recipe") return previewRecipe(payload.recipe, payload.stepIndex);
+  if (type === "preview-recipe") return previewRecipe(payload.recipe, payload.stepIndex, payload.options);
   if (type === "compose-preview") return previewComposeNode(payload.graph, payload.nodeId, payload.options);
   if (type === "compose-export") return exportComposeNode(payload.graph, payload.nodeId, payload.format);
+  if (type === "compose-connection-options") return composeConnectionOptions(payload.graph, payload.nodeId);
   throw new Error("Operasi worker tidak dikenal.");
 }
 

@@ -233,7 +233,7 @@ export function useDataWorker() {
   const searchAggregate = useCallback((column, query, filters, options = {}) => request("search-aggregate", { column, query, filters, ...options }), [request]);
   const previewPrepared = useCallback((filters, columns, options = {}) => request("prepare-preview", { filters, columns, ...options }), [request]);
   const profileData = useCallback((columns) => request("data-profile", { columns }), [request]);
-  const exportData = useCallback((format, filters) => request("export", { format, filters }), [request]);
+  const exportData = useCallback((format, filters, baseName) => request("export", { format, filters, baseName }), [request]);
   const activatePrepared = useCallback(async (preparedId, filters = {}, aggregateColumns = []) => {
     const result = await request("activate-prepared", { preparedId, filters, aggregateColumns });
     rememberStableState(rememberActivePrepared(stableStateRef.current, {
@@ -280,9 +280,10 @@ export function useDataWorker() {
     }));
     return result;
   }, [request]);
-  const previewRecipe = useCallback((recipe, stepIndex) => request("preview-recipe", { recipe, stepIndex }), [request]);
+  const previewRecipe = useCallback((recipe, stepIndex, options = {}) => request("preview-recipe", { recipe, stepIndex, options }), [request]);
   const previewCompose = useCallback((graph, nodeId, options = {}) => request("compose-preview", { graph, nodeId, options }), [request]);
   const exportCompose = useCallback((graph, nodeId, format) => request("compose-export", { graph, nodeId, format }), [request]);
+  const composeConnectionOptions = useCallback((graph, nodeId) => request("compose-connection-options", { graph, nodeId }), [request]);
 
   return useMemo(() => ({
     ready,
@@ -304,5 +305,6 @@ export function useDataWorker() {
     previewRecipe,
     previewCompose,
     exportCompose,
-  }), [ready, recovering, progress, loadFile, inspectFile, loadDemo, activatePrepared, registerPreparedCopy, unregisterPrepared, materializeComposePrepared, filter, searchAggregate, previewPrepared, profileData, exportData, applyRecipe, previewRecipe, previewCompose, exportCompose]);
+    composeConnectionOptions,
+  }), [ready, recovering, progress, loadFile, inspectFile, loadDemo, activatePrepared, registerPreparedCopy, unregisterPrepared, materializeComposePrepared, filter, searchAggregate, previewPrepared, profileData, exportData, applyRecipe, previewRecipe, previewCompose, exportCompose, composeConnectionOptions]);
 }

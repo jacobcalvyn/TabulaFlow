@@ -219,6 +219,7 @@ export function StepsPanel({
   previewedStepId,
   deleteRequest,
   onDeleteRequestShown,
+  onDeleteConfirmation,
 }) {
   const { t, toolLabel } = useI18n();
   const [formOpen, setFormOpen] = useState(false);
@@ -388,7 +389,7 @@ export function StepsPanel({
                 <button type="button" onClick={() => onPreview(index)} disabled={applying || invalid} aria-label={t("previewStep")}><Eye /></button>
                 <button type="button" onClick={() => onChange(recipe.filter((item) => item.id !== step.id), step.id)} disabled={applying} aria-label={t("deleteStep")}><Trash /></button>
               </div>
-              {confirmingDeleteId === step.id && <div className="step-card__delete-confirm"><span>{t("confirmDeleteStep")}</span><button type="button" onClick={() => setConfirmingDeleteId(null)}>{t("cancel")}</button><button type="button" disabled={applying} onClick={() => { setConfirmingDeleteId(null); onChange(recipe.filter((item) => item.id !== step.id), step.id); }}>{t("delete")}</button></div>}
+              {confirmingDeleteId === step.id && <div className="step-card__delete-confirm"><span>{t("confirmDeleteStep")}</span><button type="button" onClick={() => { setConfirmingDeleteId(null); onDeleteConfirmation?.("recipe-step", step.id, "cancelled"); }}>{t("cancel")}</button><button type="button" disabled={applying} onClick={() => { setConfirmingDeleteId(null); onChange(recipe.filter((item) => item.id !== step.id), step.id); onDeleteConfirmation?.("recipe-step", step.id, "confirmed"); }}>{t("delete")}</button></div>}
             </article>
           );
         })}

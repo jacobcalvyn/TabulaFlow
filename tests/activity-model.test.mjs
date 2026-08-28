@@ -22,3 +22,19 @@ test("activity cursors return ordered incremental changes", () => {
   });
   assert.deepEqual(pageActivityEvents(events, { cursor: 1, actor: "user", targetId: "a" }).events, [{ sequence: 3, actor: "user", targetId: "a" }]);
 });
+
+test("activity events record cancellation as a terminal status linked to the request", () => {
+  const event = createActivityEvent({
+    flowId: "flow-a",
+    actor: "user",
+    action: "delete_cancelled",
+    targetType: "prepared-dataset",
+    targetId: "prepared-a",
+    requestId: "delete-request-1",
+    status: "cancelled",
+    supersedesEventId: "pending-event-1",
+  });
+  assert.equal(event.status, "cancelled");
+  assert.equal(event.supersedesEventId, "pending-event-1");
+  assert.equal(event.requestId, "delete-request-1");
+});

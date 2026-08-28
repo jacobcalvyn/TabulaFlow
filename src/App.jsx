@@ -40,6 +40,8 @@ import {
   loadStoredActivity,
 } from "./recipeStorage.js";
 import { createActivityEvent, findSupersededActivity, pageActivityEvents } from "./activityModel.js";
+import { schemaDelta } from "./schemaDelta.js";
+import { nextWorkspaceRevision } from "./workspaceRevision.js";
 import { useI18n } from "./i18n.jsx";
 import { ComposeScreen } from "./ComposeScreen.jsx";
 import { activatePreparedForFlow } from "./preparedActivation.js";
@@ -231,6 +233,8 @@ const ACTIVITY_LABEL_KEYS = Object.freeze({
   prepared_exported: "activityPreparedExported",
   compose_exported: "activityComposeExported",
   delete_requested: "activityDeleteRequested",
+  delete_cancelled: "activityDeleteCancelled",
+  delete_confirmed: "activityDeleteConfirmed",
   prepared_deleted: "activityPreparedDeleted",
   compose_operation_deleted: "activityOperationDeleted",
 });
@@ -1231,6 +1235,7 @@ function DataScreen({
   onPreparedChange,
   deleteRequest,
   onDeleteRequestShown,
+  onDeleteConfirmation,
 }) {
   const { formatNumber, language, t, toolLabel } = useI18n();
   const valueLocale = language === "id" ? "id-ID" : "en-US";
@@ -1797,6 +1802,7 @@ function DataScreen({
           previewedStepId={stepPreview?.stepId ?? null}
           deleteRequest={deleteRequest}
           onDeleteRequestShown={onDeleteRequestShown}
+          onDeleteConfirmation={onDeleteConfirmation}
         />, sidebarStepsTarget)}
       {previewingStep && <div className="recipe-preview-loading" role="status">{t("creatingPreview")}</div>}
     </main>
@@ -1836,6 +1842,7 @@ export function App() {
   const flowHydratedRef = useRef(false);
   const workspaceRevisionRef = useRef(0);
   const activityEventsRef = useRef([]);
+  const pendingDeleteConfirmationsRef = useRef(new Map());
   const webMcpMutationRunnerRef = useRef(null);
   if (!webMcpMutationRunnerRef.current) {
     webMcpMutationRunnerRef.current = createWebMcpMutationRunner({ getRevision: () => workspaceRevisionRef.current });
@@ -1860,16 +1867,19 @@ export function App() {
     return () => { cancelled = true; };
   }, [flow.id, flowHydrated]);
 
-  const bumpWorkspaceRevision = useCallback(() => {
-    workspaceRevisionRef.current += 1;
-    setWorkspaceRevision(workspaceRevisionRef.current);
-    return workspaceRevisionRef.current;
+  const bumpWorkspaceRevision = useCallback(({ semantic = true } = {}) => {
+    const nextRevision = nextWorkspaceRevision(workspaceRevisionRef.current, { semantic });
+    if (nextRevision !== workspaceRevisionRef.current) {
+      workspaceRevisionRef.current = nextRevision;
+      setWorkspaceRevision(nextRevision);
+    }
+    return nextRevision;
   }, []);
 
-  const commitFlow = useCallback(async (nextFlow) => {
+  const commitFlow = useCallback(async (nextFlow, { semantic = true } = {}) => {
     flowRef.current = nextFlow;
     setFlow(nextFlow);
-    bumpWorkspaceRevision();
+    bumpWorkspaceRevision({ semantic });
     if (flowHydratedRef.current) {
       try {
         await saveStoredFlow(nextFlow);
@@ -1886,7 +1896,7 @@ export function App() {
     [],
   );
 
-  const recordActivity = useCallback(async ({ action, targetType, targetId, summary = {}, status = "committed" }, context = {}) => {
+  const recordActivity = useCallback(async ({ action, targetType, targetId, summary = {}, status = "committed", supersedesEventId = null }, context = {}) => {
     const candidate = createActivityEvent({
       flowId: flowRef.current.id,
       actor: context.actor ?? "user",
@@ -1898,9 +1908,10 @@ export function App() {
       status,
       workspaceRevision: workspaceRevisionRef.current,
       summary,
+      supersedesEventId,
     });
     const superseded = findSupersededActivity(activityEventsRef.current, candidate);
-    const event = superseded ? { ...candidate, supersedesEventId: superseded.eventId } : candidate;
+    const event = supersedesEventId ? candidate : superseded ? { ...candidate, supersedesEventId: superseded.eventId } : candidate;
     try {
       const stored = await appendStoredActivity(event);
       const next = [stored, ...activityEventsRef.current].slice(0, 2000);
@@ -2067,14 +2078,14 @@ export function App() {
 
   useEffect(() => {
     if (screen !== "compose" || composeSchemaState.graph === flow) return;
-    void commitFlow(composeSchemaState.graph);
+    void commitFlow(composeSchemaState.graph, { semantic: false });
   }, [commitFlow, composeSchemaState.graph, flow, screen]);
 
   useEffect(() => {
     if (!flowHydrated || !dataset || !activePreparedId) return;
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === activePreparedId);
     if (!prepared || prepared.rowCount === dataset.rowCount) return;
-    void commitFlow(updatePreparedInput(flowRef.current, activePreparedId, { rowCount: dataset.rowCount }));
+    void commitFlow(updatePreparedInput(flowRef.current, activePreparedId, { rowCount: dataset.rowCount }), { semantic: false });
   }, [activePreparedId, commitFlow, dataset, flowHydrated]);
 
   const activateDataset = async (result, source = null, recipe = []) => {
@@ -2460,11 +2471,11 @@ export function App() {
     await recordActivity({ action: "compose_operation_deleted", targetType: "compose-node", targetId: nodeId });
   };
 
-  const previewComposeDraft = async (draft, nodeId = null) => {
+  const previewComposeDraft = async (draft, nodeId = null, options = {}) => {
     const candidate = nodeId
       ? updateComposeNode(flowRef.current, nodeId, draft)
       : addComposeNode(flowRef.current, draft);
-    return worker.previewCompose(candidate.graph, candidate.node.id);
+    return worker.previewCompose(candidate.graph, candidate.node.id, options);
   };
 
   const moveComposeNode = async (nodeId, position, beforeCommit = null, activityContext = null) => {
@@ -2505,7 +2516,8 @@ export function App() {
   const exportPreparedData = async (format, preparedId = activePreparedId, activityContext = null) => {
     if (!dataset || preparedId !== activePreparedId) throw new Error(`Prepared dataset is not active: ${preparedId}`);
     setScreen("data");
-    const result = await worker.exportData(format, filters);
+    const preparedName = flowRef.current.preparedInputs.find((item) => item.id === preparedId)?.name;
+    const result = await worker.exportData(format, filters, preparedName ?? dataset.filename);
     downloadExport(result);
     const activity = await recordActivity({ action: "prepared_exported", targetType: "prepared", targetId: preparedId, summary: { format, rowCount: dataset.filteredCount, columnCount: dataset.columns.length } }, activityContext ?? undefined);
     return { filename: result.filename, format, totalRowCount: dataset.rowCount, filteredRowCount: dataset.filteredCount, activity };
@@ -2661,10 +2673,35 @@ export function App() {
     };
   };
 
-  const previewRecipeChangeFromTool = async (preparedId, recipe, stepIndex) => {
+  const previewRecipeChangeFromTool = async (preparedId, recipe, stepIndex, { previewColumns, previewLimit = 10 } = {}) => {
     assertActivePreparedForTool(preparedId);
-    const preview = await runWebMcpRead(() => worker.previewRecipe(recipe, Number.isInteger(stepIndex) ? stepIndex : Math.max(0, recipe.length - 1)));
-    return { ...preview, previewRowCount: preview.preview?.length ?? 0, saved: false, workspaceRevision: workspaceRevisionRef.current };
+    try {
+      const includeRows = Array.isArray(previewColumns) && previewColumns.length > 0;
+      const result = await runWebMcpRead(() => worker.previewRecipe(
+        recipe,
+        Number.isInteger(stepIndex) ? stepIndex : Math.max(0, recipe.length - 1),
+        { includeRows, ...(includeRows ? { columns: previewColumns, limit: previewLimit } : {}) },
+      ));
+      const currentSchema = dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] ?? null }));
+      return {
+        valid: true,
+        saved: false,
+        stepIndex: result.stepIndex,
+        stepId: result.stepId,
+        output: { rowCount: result.rowCount, columnCount: result.schema.length },
+        schemaDelta: schemaDelta(currentSchema, result.schema),
+        diagnostics: [],
+        ...(includeRows ? { preview: { columns: result.columns, rowCount: result.previewRowCount, rows: result.preview } } : {}),
+        workspaceRevision: workspaceRevisionRef.current,
+      };
+    } catch (cause) {
+      return {
+        valid: false,
+        saved: false,
+        diagnostics: [{ level: "error", code: cause?.code ?? "RECIPE_VALIDATION_FAILED", message: cause instanceof Error ? cause.message : "Recipe validation failed." }],
+        workspaceRevision: workspaceRevisionRef.current,
+      };
+    }
   };
 
   const composeNodesForTool = () => [
@@ -2695,52 +2732,9 @@ export function App() {
   };
 
   const getConnectionOptionsFromTool = async (nodeId) => {
-    const nodes = composeNodesForTool();
-    const source = nodes.find((item) => item.id === nodeId);
-    if (!source) throw new Error(`Compose node not found: ${nodeId}`);
-    return {
-      nodeId,
-      workspaceRevision: workspaceRevisionRef.current,
-      targets: nodes.filter((item) => item.id !== nodeId).map((target) => {
-        const normalizeType = (type) => String(type).toUpperCase().replace(/\s+/g, " ").trim();
-        const targetKeysByType = new Map();
-        for (const column of target.schema ?? []) {
-          const type = normalizeType(column.type);
-          targetKeysByType.set(type, [...(targetKeysByType.get(type) ?? []), column]);
-        }
-        const keyPairCount = (source.schema ?? []).reduce((total, column) => total + (targetKeysByType.get(normalizeType(column.type))?.length ?? 0), 0);
-        const keyPairs = [];
-        const seenKeyPairs = new Set();
-        const addKeyPair = (left, right) => {
-          const key = `${left.name}\u0000${right.name}`;
-          if (keyPairs.length >= 200 || seenKeyPairs.has(key)) return;
-          seenKeyPairs.add(key);
-          keyPairs.push({ left: left.name, right: right.name, type: left.type, compatible: true });
-        };
-        for (const left of source.schema ?? []) {
-          const sameType = targetKeysByType.get(normalizeType(left.type)) ?? [];
-          const exact = sameType.find((right) => right.name === left.name);
-          if (exact) addKeyPair(left, exact);
-        }
-        for (const left of source.schema ?? []) {
-          for (const right of targetKeysByType.get(normalizeType(left.type)) ?? []) addKeyPair(left, right);
-          if (keyPairs.length >= 200) break;
-        }
-        const targetTypes = new Map((target.schema ?? []).map(({ name, type }) => [name, normalizeType(type)]));
-        const appendConflicts = (source.schema ?? []).filter(({ name, type }) => targetTypes.has(name) && targetTypes.get(name) !== normalizeType(type));
-        const appendCompatible = appendConflicts.length === 0;
-        return {
-          targetNodeId: target.id,
-          targetName: target.name,
-          operations: [...(appendCompatible ? ["append"] : []), ...(keyPairCount ? ["join", "difference"] : [])],
-          appendCompatible,
-          appendConflicts: appendConflicts.map(({ name, type }) => ({ column: name, sourceType: type, targetType: targetTypes.get(name) })),
-          keyPairCount,
-          keyPairsTruncated: keyPairCount > keyPairs.length,
-          keyPairs,
-        };
-      }),
-    };
+    await getComposeNodeFromTool(nodeId);
+    const result = await runWebMcpRead(() => worker.composeConnectionOptions(flowRef.current, nodeId));
+    return { ...result, workspaceRevision: workspaceRevisionRef.current };
   };
 
   const getAvailableActionsFromTool = async (targetId) => {
@@ -2893,16 +2887,31 @@ export function App() {
     return updateComposeOperation(nodeId, composeOperationDraftFromTool(operation, existing), assertCurrent, webMcpActivity(meta));
   }, `compose:update:${nodeId}:${JSON.stringify(operation)}`);
 
-  const validateComposeOperationFromTool = async (operation) => {
-    const preview = await runWebMcpRead(() => previewComposeDraft(composeOperationDraftFromTool(operation)));
-    return {
-      valid: true,
-      rowCount: preview.rowCount,
-      columnCount: preview.schema.length,
-      schema: preview.schema,
-      preview: preview.preview,
-      workspaceRevision: preview.workspaceRevision,
-    };
+  const validateComposeOperationFromTool = async (operation, { previewColumns, previewLimit = 10 } = {}) => {
+    const draft = composeOperationDraftFromTool(operation);
+    try {
+      const includeRows = Array.isArray(previewColumns) && previewColumns.length > 0;
+      const preview = await runWebMcpRead(() => previewComposeDraft(draft, null, {
+        includeRows,
+        ...(includeRows ? { columns: previewColumns, limit: previewLimit } : {}),
+      }));
+      const nodes = composeNodesForTool();
+      const inputSchema = draft.inputIds.flatMap((inputId) => nodes.find((node) => node.id === inputId)?.schema ?? []);
+      return {
+        valid: true,
+        output: { rowCount: preview.rowCount, columnCount: preview.schema.length },
+        schemaDelta: schemaDelta(inputSchema, preview.schema),
+        diagnostics: [],
+        ...(includeRows ? { preview: { columns: preview.columns, rowCount: preview.previewRowCount, rows: preview.preview } } : {}),
+        workspaceRevision: workspaceRevisionRef.current,
+      };
+    } catch (cause) {
+      return {
+        valid: false,
+        diagnostics: [{ level: "error", code: cause?.code ?? "COMPOSE_VALIDATION_FAILED", message: cause instanceof Error ? cause.message : "Compose validation failed." }],
+        workspaceRevision: workspaceRevisionRef.current,
+      };
+    }
   };
 
   const exportComposeFromTool = async (nodeId, format) => {
@@ -2926,6 +2935,7 @@ export function App() {
     const token = `${Date.now()}-${Math.random()}`;
     setWebMcpDeleteRequest({ target, targetId, token, requestId: meta.requestId });
     const activity = await recordActivity({ action: "delete_requested", targetType: target, targetId, status: "pending-confirmation", summary: { targetKind: target } }, webMcpActivity(meta));
+    pendingDeleteConfirmationsRef.current.set(`${target}:${targetId}`, { target, targetId, requestId: meta.requestId, activityEventId: activity?.eventId ?? null });
     return { target, targetId, confirmationToken: token, pendingConfirmation: true, activity };
   }, `delete:request:${target}:${targetId}`);
 
@@ -2943,9 +2953,24 @@ export function App() {
     setWebMcpDeleteRequest((current) => current?.token === token ? null : current);
   }, []);
 
+  const resolveDeleteConfirmation = useCallback(async (target, targetId, outcome) => {
+    const key = `${target}:${targetId}`;
+    const pending = pendingDeleteConfirmationsRef.current.get(key);
+    if (!pending) return null;
+    pendingDeleteConfirmationsRef.current.delete(key);
+    return recordActivity({
+      action: outcome === "cancelled" ? "delete_cancelled" : "delete_confirmed",
+      targetType: target,
+      targetId,
+      status: outcome === "cancelled" ? "cancelled" : "committed",
+      summary: { targetKind: target },
+      supersedesEventId: pending.activityEventId,
+    }, { actor: "user", origin: "ui", requestId: pending.requestId });
+  }, [recordActivity]);
+
   useWebMcpTools({
     state: {
-      contractVersion: "2.1",
+      contractVersion: "2.2",
       workspaceRevision,
       flowId: flow.id,
       flowRevision: flow.revision,
@@ -2961,6 +2986,11 @@ export function App() {
       ],
       activePreparedId,
       activeNodeId: flow.activeNodeId,
+      selection: {
+        prepareContext: { preparedId: activePreparedId, meaning: "Dataset currently loaded in the Prepare worker and recipe workspace." },
+        composeSelection: { nodeId: flow.activeNodeId, meaning: "Node currently selected on the independent Compose canvas." },
+        relationship: activePreparedId && flow.activeNodeId === activePreparedId ? "same-dataset" : "independent-workspace-contexts",
+      },
       activeDataset: dataset ? {
         name: flow.preparedInputs.find((item) => item.id === activePreparedId)?.name ?? dataset.filename,
         totalRowCount: dataset.rowCount,
@@ -3091,6 +3121,7 @@ export function App() {
           onExport={exportComposeNode}
           deleteRequest={webMcpDeleteRequest?.target === "recipe-step" ? null : webMcpDeleteRequest}
           onDeleteRequestShown={acknowledgeDeleteRequest}
+          onDeleteConfirmation={resolveDeleteConfirmation}
         />
       ) : dataset ? (
         <DataScreen
@@ -3115,6 +3146,7 @@ export function App() {
           onPreparedChange={openPrepared}
           deleteRequest={webMcpDeleteRequest?.target === "recipe-step" ? webMcpDeleteRequest : null}
           onDeleteRequestShown={acknowledgeDeleteRequest}
+          onDeleteConfirmation={resolveDeleteConfirmation}
         />
       ) : null}
     </div>

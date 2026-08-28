@@ -1,6 +1,16 @@
 import Papa from "papaparse";
 import { prepareSpreadsheetData } from "./data.js";
 
+export function sanitizeExportBaseName(value, fallback = "tabulaflow-data") {
+  const normalized = String(value ?? "")
+    .replace(/\.[^.]+$/, "")
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+  return normalized || fallback;
+}
+
 export async function encodeSpreadsheetExport(rows, sourceColumns, format, baseName, sheetName = "Filtered Data") {
   const spreadsheet = prepareSpreadsheetData(rows, sourceColumns);
   if (format === "csv") {

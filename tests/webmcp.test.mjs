@@ -12,9 +12,10 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "2.1", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "2.2", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
+        selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
         activeDataset: {
           name: "Orders", totalRowCount: 10, filteredRowCount: 4, previewRowCount: 4, columnCount: 2,
           columns: ["status", "amount"], schema: [{ name: "status", type: "VARCHAR" }, { name: "amount", type: "DOUBLE" }],
@@ -47,7 +48,7 @@ function createContext() {
         async getDataProfile(preparedId, columns) { calls.push(["profile", preparedId, columns]); return { columns: [{ name: "status" }] }; },
         async queryColumnValues(preparedId, column, search, options) { calls.push(["values", preparedId, column, search, options]); return { column, values: [{ value: "open", count: 4 }], matchCount: 1 }; },
         async getPreparePreview(preparedId, columns, options) { calls.push(["prepare-preview", preparedId, columns, options]); return { previewRowCount: 1, rows: [{ status: "open" }] }; },
-        async previewRecipeChange(preparedId, recipe, stepIndex) { calls.push(["recipe-preview", preparedId, recipe, stepIndex]); return { previewRowCount: 1, saved: false }; },
+        async previewRecipeChange(preparedId, recipe, stepIndex, options) { calls.push(["recipe-preview", preparedId, recipe, stepIndex, options]); return { valid: true, output: { rowCount: 4, columnCount: 2 }, schemaDelta: {}, diagnostics: [], saved: false }; },
         async applyFilters(preparedId, filters, meta) { calls.push(["filters", preparedId, filters, meta]); return result({ rowCount: 10, filteredCount: Object.keys(filters).length ? 4 : 10 }); },
         async setAggregateColumns(preparedId, columns, meta) { calls.push(["aggregate-columns", preparedId, columns, meta]); return result({ aggregateColumns: columns, hiddenAggregateColumnCount: 2 - columns.length }); },
         async exportPrepare(preparedId, format) { calls.push(["export-prepare", preparedId, format]); return { filename: `orders.${format}`, format, totalRowCount: 10, filteredRowCount: 4 }; },
@@ -61,7 +62,7 @@ function createContext() {
         async getComposeGraph() { calls.push(["graph"]); return { nodes: [{ id: "operation-a" }], edges: [], workspaceRevision: REVISION }; },
         async getComposeNode(nodeId) { calls.push(["compose-node", nodeId]); return { id: nodeId, name: "Filtered orders" }; },
         async getComposeNodePreview(nodeId, columns, options) { calls.push(["node-preview", nodeId, columns, options]); return { previewRowCount: 1, rows: [{ status: "open" }] }; },
-        async validateComposeOperation(operation) { calls.push(["validate", operation]); return { valid: true, rowCount: 4, schema: [] }; },
+        async validateComposeOperation(operation, options) { calls.push(["validate", operation, options]); return { valid: true, output: { rowCount: 4, columnCount: 2 }, schemaDelta: {}, diagnostics: [] }; },
         async getConnectionOptions(nodeId) { calls.push(["connections", nodeId]); return { nodeId, targets: [] }; },
         async selectComposeNode(nodeId, meta) { calls.push(["node", nodeId, meta]); },
         async autoArrangeCompose(meta) { calls.push(["arrange", meta]); return result({ revision: 5 }); },
@@ -137,7 +138,8 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "2.1");
+  assert.equal(capabilities.structuredContent.contractVersion, "2.2");
+  assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");
   assert.equal(capabilities.structuredContent.safeguards.deletion, "visible-user-confirmation-required");
   assert.equal(guide.structuredContent.flow.length, 3);
   assert.equal(operation.structuredContent.inputs, 2);
@@ -145,9 +147,9 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   assert.deepEqual(calls, [
     ["available-actions", "prepared-a"], ["activity", { limit: 20, targetId: undefined, actor: "agent" }], ["changes", 12, { limit: 20 }], ["recipe", "prepared-a"], ["dataset", "prepared-a"],
     ["profile", "prepared-a", ["status"]], ["values", "prepared-a", "status", "op", { offset: 0, limit: 20 }],
-    ["prepare-preview", "prepared-a", ["status"], { offset: 0, limit: 20 }], ["recipe-preview", "prepared-a", [], 0],
+    ["prepare-preview", "prepared-a", ["status"], { offset: 0, limit: 20 }], ["recipe-preview", "prepared-a", [], 0, { previewColumns: undefined, previewLimit: 10 }],
     ["graph"], ["compose-node", "operation-a"], ["node-preview", "operation-a", ["status"], { offset: 0, limit: 20 }],
-    ["validate", candidate], ["connections", "prepared-a"],
+    ["validate", candidate, { previewColumns: undefined, previewLimit: 10 }], ["connections", "prepared-a"],
   ]);
 });
 
@@ -226,6 +228,10 @@ test("WebMCP mutation schemas require collaboration metadata and conditional val
   const aggregates = branches.filter((branch) => branch.properties.kind.const === "aggregate");
   assert.equal(aggregates.length, 2);
   assert.ok(aggregates.some((branch) => branch.required.includes("measureColumn")));
+  const previewStep = toolByName(tools, "tabulaflow_preview_recipe_change").inputSchema.properties.recipe.items;
+  assert.ok(previewStep.required.includes("id"));
+  assert.equal(toolByName(tools, "tabulaflow_preview_recipe_change").inputSchema.properties.previewLimit.maximum, 20);
+  assert.equal(toolByName(tools, "tabulaflow_validate_compose_operation").inputSchema.properties.previewLimit.maximum, 20);
 });
 
 test("WebMCP registration is sequential, uses one lifecycle signal, and skips unsupported browsers", async () => {

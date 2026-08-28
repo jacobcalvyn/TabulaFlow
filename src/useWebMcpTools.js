@@ -189,8 +189,19 @@ const COLUMN_VALUES_SCHEMA = Object.freeze(strictObject({
 }, ["preparedId", "column"]));
 const RECIPE_PREVIEW_SCHEMA = Object.freeze(strictObject({
   preparedId: ID,
-  recipe: { type: "array", items: { type: "object", description: "A complete ordered recipe step including type, params, and optional id/enabled." } },
+  recipe: {
+    type: "array",
+    items: strictObject({
+      id: ID,
+      type: ID,
+      params: { type: "object", additionalProperties: true },
+      enabled: { type: "boolean", default: true },
+    }, ["id", "type", "params"]),
+    description: "The complete ordered recipe. Every dry-run step requires the same stable id used by the runtime.",
+  },
   stepIndex: { type: "integer", minimum: 0 },
+  previewColumns: { type: "array", items: ID, maxItems: 20, uniqueItems: true, description: "Optional explicit columns for a bounded row preview. Omit for metadata-only validation." },
+  previewLimit: { type: "integer", minimum: 1, maximum: 20, default: 10 },
 }, ["preparedId", "recipe"]));
 const WORKSPACE_ACTIONS_SCHEMA = Object.freeze(strictObject({ targetId: ID }, []));
 const OPERATION_DESCRIPTION_SCHEMA = Object.freeze(strictObject({ kind: { type: "string", enum: OPERATION_KINDS } }));
@@ -201,7 +212,11 @@ const COMPOSE_PREVIEW_SCHEMA = Object.freeze(strictObject({
   offset: { type: "integer", minimum: 0, default: 0 },
   limit: { type: "integer", minimum: 1, maximum: 100, default: 100 },
 }, ["nodeId"]));
-const VALIDATE_COMPOSE_OPERATION_SCHEMA = CREATE_COMPOSE_OPERATION_SCHEMA;
+const VALIDATE_COMPOSE_OPERATION_SCHEMA = Object.freeze(strictObject({
+  operation: COMPOSE_OPERATION_SCHEMA,
+  previewColumns: { type: "array", items: ID, maxItems: 20, uniqueItems: true, description: "Optional explicit columns for a bounded row preview. Omit for metadata-only validation." },
+  previewLimit: { type: "integer", minimum: 1, maximum: 20, default: 10 },
+}, ["operation"]));
 const DUPLICATE_PREPARED_SCHEMA = Object.freeze(strictObject({ preparedId: ID, ...MUTATION_META }));
 const PROMOTE_COMPOSE_SCHEMA = Object.freeze(strictObject({ nodeId: ID, ...MUTATION_META }));
 const MOVE_COMPOSE_SCHEMA = Object.freeze(strictObject({
@@ -272,7 +287,7 @@ function filterSelection(raw) {
 }
 
 const WEBMCP_CAPABILITIES = Object.freeze({
-  contractVersion: "2.1",
+  contractVersion: "2.2",
   authenticationRequired: false,
   workspaces: ["source", "prepare", "compose", "account"],
   actions: [
@@ -313,7 +328,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
 });
 
 const WORKFLOW_GUIDE = Object.freeze({
-  contractVersion: "2.1",
+  contractVersion: "2.2",
   flow: [
     { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
     { workspace: "prepare", purpose: "Inspect one prepared dataset, apply temporary filters, and maintain its independent ordered recipe." },
@@ -532,7 +547,7 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_get_data_profile",
       title: "Profile prepared data",
-      description: "Read per-column missing, distinct, min, max, mixed-type, and semantic metadata. Unknown unit, currency, or sensitivity is returned explicitly rather than inferred.",
+      description: "Read per-column missing, distinct, mixed-type, and conservative sensitivity metadata. Raw min/max values are returned only for heuristically non-sensitive typed measures.",
       inputSchema: DATA_PROFILE_SCHEMA,
       annotations: { readOnlyHint: true, untrustedContentHint: true },
       async execute({ preparedId, columns }) {
@@ -565,13 +580,13 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_preview_recipe_change",
       title: "Preview a complete recipe",
-      description: "Dry-run a complete ordered recipe for the active prepared dataset without saving it.",
+      description: "Dry-run a complete ordered recipe without saving it. The default response contains only diagnostics, output counts, and schema delta; rows require explicit previewColumns and are limited to 20.",
       inputSchema: RECIPE_PREVIEW_SCHEMA,
       annotations: { readOnlyHint: true, untrustedContentHint: true },
-      async execute({ preparedId, recipe, stepIndex }) {
+      async execute({ preparedId, recipe, stepIndex, previewColumns, previewLimit = 10 }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.previewRecipeChange(preparedId, recipe, stepIndex);
-        return webMcpResult(`Previewed ${result.previewRowCount ?? result.preview?.length ?? 0} recipe rows.`, result);
+        const result = await actions.previewRecipeChange(preparedId, recipe, stepIndex, { previewColumns, previewLimit });
+        return webMcpResult(result.valid ? "Validated the recipe change without saving it." : "The recipe change is invalid.", result);
       },
     }, {
       name: "tabulaflow_set_aggregate_columns",
@@ -758,18 +773,18 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_validate_compose_operation",
       title: "Validate a Compose operation",
-      description: "Dry-run a candidate operation and return output schema, row count, and compatibility errors without changing the graph.",
+      description: "Dry-run a candidate operation and return diagnostics, output counts, and schema delta without changing the graph. Rows require explicit previewColumns and are limited to 20.",
       inputSchema: VALIDATE_COMPOSE_OPERATION_SCHEMA,
       annotations: { readOnlyHint: true, untrustedContentHint: true },
-      async execute({ operation }) {
+      async execute({ operation, previewColumns, previewLimit = 10 }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.validateComposeOperation(operation);
-        return webMcpResult("Validated the candidate Compose operation without saving it.", result);
+        const result = await actions.validateComposeOperation(operation, { previewColumns, previewLimit });
+        return webMcpResult(result.valid ? "Validated the candidate Compose operation without saving it." : "The candidate Compose operation is invalid.", result);
       },
     }, {
       name: "tabulaflow_get_connection_options",
       title: "Get compatible Compose connections",
-      description: "List valid target nodes, binary operations, and exact same-type key candidates for one source node.",
+      description: "List valid target nodes and a bounded ranking of Join/Difference keys using exact names, normalized-name similarity, uniqueness, null ratio, and exact type compatibility.",
       inputSchema: CONNECTION_OPTIONS_SCHEMA,
       annotations: { readOnlyHint: true, untrustedContentHint: true },
       async execute({ nodeId }) {
