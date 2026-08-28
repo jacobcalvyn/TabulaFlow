@@ -25,6 +25,7 @@ import {
 import { formatValue, isSupportedFile } from "./data.js";
 import { useDataWorker } from "./useDataWorker.js";
 import { useWebMcpTools } from "./useWebMcpTools.js";
+import { createWebMcpMutationRunner } from "./webMcpMutation.js";
 import { StepsPanel, TransformationForm } from "./StepsPanel.jsx";
 import { useRecipeHistory } from "./useRecipeHistory.js";
 import { fileFromDroppedItem, isSameFileEntry, pickSourceFile, restoreFileFromHandle } from "./sourceFileHandles.js";
@@ -209,10 +210,11 @@ function downloadExport(result) {
   return result.filename;
 }
 
-function AccountScreen({ onOpenFile }) {
+function AccountScreen({ onOpenFile, uploadRequestToken, onUploadRequestShown }) {
   const { language, t } = useI18n();
   const locale = language === "id" ? "id-ID" : "en-US";
   const inputRef = useRef(null);
+  const uploadButtonRef = useRef(null);
   const [account, setAccount] = useState(null);
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -248,6 +250,13 @@ function AccountScreen({ onOpenFile }) {
   }, [t]);
 
   useEffect(() => { void refresh(); }, [refresh]);
+
+  useEffect(() => {
+    if (!uploadRequestToken || !account?.authenticated) return;
+    uploadButtonRef.current?.scrollIntoView({ block: "center", behavior: "smooth" });
+    uploadButtonRef.current?.focus();
+    onUploadRequestShown?.(uploadRequestToken);
+  }, [account?.authenticated, onUploadRequestShown, uploadRequestToken]);
 
   const upload = async (file) => {
     if (!file) return;
@@ -334,7 +343,7 @@ function AccountScreen({ onOpenFile }) {
           <section className="account-card cloud-files-card">
             <div className="account-card__heading">
               <div><h2>{t("cloudFiles")}</h2><p>{t("cloudFilesDescription")}</p></div>
-              <button className="button button--secondary" type="button" disabled={busy} onClick={() => inputRef.current?.click()}><CloudArrowUp weight="bold" /> {t("uploadToCloud")}</button>
+              <button ref={uploadButtonRef} className="button button--secondary" type="button" disabled={busy} onClick={() => inputRef.current?.click()}><CloudArrowUp weight="bold" /> {t("uploadToCloud")}</button>
               <input ref={inputRef} type="file" accept={ACCEPTED_FILES} hidden onChange={(event) => { void upload(event.target.files?.[0]); event.target.value = ""; }} />
             </div>
             {files.length ? <ul className="cloud-file-list">{files.map((file) => (
@@ -351,10 +360,11 @@ function AccountScreen({ onOpenFile }) {
   );
 }
 
-function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, workerReady, openedSources, fileRequestToken, onFileRequestShown }) {
+function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, workerReady, openedSources, fileRequestToken, onFileRequestShown, relinkRequest, onRelinkRequestShown }) {
   const { formatNumber, t } = useI18n();
   const inputRef = useRef(null);
   const chooseFileButtonRef = useRef(null);
+  const relinkButtonRefs = useRef(new Map());
   const [relinkSourceId, setRelinkSourceId] = useState(null);
   const [dragging, setDragging] = useState(false);
 
@@ -364,6 +374,14 @@ function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, wor
     chooseFileButtonRef.current?.focus();
     onFileRequestShown?.(fileRequestToken);
   }, [fileRequestToken, onFileRequestShown]);
+
+  useEffect(() => {
+    if (!relinkRequest?.token) return;
+    const button = relinkButtonRefs.current.get(relinkRequest.sourceAssetId);
+    button?.scrollIntoView({ block: "center", behavior: "smooth" });
+    button?.focus();
+    onRelinkRequestShown?.(relinkRequest.token);
+  }, [onRelinkRequestShown, relinkRequest]);
 
   const chooseFile = async () => {
     try {
@@ -461,7 +479,7 @@ function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, wor
                   </span>
                 </button>
                 {source.status !== "linked" && (
-                  <button className="opened-source__relink" type="button" disabled={loading || source.status === "restoring"} onClick={() => chooseRelinkFile(source.sourceAssetId)}>
+                  <button ref={(element) => { if (element) relinkButtonRefs.current.set(source.sourceAssetId, element); else relinkButtonRefs.current.delete(source.sourceAssetId); }} className="opened-source__relink" type="button" disabled={loading || source.status === "restoring"} onClick={() => chooseRelinkFile(source.sourceAssetId)}>
                     {source.status === "restoring" ? t("restoringSource") : t("relink")}
                   </button>
                 )}
@@ -1763,16 +1781,31 @@ export function App() {
   const [flowHydrated, setFlowHydrated] = useState(false);
   const [flowDirty, setFlowDirty] = useState(false);
   const [retryingFlowSave, setRetryingFlowSave] = useState(false);
+  const [workspaceRevision, setWorkspaceRevision] = useState(0);
   const [webMcpFileRequestToken, setWebMcpFileRequestToken] = useState(0);
+  const [webMcpRelinkRequest, setWebMcpRelinkRequest] = useState(null);
+  const [webMcpCloudUploadToken, setWebMcpCloudUploadToken] = useState(0);
   const [webMcpDeleteRequest, setWebMcpDeleteRequest] = useState(null);
   const restoreStartedRef = useRef(false);
   const flowHydratedRef = useRef(false);
+  const workspaceRevisionRef = useRef(0);
+  const webMcpMutationRunnerRef = useRef(null);
+  if (!webMcpMutationRunnerRef.current) {
+    webMcpMutationRunnerRef.current = createWebMcpMutationRunner({ getRevision: () => workspaceRevisionRef.current });
+  }
 
   useEffect(() => { flowRef.current = flow; }, [flow]);
+
+  const bumpWorkspaceRevision = useCallback(() => {
+    workspaceRevisionRef.current += 1;
+    setWorkspaceRevision(workspaceRevisionRef.current);
+    return workspaceRevisionRef.current;
+  }, []);
 
   const commitFlow = useCallback(async (nextFlow) => {
     flowRef.current = nextFlow;
     setFlow(nextFlow);
+    bumpWorkspaceRevision();
     if (flowHydratedRef.current) {
       try {
         await saveStoredFlow(nextFlow);
@@ -1782,7 +1815,12 @@ export function App() {
       }
     }
     return nextFlow;
-  }, []);
+  }, [bumpWorkspaceRevision]);
+
+  const runWebMcpMutation = useCallback(
+    (meta, execute, fingerprint) => webMcpMutationRunnerRef.current(meta, execute, fingerprint),
+    [],
+  );
 
   const retryFlowSave = useCallback(async () => {
     if (retryingFlowSave) return;
@@ -1849,7 +1887,7 @@ export function App() {
     };
   }), [flow.preparedInputs, flow.sourceAssets]);
 
-  const relinkSource = useCallback(async (sourceAssetId, nextFile, handle = null, automatic = false) => {
+  const relinkSource = useCallback(async (sourceAssetId, nextFile, handle = null, automatic = false, beforeCommit = null) => {
     const source = flowRef.current.sourceAssets.find((item) => item.id === sourceAssetId);
     const preparedInputs = flowRef.current.preparedInputs.filter((item) => item.sourceAssetId === sourceAssetId);
     const primaryPrepared = preparedInputs[0];
@@ -1865,6 +1903,7 @@ export function App() {
       await worker.registerPreparedCopy(prepared.id, primaryPrepared.id, recipeForExecution(prepared, []));
     }
     await worker.activatePrepared(primaryPrepared.id, {}, primaryPrepared.schema.map((column) => column.name));
+    beforeCommit?.();
     const linkedFlow = {
       ...flowRef.current,
       sourceAssets: flowRef.current.sourceAssets.map((item) => item.id === source.id ? { ...item, status: "linked" } : item),
@@ -1963,12 +2002,14 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [error, screen]);
 
-  const loadFile = async (nextFile, handle = null) => {
+  const loadFile = async (nextFile, handle = null, throwOnError = false, beforeCommit = null) => {
+    let transientPreparedId = null;
     setError("");
     if (!isSupportedFile(nextFile.name)) {
       if (!dataset) setDataset(null);
       setError(t("unsupportedFormat"));
-      return;
+      if (throwOnError) throw new Error(t("unsupportedFormat"));
+      return { ok: false };
     }
 
     setLoading(true);
@@ -1979,31 +2020,40 @@ export function App() {
         const storedHandle = await loadStoredSourceHandle(matchingSource.id);
         const sameEntry = !handle || !storedHandle || await isSameFileEntry(storedHandle, handle);
         if (sameEntry) {
-          await relinkSource(matchingSource.id, nextFile, handle, false);
-          return;
+          await relinkSource(matchingSource.id, nextFile, handle, false, beforeCommit);
+          return { ok: true, relinked: true };
         }
       }
       const result = await worker.loadFile(nextFile);
+      transientPreparedId = result.preparedId;
+      beforeCommit?.();
       await activateDataset(result, {
         kind: "local",
         size: nextFile.size,
         lastModified: nextFile.lastModified,
       }, []);
+      transientPreparedId = null;
       if (handle && result.sourceId) await saveStoredSourceHandle(result.sourceId, handle);
+      return { ok: true, sourceId: result.sourceId, preparedId: result.preparedId };
     } catch (cause) {
+      if (transientPreparedId) await worker.unregisterPrepared(transientPreparedId);
       if (!dataset) setDataset(null);
       setError(cause instanceof Error ? cause.message : t("fileReadFailed"));
+      if (throwOnError) throw cause;
+      return { ok: false };
     } finally {
       setLoading(false);
     }
   };
 
-  const applyFilters = useCallback(async (filters, aggregateColumns) => {
+  const applyFilters = useCallback(async (filters, aggregateColumns, beforeCommit = null) => {
     const result = await worker.filter(filters, aggregateColumns);
+    beforeCommit?.();
     setDataset(result);
     setFilters(filters);
+    bumpWorkspaceRevision();
     return result;
-  }, [worker]);
+  }, [bumpWorkspaceRevision, worker]);
 
   const searchAggregate = useCallback(
     (column, query, filters) => worker.searchAggregate(column, query, filters),
@@ -2024,7 +2074,14 @@ export function App() {
     const nextFlow = {
       ...updated,
       composeNodes: updated.composeNodes.map((node) => descendantIds.has(node.id)
-        ? { ...node, schema: [], validationStatus: "needs-validation" }
+        ? {
+          ...node,
+          schema: node.schema ?? node.lastValidSchema ?? [],
+          lastValidSchema: node.schema?.length ? node.schema : node.lastValidSchema ?? [],
+          validationStatus: "needs-validation",
+          dataStatus: "stale",
+          validationError: null,
+        }
         : node),
     };
     await commitFlow(nextFlow);
@@ -2032,8 +2089,9 @@ export function App() {
     setComposeError("");
   };
 
-  const applyRecipeChange = async (recipe) => {
+  const applyRecipeChange = async (recipe, beforeCommit = null) => {
     const result = await worker.applyRecipe(recipe, filters, dataset?.aggregateColumns ?? [], activePreparedId);
+    beforeCommit?.();
     const next = recipeHistory.commit(recipe);
     setDataset(result);
     setFilters(result.appliedFilters ?? filters);
@@ -2041,10 +2099,11 @@ export function App() {
     return result;
   };
 
-  const undoRecipe = async () => {
+  const undoRecipe = async (beforeCommit = null) => {
     const next = recipeHistory.undoTarget;
     if (!next) return null;
     const result = await worker.applyRecipe(next, filters, dataset?.aggregateColumns ?? [], activePreparedId);
+    beforeCommit?.();
     recipeHistory.undo();
     setDataset(result);
     setFilters(result.appliedFilters ?? filters);
@@ -2052,10 +2111,11 @@ export function App() {
     return result;
   };
 
-  const redoRecipe = async () => {
+  const redoRecipe = async (beforeCommit = null) => {
     const next = recipeHistory.redoTarget;
     if (!next) return null;
     const result = await worker.applyRecipe(next, filters, dataset?.aggregateColumns ?? [], activePreparedId);
+    beforeCommit?.();
     recipeHistory.redo();
     setDataset(result);
     setFilters(result.appliedFilters ?? filters);
@@ -2063,13 +2123,18 @@ export function App() {
     return result;
   };
 
-  const openPrepared = async (preparedId) => {
+  const openPrepared = async (preparedId, beforeCommit = null, throwOnError = false) => {
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === preparedId);
     const source = flowRef.current.sourceAssets.find((item) => item.id === prepared?.sourceAssetId);
-    if (!prepared || !source) return;
+    if (!prepared || !source) {
+      const missing = new Error(`Prepared dataset is unavailable: ${preparedId}`);
+      if (throwOnError) throw missing;
+      return;
+    }
     if (source.status !== "linked" && source.location === "local-device") {
       setError(t("relinkRequired"));
       setScreen("input");
+      if (throwOnError) throw new Error(t("relinkRequired"));
       return;
     }
     setLoading(true);
@@ -2083,6 +2148,7 @@ export function App() {
         filters: {},
         aggregateColumns: prepared.schema.map((column) => column.name),
       });
+      beforeCommit?.();
       setDataset(result);
       setFilters({});
       setActivePreparedId(preparedId);
@@ -2096,19 +2162,32 @@ export function App() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("fileReadFailed"));
       setScreen("input");
+      if (throwOnError) throw cause;
     } finally {
       setLoading(false);
     }
   };
 
-  const duplicatePreparation = async (preparedId) => {
+  const duplicatePreparation = async (preparedId, beforeCommit = null) => {
     setComposeError("");
     try {
       const duplicated = duplicatePreparedInput(flowRef.current, preparedId);
       await worker.registerPreparedCopy(duplicated.preparedInput.id, preparedId, duplicated.preparedInput.recipe);
+      try {
+        beforeCommit?.();
+      } catch (cause) {
+        await worker.unregisterPrepared(duplicated.preparedInput.id);
+        throw cause;
+      }
       await commitFlow(duplicated.graph);
       setComposePreview(null);
-      return { ok: true, preparedInputId: duplicated.preparedInput.id };
+      return {
+        ok: true,
+        preparedInputId: duplicated.preparedInput.id,
+        name: duplicated.preparedInput.name,
+        rowCount: duplicated.preparedInput.rowCount,
+        columnCount: duplicated.preparedInput.schema.length,
+      };
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : t("duplicateFailed");
       setComposeError(message);
@@ -2116,7 +2195,7 @@ export function App() {
     }
   };
 
-  const createPreparationFromCompose = async (nodeId) => {
+  const createPreparationFromCompose = async (nodeId, beforeCommit = null) => {
     setComposeError("");
     try {
       const candidate = createPreparedFromCompose(flowRef.current, nodeId);
@@ -2125,6 +2204,12 @@ export function App() {
         preparedId: candidate.preparedInput.id,
         filename: candidate.preparedInput.name,
       });
+      try {
+        beforeCommit?.();
+      } catch (cause) {
+        await worker.unregisterPrepared(candidate.preparedInput.id);
+        throw cause;
+      }
       const nextGraph = {
         ...candidate.graph,
         sourceAssets: candidate.graph.sourceAssets.map((item) => item.id === candidate.sourceAsset.id
@@ -2136,7 +2221,13 @@ export function App() {
       };
       await commitFlow(nextGraph);
       setComposePreview(null);
-      return { ok: true, preparedInputId: candidate.preparedInput.id };
+      return {
+        ok: true,
+        preparedInputId: candidate.preparedInput.id,
+        name: candidate.preparedInput.name,
+        rowCount: materialized.rowCount,
+        columnCount: materialized.schema.length,
+      };
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : t("createPreparedFailed");
       setComposeError(message);
@@ -2168,36 +2259,39 @@ export function App() {
     }
   };
 
-  const selectComposeNode = async (nodeId) => {
+  const selectComposeNode = async (nodeId, beforeCommit = null, throwOnError = false) => {
     const nextFlow = { ...flowRef.current, activeNodeId: nodeId };
-    await commitFlow(nextFlow);
     setComposeLoading(true);
     setComposeError("");
     try {
       const preview = await worker.previewCompose(nextFlow, nodeId);
-      if (nextFlow.composeNodes.some((node) => node.id === nodeId)) {
-        await commitFlow({
+      beforeCommit?.();
+      const committedFlow = nextFlow.composeNodes.some((node) => node.id === nodeId)
+        ? {
           ...nextFlow,
           revision: nextFlow.revision + 1,
-          composeNodes: nextFlow.composeNodes.map((node) => node.id === nodeId ? { ...node, rowCount: preview.rowCount, schema: preview.schema, validationStatus: "valid" } : node),
+          composeNodes: nextFlow.composeNodes.map((node) => node.id === nodeId ? { ...node, rowCount: preview.rowCount, lastValidRowCount: preview.rowCount, schema: preview.schema, lastValidSchema: preview.schema, validationStatus: "valid", dataStatus: "ready", validationError: null } : node),
           updatedAt: new Date().toISOString(),
-        });
-      }
+        }
+        : nextFlow;
+      await commitFlow(committedFlow);
       setComposePreview(preview);
     } catch (cause) {
       setComposePreview(null);
       setComposeError(cause instanceof Error ? cause.message : t("composePreviewFailed"));
+      if (throwOnError) throw cause;
     } finally {
       setComposeLoading(false);
     }
   };
 
-  const createComposeNode = async (draft) => {
+  const createComposeNode = async (draft, beforeCommit = null) => {
     const candidate = addComposeNode(flowRef.current, draft);
     const preview = await worker.previewCompose(candidate.graph, candidate.node.id);
+    beforeCommit?.();
     const committed = {
       ...candidate.graph,
-      composeNodes: candidate.graph.composeNodes.map((node) => node.id === candidate.node.id ? { ...node, rowCount: preview.rowCount, schema: preview.schema, validationStatus: "valid" } : node),
+      composeNodes: candidate.graph.composeNodes.map((node) => node.id === candidate.node.id ? { ...node, rowCount: preview.rowCount, lastValidRowCount: preview.rowCount, schema: preview.schema, lastValidSchema: preview.schema, validationStatus: "valid", dataStatus: "ready", validationError: null } : node),
     };
     await commitFlow(committed);
     setComposePreview(preview);
@@ -2207,21 +2301,30 @@ export function App() {
       name: candidate.node.name,
       rowCount: preview.rowCount,
       columnCount: preview.schema.length,
+      schema: preview.schema,
     };
   };
 
-  const updateComposeOperation = async (nodeId, draft) => {
+  const updateComposeOperation = async (nodeId, draft, beforeCommit = null) => {
     const candidate = updateComposeNode(flowRef.current, nodeId, draft);
     const preview = await worker.previewCompose(candidate.graph, nodeId);
+    beforeCommit?.();
     const committed = {
       ...candidate.graph,
       composeNodes: candidate.graph.composeNodes.map((node) => node.id === nodeId
-        ? { ...node, rowCount: preview.rowCount, schema: preview.schema, validationStatus: "valid" }
+        ? { ...node, rowCount: preview.rowCount, lastValidRowCount: preview.rowCount, schema: preview.schema, lastValidSchema: preview.schema, validationStatus: "valid", dataStatus: "ready", validationError: null }
         : node),
     };
     await commitFlow(committed);
     setComposePreview(preview);
     setComposeError("");
+    return {
+      nodeId,
+      name: candidate.node.name,
+      rowCount: preview.rowCount,
+      columnCount: preview.schema.length,
+      schema: preview.schema,
+    };
   };
 
   const deleteComposeOperation = async (nodeId) => {
@@ -2238,17 +2341,23 @@ export function App() {
     return worker.previewCompose(candidate.graph, candidate.node.id);
   };
 
-  const moveComposeNode = async (nodeId, position) => {
+  const moveComposeNode = async (nodeId, position, beforeCommit = null) => {
     try {
-      await commitFlow(updateNodePosition(flowRef.current, nodeId, position));
+      const candidate = updateNodePosition(flowRef.current, nodeId, position);
+      beforeCommit?.();
+      const graph = await commitFlow(candidate);
+      return { nodeId, position: graph.preparedInputs.find((node) => node.id === nodeId)?.position ?? graph.composeNodes.find((node) => node.id === nodeId)?.position };
     } catch (cause) {
       setComposeError(cause instanceof Error ? cause.message : t("composeUpdateFailed"));
+      throw cause;
     }
   };
 
-  const autoArrangeComposeNodes = async () => {
+  const autoArrangeComposeNodes = async (beforeCommit = null) => {
     try {
-      return await commitFlow(autoArrangeNodePositions(flowRef.current));
+      const candidate = autoArrangeNodePositions(flowRef.current);
+      beforeCommit?.();
+      return await commitFlow(candidate);
     } catch (cause) {
       setComposeError(cause instanceof Error ? cause.message : t("composeUpdateFailed"));
       return null;
@@ -2262,12 +2371,12 @@ export function App() {
     return { nodeId, filename: result.filename, format };
   };
 
-  const exportPreparedData = async (format) => {
-    if (!dataset) throw new Error("Open a prepared dataset before exporting.");
+  const exportPreparedData = async (format, preparedId = activePreparedId) => {
+    if (!dataset || preparedId !== activePreparedId) throw new Error(`Prepared dataset is not active: ${preparedId}`);
     setScreen("data");
     const result = await worker.exportData(format, filters);
     downloadExport(result);
-    return { filename: result.filename, format, rowCount: dataset.rowCount };
+    return { filename: result.filename, format, totalRowCount: dataset.rowCount, filteredRowCount: dataset.filteredCount };
   };
 
   const previewRecipe = (recipe, stepIndex) => worker.previewRecipe(recipe, stepIndex);
@@ -2290,20 +2399,229 @@ export function App() {
     await openPrepared(preparedId);
   };
 
-  const selectComposeNodeFromTool = async (nodeId) => {
+  const selectComposeNodeFromTool = async (nodeId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
     setScreen("compose");
-    await selectComposeNode(nodeId);
+    await selectComposeNode(nodeId, assertCurrent, true);
+    return { workspaceRevision: workspaceRevisionRef.current };
+  }, `compose:select:${nodeId}`);
+
+  const selectPreparedFromTool = async (preparedId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    await openPrepared(preparedId, assertCurrent, true);
+    return { workspaceRevision: workspaceRevisionRef.current };
+  }, `prepare:select:${preparedId}`);
+
+  const assertActivePreparedForTool = (preparedId) => {
+    if (!dataset || preparedId !== activePreparedId) {
+      const inactive = new Error(`Prepared dataset is not active: ${preparedId}. Open it before reading or changing its data.`);
+      inactive.code = "PREPARED_NOT_ACTIVE";
+      throw inactive;
+    }
+    return flowRef.current.preparedInputs.find((item) => item.id === preparedId);
   };
 
-  const autoArrangeComposeFromTool = async () => {
-    setScreen("compose");
-    return autoArrangeComposeNodes();
+  const runWebMcpRead = async (execute) => {
+    const revision = workspaceRevisionRef.current;
+    const result = await execute();
+    if (revision !== workspaceRevisionRef.current) {
+      const stale = new Error("Workspace state changed while the WebMCP read was running. Read workspace state and retry.");
+      stale.code = "STALE_STATE";
+      throw stale;
+    }
+    return result && typeof result === "object" ? { ...result, workspaceRevision: revision } : { result, workspaceRevision: revision };
   };
+
+  const autoArrangeComposeFromTool = async (meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    setScreen("compose");
+    const graph = await autoArrangeComposeNodes(assertCurrent);
+    if (!graph) throw new Error("The Compose graph could not be arranged.");
+    return { revision: graph.revision };
+  }, "compose:auto-arrange");
 
   const requestSourceFileSelection = async () => {
     if (!worker.ready) throw new Error("The local data engine is still starting. Try again when workspace state reports ready.");
     setScreen("input");
     setWebMcpFileRequestToken((current) => current + 1);
+  };
+
+  const requestSourceRelinkFromTool = async (sourceAssetId) => {
+    const source = flowRef.current.sourceAssets.find((item) => item.id === sourceAssetId);
+    if (!source || !isFlowFileSource(source)) throw new Error(`Local source not found: ${sourceAssetId}`);
+    if (source.status !== "unlinked") throw new Error(`Local source cannot be relinked in its current state: ${sourceAssetId}`);
+    setScreen("input");
+    setWebMcpRelinkRequest({ sourceAssetId, token: `${Date.now()}-${Math.random()}` });
+  };
+
+  const listCloudFilesFromTool = async () => {
+    const account = await getCloudAccount();
+    if (!account.authenticated) return { authenticated: false, files: [], storage: null };
+    const result = await getCloudFiles();
+    return { authenticated: true, storage: account.storage ?? null, files: result.files ?? [] };
+  };
+
+  const openCloudFileFromTool = async (fileId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    const cloud = await listCloudFilesFromTool();
+    if (!cloud.authenticated) throw new Error("Cloud files require ChatGPT sign-in.");
+    const metadata = cloud.files.find((item) => item.id === fileId);
+    if (!metadata) throw new Error(`Cloud file not found: ${fileId}`);
+    const file = await openCloudFile(metadata);
+    setScreen("input");
+    await loadFile(file, null, true, assertCurrent);
+    return { fileId, name: metadata.name, size: metadata.size };
+  }, `cloud:open:${fileId}`);
+
+  const requestCloudUploadFromTool = async () => {
+    const account = await getCloudAccount();
+    if (!account.authenticated) throw new Error("Cloud upload requires ChatGPT sign-in.");
+    setScreen("account");
+    setWebMcpCloudUploadToken((current) => current + 1);
+  };
+
+  const getPrepareDatasetFromTool = async (preparedId) => {
+    const prepared = assertActivePreparedForTool(preparedId);
+    return {
+      preparedId,
+      name: prepared?.name ?? dataset.filename,
+      sourceName: dataset.filename,
+      recipeRevision: prepared?.recipeVersion ?? 0,
+      totalRowCount: dataset.rowCount,
+      filteredRowCount: dataset.filteredCount,
+      previewRowCount: dataset.preview.length,
+      columnCount: dataset.columns.length,
+      schema: dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] ?? null })),
+      aggregateColumns: [...dataset.aggregateColumns],
+      hiddenAggregateColumnCount: dataset.hiddenAggregateColumnCount,
+      filters: { ...filters },
+      quality: structuredClone(dataset.quality),
+      recipeStatus: prepared?.recipeStatus ?? null,
+      workspaceRevision: workspaceRevisionRef.current,
+    };
+  };
+
+  const getDataProfileFromTool = async (preparedId, columns) => {
+    assertActivePreparedForTool(preparedId);
+    return runWebMcpRead(() => worker.profileData(columns));
+  };
+
+  const queryColumnValuesFromTool = async (preparedId, column, search, options) => {
+    assertActivePreparedForTool(preparedId);
+    if (!dataset.columns.includes(column)) throw new Error(`Column not found: ${column}`);
+    return runWebMcpRead(() => worker.searchAggregate(column, search, filters, options));
+  };
+
+  const getPreparePreviewFromTool = async (preparedId, columns, options) => {
+    assertActivePreparedForTool(preparedId);
+    return runWebMcpRead(() => worker.previewPrepared(filters, columns, options));
+  };
+
+  const getRecipeFromTool = async (preparedId) => {
+    const prepared = flowRef.current.preparedInputs.find((item) => item.id === preparedId);
+    if (!prepared) throw new Error(`Prepared dataset not found: ${preparedId}`);
+    return {
+      preparedId,
+      name: prepared.name,
+      recipeRevision: prepared.recipeVersion ?? 0,
+      recipeStatus: prepared.recipeStatus ?? null,
+      recipe: structuredClone(prepared.recipe ?? []),
+      schema: structuredClone(prepared.schema ?? []),
+      totalRowCount: prepared.rowCount ?? null,
+      active: preparedId === activePreparedId,
+      workspaceRevision: workspaceRevisionRef.current,
+    };
+  };
+
+  const previewRecipeChangeFromTool = async (preparedId, recipe, stepIndex) => {
+    assertActivePreparedForTool(preparedId);
+    const preview = await runWebMcpRead(() => worker.previewRecipe(recipe, Number.isInteger(stepIndex) ? stepIndex : Math.max(0, recipe.length - 1)));
+    return { ...preview, previewRowCount: preview.preview?.length ?? 0, saved: false, workspaceRevision: workspaceRevisionRef.current };
+  };
+
+  const composeNodesForTool = () => [
+    ...flowRef.current.preparedInputs.map((item) => ({ ...structuredClone(item), nodeType: "dataset", kind: "dataset", config: null, inputIds: [] })),
+    ...flowRef.current.composeNodes.map((item) => ({ ...structuredClone(item), nodeType: "operation" })),
+  ];
+
+  const getComposeGraphFromTool = async () => {
+    const nodes = composeNodesForTool();
+    const sourceById = new Map(flowRef.current.sourceAssets.map((item) => [item.id, item]));
+    const edges = flowRef.current.composeNodes.flatMap((node) => node.inputIds.map((sourceId) => ({ sourceId, targetId: node.id, type: "operation-input" })));
+    for (const prepared of flowRef.current.preparedInputs) {
+      const upstreamNodeId = sourceById.get(prepared.sourceAssetId)?.upstreamNodeId;
+      if (upstreamNodeId) edges.push({ sourceId: upstreamNodeId, targetId: prepared.id, type: "materialized-result" });
+    }
+    return { flowId: flowRef.current.id, flowRevision: flowRef.current.revision, workspaceRevision: workspaceRevisionRef.current, activeNodeId: flowRef.current.activeNodeId, nodes, edges };
+  };
+
+  const getComposeNodeFromTool = async (nodeId) => {
+    const node = composeNodesForTool().find((item) => item.id === nodeId);
+    if (!node) throw new Error(`Compose node not found: ${nodeId}`);
+    return { ...node, workspaceRevision: workspaceRevisionRef.current };
+  };
+
+  const getComposeNodePreviewFromTool = async (nodeId, columns, options) => {
+    await getComposeNodeFromTool(nodeId);
+    return runWebMcpRead(() => worker.previewCompose(flowRef.current, nodeId, { columns, ...options }));
+  };
+
+  const getConnectionOptionsFromTool = async (nodeId) => {
+    const nodes = composeNodesForTool();
+    const source = nodes.find((item) => item.id === nodeId);
+    if (!source) throw new Error(`Compose node not found: ${nodeId}`);
+    return {
+      nodeId,
+      workspaceRevision: workspaceRevisionRef.current,
+      targets: nodes.filter((item) => item.id !== nodeId).map((target) => {
+        const normalizeType = (type) => String(type).toUpperCase().replace(/\s+/g, " ").trim();
+        const targetKeysByType = new Map();
+        for (const column of target.schema ?? []) {
+          const type = normalizeType(column.type);
+          targetKeysByType.set(type, [...(targetKeysByType.get(type) ?? []), column]);
+        }
+        const keyPairCount = (source.schema ?? []).reduce((total, column) => total + (targetKeysByType.get(normalizeType(column.type))?.length ?? 0), 0);
+        const keyPairs = [];
+        const seenKeyPairs = new Set();
+        const addKeyPair = (left, right) => {
+          const key = `${left.name}\u0000${right.name}`;
+          if (keyPairs.length >= 200 || seenKeyPairs.has(key)) return;
+          seenKeyPairs.add(key);
+          keyPairs.push({ left: left.name, right: right.name, type: left.type, compatible: true });
+        };
+        for (const left of source.schema ?? []) {
+          const sameType = targetKeysByType.get(normalizeType(left.type)) ?? [];
+          const exact = sameType.find((right) => right.name === left.name);
+          if (exact) addKeyPair(left, exact);
+        }
+        for (const left of source.schema ?? []) {
+          for (const right of targetKeysByType.get(normalizeType(left.type)) ?? []) addKeyPair(left, right);
+          if (keyPairs.length >= 200) break;
+        }
+        const targetTypes = new Map((target.schema ?? []).map(({ name, type }) => [name, normalizeType(type)]));
+        const appendConflicts = (source.schema ?? []).filter(({ name, type }) => targetTypes.has(name) && targetTypes.get(name) !== normalizeType(type));
+        const appendCompatible = appendConflicts.length === 0;
+        return {
+          targetNodeId: target.id,
+          targetName: target.name,
+          operations: [...(appendCompatible ? ["append"] : []), ...(keyPairCount ? ["join", "difference"] : [])],
+          appendCompatible,
+          appendConflicts: appendConflicts.map(({ name, type }) => ({ column: name, sourceType: type, targetType: targetTypes.get(name) })),
+          keyPairCount,
+          keyPairsTruncated: keyPairCount > keyPairs.length,
+          keyPairs,
+        };
+      }),
+    };
+  };
+
+  const getAvailableActionsFromTool = async (targetId) => {
+    if (!targetId) return {
+      workspace: screen === "input" ? "source" : screen === "data" ? "prepare" : screen,
+      workspaceRevision: workspaceRevisionRef.current,
+      actions: screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "export"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload"] : ["request-source-file", "request-source-relink"],
+    };
+    const prepared = flowRef.current.preparedInputs.find((item) => item.id === targetId);
+    if (prepared) return { targetId, kind: "dataset", actions: ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "export", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
+    const operation = flowRef.current.composeNodes.find((item) => item.id === targetId);
+    if (operation) return { targetId, kind: operation.kind, actions: ["inspect", "preview", "update", "export", "promote-result", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
+    throw new Error(`Target not found: ${targetId}`);
   };
 
   const recipeResultSummary = (result, stepId = null) => ({
@@ -2312,34 +2630,57 @@ export function App() {
     columnCount: result.columns.length,
   });
 
-  const addRecipeStepFromTool = async (definition) => {
-    if (!dataset) throw new Error("Open a prepared dataset before changing its recipe.");
+  const applyFiltersFromTool = async (preparedId, nextFilters, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    assertActivePreparedForTool(preparedId);
+    const result = await applyFilters(nextFilters, dataset.aggregateColumns, assertCurrent);
+    return result;
+  }, `prepare:filters:${preparedId}:${JSON.stringify(nextFilters)}`);
+
+  const setAggregateColumnsFromTool = async (preparedId, columns, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    assertActivePreparedForTool(preparedId);
+    const missing = columns.filter((column) => !dataset.columns.includes(column));
+    if (missing.length) throw new Error(`Columns are not available: ${missing.join(", ")}`);
+    const result = await applyFilters(filters, columns, assertCurrent);
+    return { aggregateColumns: result.aggregateColumns, hiddenAggregateColumnCount: result.hiddenAggregateColumnCount };
+  }, `prepare:aggregate-columns:${preparedId}:${JSON.stringify(columns)}`);
+
+  const duplicatePreparedFromTool = async (preparedId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    const result = await duplicatePreparation(preparedId, assertCurrent);
+    if (!result.ok) throw new Error(result.error || "Prepared dataset could not be duplicated.");
+    return result;
+  }, `prepare:duplicate:${preparedId}`);
+
+  const addRecipeStepFromTool = async (preparedId, definition, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    assertActivePreparedForTool(preparedId);
     setScreen("data");
     const step = createStep(definition.type, { ...definition.params });
-    const result = await applyRecipeChange([...recipeHistory.recipe, step]);
+    const result = await applyRecipeChange([...recipeHistory.recipe, step], assertCurrent);
     return recipeResultSummary(result, step.id);
-  };
+  }, `prepare:recipe:add:${preparedId}:${JSON.stringify(definition)}`);
 
-  const updateRecipeStepFromTool = async (stepId, definition) => {
+  const updateRecipeStepFromTool = async (preparedId, stepId, definition, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    assertActivePreparedForTool(preparedId);
     const current = recipeHistory.recipe.find((step) => step.id === stepId);
     if (!current) throw new Error(`Recipe step not found: ${stepId}`);
     setScreen("data");
     const nextRecipe = recipeHistory.recipe.map((step) => step.id === stepId
       ? { ...step, type: definition.type, params: { ...definition.params } }
       : step);
-    const result = await applyRecipeChange(nextRecipe);
+    const result = await applyRecipeChange(nextRecipe, assertCurrent);
     return recipeResultSummary(result, stepId);
-  };
+  }, `prepare:recipe:update:${preparedId}:${stepId}:${JSON.stringify(definition)}`);
 
-  const setRecipeStepEnabledFromTool = async (stepId, enabled) => {
+  const setRecipeStepEnabledFromTool = async (preparedId, stepId, enabled, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    assertActivePreparedForTool(preparedId);
     if (!recipeHistory.recipe.some((step) => step.id === stepId)) throw new Error(`Recipe step not found: ${stepId}`);
     setScreen("data");
     const nextRecipe = recipeHistory.recipe.map((step) => step.id === stepId ? { ...step, enabled } : step);
-    const result = await applyRecipeChange(nextRecipe);
+    const result = await applyRecipeChange(nextRecipe, assertCurrent);
     return { ...recipeResultSummary(result, stepId), enabled };
-  };
+  }, `prepare:recipe:enable:${preparedId}:${stepId}:${enabled}`);
 
-  const moveRecipeStepFromTool = async (stepId, position) => {
+  const moveRecipeStepFromTool = async (preparedId, stepId, position, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    assertActivePreparedForTool(preparedId);
     const sourceIndex = recipeHistory.recipe.findIndex((step) => step.id === stepId);
     if (sourceIndex < 0) throw new Error(`Recipe step not found: ${stepId}`);
     if (position > recipeHistory.recipe.length) throw new Error(`Recipe position must be between 1 and ${recipeHistory.recipe.length}.`);
@@ -2347,34 +2688,37 @@ export function App() {
     const [step] = nextRecipe.splice(sourceIndex, 1);
     nextRecipe.splice(position - 1, 0, step);
     setScreen("data");
-    const result = await applyRecipeChange(nextRecipe);
+    const result = await applyRecipeChange(nextRecipe, assertCurrent);
     return { ...recipeResultSummary(result, stepId), position };
-  };
+  }, `prepare:recipe:move:${preparedId}:${stepId}:${position}`);
 
-  const undoRecipeFromTool = async () => {
+  const undoRecipeFromTool = async (preparedId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    assertActivePreparedForTool(preparedId);
     setScreen("data");
-    const result = await undoRecipe();
+    const result = await undoRecipe(assertCurrent);
     if (!result) throw new Error("There is no recipe change to undo.");
     return recipeResultSummary(result);
-  };
+  }, `prepare:recipe:undo:${preparedId}`);
 
-  const redoRecipeFromTool = async () => {
+  const redoRecipeFromTool = async (preparedId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    assertActivePreparedForTool(preparedId);
     setScreen("data");
-    const result = await redoRecipe();
+    const result = await redoRecipe(assertCurrent);
     if (!result) throw new Error("There is no recipe change to redo.");
     return recipeResultSummary(result);
-  };
+  }, `prepare:recipe:redo:${preparedId}`);
 
-  const applyValueActionFromTool = async (action, column, value) => {
-    if (!dataset?.columns.includes(column)) throw new Error(`Column not found: ${column}`);
+  const applyValueActionFromTool = async (preparedId, action, column, value, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    assertActivePreparedForTool(preparedId);
+    if (!dataset.columns.includes(column)) throw new Error(`Column not found: ${column}`);
     const step = createStep("delete-rows", valueRowActionParams(action, column, value));
     setScreen("data");
-    const result = await applyRecipeChange([...recipeHistory.recipe, step]);
+    const result = await applyRecipeChange([...recipeHistory.recipe, step], assertCurrent);
     return { ...recipeResultSummary(result, step.id), action, column, value };
-  };
+  }, `prepare:value:${preparedId}:${action}:${column}:${JSON.stringify(value)}`);
 
-  const createComposeOperationFromTool = async (operation) => {
-    const defaultName = `${t(operation.kind === "filter-rows" ? "filterRows" : operation.kind === "distinct-rows" ? "distinctRows" : operation.kind)} ${flowRef.current.composeNodes.length + 1}`;
+  const composeOperationDraftFromTool = (operation, existing = null) => {
+    const defaultName = existing?.name ?? `${t(operation.kind === "filter-rows" ? "filterRows" : operation.kind === "distinct-rows" ? "distinctRows" : operation.kind)} ${flowRef.current.composeNodes.length + 1}`;
     let inputIds;
     let config;
     if (operation.kind === "append") {
@@ -2394,20 +2738,62 @@ export function App() {
       if (operation.kind === "pivot") config = { groupBy: operation.groupBy ?? [], pivotColumn: operation.pivotColumn, valueColumn: operation.valueColumn, aggregate: operation.aggregate, values: operation.values };
       if (operation.kind === "unpivot") config = { idColumns: operation.idColumns ?? [], valueColumns: operation.valueColumns, nameColumn: operation.fieldColumn, valueColumn: operation.valueColumn };
     }
+    return {
+      kind: operation.kind,
+      name: operation.name ?? defaultName,
+      inputIds,
+      config,
+      ...(existing?.position ? { position: existing.position } : {}),
+    };
+  };
+
+  const createComposeOperationFromTool = async (operation, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
     setScreen("compose");
-    return createComposeNode({ kind: operation.kind, name: operation.name ?? defaultName, inputIds, config });
+    return createComposeNode(composeOperationDraftFromTool(operation), assertCurrent);
+  }, `compose:create:${JSON.stringify(operation)}`);
+
+  const updateComposeOperationFromTool = async (nodeId, operation, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    const existing = flowRef.current.composeNodes.find((node) => node.id === nodeId);
+    if (!existing) throw new Error(`Compose operation not found: ${nodeId}`);
+    if (operation.kind !== existing.kind) throw new Error("Changing the operation kind is not supported. Create a new operation instead.");
+    setScreen("compose");
+    return updateComposeOperation(nodeId, composeOperationDraftFromTool(operation, existing), assertCurrent);
+  }, `compose:update:${nodeId}:${JSON.stringify(operation)}`);
+
+  const validateComposeOperationFromTool = async (operation) => {
+    const preview = await runWebMcpRead(() => previewComposeDraft(composeOperationDraftFromTool(operation)));
+    return {
+      valid: true,
+      rowCount: preview.rowCount,
+      columnCount: preview.schema.length,
+      schema: preview.schema,
+      preview: preview.preview,
+      workspaceRevision: preview.workspaceRevision,
+    };
   };
 
   const exportComposeFromTool = async (nodeId, format) => {
     setScreen("compose");
-    await selectComposeNode(nodeId);
     return exportComposeNode(format, nodeId);
   };
 
-  const requestDeleteFromTool = async (target, targetId) => {
+  const moveComposeNodeFromTool = async (nodeId, position, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    setScreen("compose");
+    return moveComposeNode(nodeId, position, assertCurrent);
+  }, `compose:move:${nodeId}:${JSON.stringify(position)}`);
+
+  const promoteComposeResultFromTool = async (nodeId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    const result = await createPreparationFromCompose(nodeId, assertCurrent);
+    if (!result.ok) throw new Error(result.error || "Compose result could not be promoted.");
+    return result;
+  }, `compose:promote:${nodeId}`);
+
+  const requestDeleteFromTool = async (target, targetId, meta) => runWebMcpMutation(meta, async () => {
     setScreen(target === "recipe-step" ? "data" : "compose");
-    setWebMcpDeleteRequest({ target, targetId, token: `${Date.now()}-${Math.random()}` });
-  };
+    const token = `${Date.now()}-${Math.random()}`;
+    setWebMcpDeleteRequest({ target, targetId, token });
+    return { target, targetId, confirmationToken: token, pendingConfirmation: true };
+  }, `delete:request:${target}:${targetId}`);
 
   const acknowledgeDeleteRequest = useCallback((token) => {
     setWebMcpDeleteRequest((current) => current?.token === token ? null : current);
@@ -2415,18 +2801,32 @@ export function App() {
 
   useWebMcpTools({
     state: {
+      contractVersion: "2.0",
+      workspaceRevision,
+      flowId: flow.id,
+      flowRevision: flow.revision,
       workspace: screen === "input" ? "source" : screen === "data" ? "prepare" : screen,
       worker: { ready: worker.ready, recovering: worker.recovering },
       flowDirty,
+      diagnostics: [
+        ...(error ? [{ scope: "source-or-prepare", level: "error", message: error }] : []),
+        ...(composeError ? [{ scope: "compose", level: "error", message: composeError }] : []),
+        ...(recipeRecovery.error ? [{ scope: "recipe", level: "error", message: recipeRecovery.error, stepId: recipeRecovery.invalidStepId }] : []),
+      ],
       activePreparedId,
       activeNodeId: flow.activeNodeId,
       activeDataset: dataset ? {
         name: flow.preparedInputs.find((item) => item.id === activePreparedId)?.name ?? dataset.filename,
-        rowCount: dataset.rowCount,
+        totalRowCount: dataset.rowCount,
+        filteredRowCount: dataset.filteredCount,
+        previewRowCount: dataset.preview.length,
         columnCount: dataset.columns.length,
+        columns: [...dataset.columns],
+        schema: dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] ?? null })),
         filterableColumns: [...dataset.aggregateColumns],
         filterableColumnsTruncated: dataset.aggregateColumns.length < dataset.columns.length,
         filters: { ...filters },
+        quality: structuredClone(dataset.quality),
       } : null,
       recipeSteps: recipeHistory.recipe.map((step) => ({
         id: step.id,
@@ -2438,22 +2838,44 @@ export function App() {
       preparedInputs: flow.preparedInputs.map((item) => ({
         id: item.id,
         name: item.name,
-        rowCount: item.rowCount,
+        totalRowCount: item.rowCount,
         columnCount: item.schema?.length ?? null,
+        recipeRevision: item.recipeVersion ?? 0,
+        recipeStatus: item.recipeStatus ?? null,
       })),
       composeNodes: [
-        ...flow.preparedInputs.map((item) => ({ id: item.id, name: item.name, kind: "dataset", rowCount: item.rowCount, columnCount: item.schema?.length ?? null })),
-        ...flow.composeNodes.map((item) => ({ id: item.id, name: item.name, kind: item.kind, inputIds: [...item.inputIds], rowCount: item.rowCount, columnCount: item.schema?.length ?? null })),
+        ...flow.preparedInputs.map((item) => ({ id: item.id, name: item.name, kind: "dataset", totalRowCount: item.rowCount, columnCount: item.schema?.length ?? null, dataStatus: "ready" })),
+        ...flow.composeNodes.map((item) => ({ id: item.id, name: item.name, kind: item.kind, inputIds: [...item.inputIds], totalRowCount: item.rowCount, columnCount: item.schema?.length ?? null, validationStatus: item.validationStatus ?? null, dataStatus: item.dataStatus ?? "ready" })),
       ],
+      sourceAssets: flow.sourceAssets.map((item) => ({ id: item.id, name: item.name, location: item.location, status: item.status, size: item.size ?? null })),
     },
     actions: {
       openWorkspace,
-      selectPrepared: openPrepared,
-      applyFilters: (nextFilters) => applyFilters(nextFilters, dataset?.aggregateColumns ?? []),
+      getAvailableActions: getAvailableActionsFromTool,
+      selectPrepared: selectPreparedFromTool,
+      getRecipe: getRecipeFromTool,
+      duplicatePrepared: duplicatePreparedFromTool,
+      getPrepareDataset: getPrepareDatasetFromTool,
+      getDataProfile: getDataProfileFromTool,
+      queryColumnValues: queryColumnValuesFromTool,
+      getPreparePreview: getPreparePreviewFromTool,
+      previewRecipeChange: previewRecipeChangeFromTool,
+      applyFilters: applyFiltersFromTool,
+      setAggregateColumns: setAggregateColumnsFromTool,
       selectComposeNode: selectComposeNodeFromTool,
       autoArrangeCompose: autoArrangeComposeFromTool,
+      moveComposeNode: moveComposeNodeFromTool,
+      getComposeGraph: getComposeGraphFromTool,
+      getComposeNode: getComposeNodeFromTool,
+      getComposeNodePreview: getComposeNodePreviewFromTool,
+      validateComposeOperation: validateComposeOperationFromTool,
+      getConnectionOptions: getConnectionOptionsFromTool,
       requestSourceFileSelection,
-      exportPrepare: exportPreparedData,
+      requestSourceRelink: requestSourceRelinkFromTool,
+      listCloudFiles: listCloudFilesFromTool,
+      openCloudFile: openCloudFileFromTool,
+      requestCloudUpload: requestCloudUploadFromTool,
+      exportPrepare: (preparedId, format) => exportPreparedData(format, preparedId),
       addRecipeStep: addRecipeStepFromTool,
       updateRecipeStep: updateRecipeStepFromTool,
       setRecipeStepEnabled: setRecipeStepEnabledFromTool,
@@ -2462,6 +2884,8 @@ export function App() {
       redoRecipe: redoRecipeFromTool,
       applyValueAction: applyValueActionFromTool,
       createComposeOperation: createComposeOperationFromTool,
+      updateComposeOperation: updateComposeOperationFromTool,
+      promoteComposeResult: promoteComposeResultFromTool,
       exportCompose: exportComposeFromTool,
       requestDelete: requestDeleteFromTool,
     },
@@ -2475,7 +2899,11 @@ export function App() {
       }} onCollapse={() => setCollapsed((value) => !value)} />
       {flowDirty && <div className="flow-save-alert" role="alert"><span>{t("flowSaveFailed")}</span><button type="button" disabled={retryingFlowSave} onClick={retryFlowSave}>{t(retryingFlowSave ? "saving" : "retrySave")}</button></div>}
       {screen === "account" ? (
-        <AccountScreen onOpenFile={async (file) => { setScreen("input"); await loadFile(file, null); }} />
+        <AccountScreen
+          onOpenFile={async (file) => { setScreen("input"); await loadFile(file, null); }}
+          uploadRequestToken={webMcpCloudUploadToken}
+          onUploadRequestShown={(token) => setWebMcpCloudUploadToken((current) => current === token ? 0 : current)}
+        />
       ) : screen === "input" ? (
         <InputScreen
           loading={loading}
@@ -2487,6 +2915,8 @@ export function App() {
           openedSources={openedSources}
           fileRequestToken={webMcpFileRequestToken}
           onFileRequestShown={(token) => setWebMcpFileRequestToken((current) => current === token ? 0 : current)}
+          relinkRequest={webMcpRelinkRequest}
+          onRelinkRequestShown={(token) => setWebMcpRelinkRequest((current) => current?.token === token ? null : current)}
         />
       ) : screen === "compose" ? (
         <ComposeScreen

@@ -8,6 +8,8 @@ import { collectSourceColumns } from "./sourceInspection.js";
 import { compileRecipe, compileRecipeSafely, INTERNAL_ROW_ID } from "./transformations.js";
 
 const AGGREGATE_LIMIT = 100;
+const WEBMCP_PREVIEW_COLUMN_LIMIT = 100;
+const WEBMCP_PROFILE_COLUMN_LIMIT = 50;
 const SOURCE_TABLE = "source_data";
 const WORKING_VIEW = "working_data";
 let databasePromise = null;
@@ -175,6 +177,26 @@ function displayProjection(selectedColumns = columns) {
       ? `CAST(${identifier} AS VARCHAR) AS ${identifier}`
       : identifier;
   }).join(", ");
+}
+
+function normalizedPage(offset = 0, limit = 100) {
+  const normalizedOffset = Math.max(0, Math.trunc(Number(offset) || 0));
+  const normalizedLimit = Math.max(1, Math.min(100, Math.trunc(Number(limit) || 100)));
+  return { offset: normalizedOffset, limit: normalizedLimit };
+}
+
+function selectedKnownColumns(requestedColumns, maximum = WEBMCP_PREVIEW_COLUMN_LIMIT) {
+  const requested = Array.isArray(requestedColumns) && requestedColumns.length
+    ? requestedColumns
+    : columns.slice(0, maximum);
+  if (requested.length > maximum) throw new Error(`A maximum of ${maximum} columns can be returned per request.`);
+  const seen = new Set();
+  return requested.map(String).filter((column) => {
+    if (!columnTypes.has(column)) throw new Error(`Column not found: ${column}`);
+    if (seen.has(column)) return false;
+    seen.add(column);
+    return true;
+  });
 }
 
 async function refreshMetadata({ requireRows = false } = {}) {
@@ -461,8 +483,9 @@ async function buildDataset(filters = {}, requestedAggregateColumns) {
   };
 }
 
-async function searchAggregate(column, searchText, filters) {
+async function searchAggregate(column, searchText, filters, offset = 0, limit = AGGREGATE_LIMIT) {
   if (!columnTypes.has(column)) return { values: [], matchCount: 0 };
+  const page = normalizedPage(offset, limit);
   const identifier = quoteIdentifier(column);
   const type = columnTypes.get(column);
   const where = buildWhere(filters, column);
@@ -471,19 +494,91 @@ async function searchAggregate(column, searchText, filters) {
   const nullSearch = normalizedSearch.replaceAll("(", "").replaceAll(")", "").toLocaleLowerCase();
   const includesNull = ["null", "kosong"].some((token) => token.includes(nullSearch));
   const escapedSearch = normalizedSearch.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_");
-  const rows = await query(`
+  const groupedSql = `
     WITH grouped AS (
       SELECT CAST(${identifier} AS VARCHAR) AS value_text, COUNT(*) AS count
       FROM ${WORKING_VIEW}
       ${searchClause} (LOWER(CAST(${identifier} AS VARCHAR)) LIKE LOWER(?) ESCAPE '\\'${includesNull ? ` OR ${identifier} IS NULL` : ""})
       GROUP BY ${identifier}
-    )
-    SELECT value_text, count, COUNT(*) OVER () AS match_count
+    )`;
+  const parameters = [...where.parameters, `%${escapedSearch}%`];
+  const countRows = await query(`${groupedSql} SELECT COUNT(*) AS match_count FROM grouped`, parameters);
+  const rows = await query(`${groupedSql}
+    SELECT value_text, count
     FROM grouped
     ORDER BY count DESC, value_text ASC NULLS FIRST
-    LIMIT ${AGGREGATE_LIMIT}
-  `, [...where.parameters, `%${escapedSearch}%`]);
-  return { values: rows.map((row) => aggregateItem(row, type)), matchCount: Number(rows[0]?.match_count ?? 0) };
+    LIMIT ${page.limit} OFFSET ${page.offset}
+  `, parameters);
+  return {
+    column,
+    values: rows.map((row) => aggregateItem(row, type)),
+    matchCount: Number(countRows[0]?.match_count ?? 0),
+    offset: page.offset,
+    limit: page.limit,
+  };
+}
+
+async function previewPreparedData(filters = {}, requestedColumns, offset = 0, limit = 100) {
+  const page = normalizedPage(offset, limit);
+  const selectedColumns = selectedKnownColumns(requestedColumns);
+  const where = buildWhere(filters);
+  const counts = await query(`SELECT COUNT(*) AS filtered_count FROM ${WORKING_VIEW} ${where.sql}`, where.parameters);
+  const preview = await query(`SELECT ${displayProjection(selectedColumns)} FROM ${WORKING_VIEW} ${where.sql} LIMIT ${page.limit} OFFSET ${page.offset}`, where.parameters);
+  return {
+    preparedId: activePreparedId,
+    columns: selectedColumns,
+    totalColumnCount: columns.length,
+    columnsTruncated: selectedColumns.length < columns.length,
+    columnTypes: Object.fromEntries(selectedColumns.map((column) => [column, columnTypes.get(column)])),
+    totalRowCount: rowCount,
+    filteredRowCount: Number(counts[0]?.filtered_count ?? 0),
+    previewRowCount: preview.length,
+    offset: page.offset,
+    limit: page.limit,
+    preview,
+  };
+}
+
+async function profileDataColumns(requestedColumns) {
+  const selectedColumns = selectedKnownColumns(requestedColumns, WEBMCP_PROFILE_COLUMN_LIMIT);
+  if (!qualityCache) qualityCache = await analyzeQuality();
+  const expressions = selectedColumns.flatMap((column, index) => {
+    const identifier = quoteIdentifier(column);
+    const type = String(columnTypes.get(column)).toUpperCase();
+    const comparable = type.includes("JSON") || type.includes("UNION") || type.includes("STRUCT") || type.includes("[]")
+      ? `CAST(${identifier} AS VARCHAR)`
+      : identifier;
+    return [
+      `COUNT(*) FILTER (WHERE ${identifier} IS NULL OR TRIM(CAST(${identifier} AS VARCHAR)) = '') AS missing_${index}`,
+      `COUNT(DISTINCT CAST(${identifier} AS VARCHAR)) AS distinct_${index}`,
+      `MIN(${comparable}) AS min_${index}`,
+      `MAX(${comparable}) AS max_${index}`,
+    ];
+  });
+  const stats = expressions.length ? (await query(`SELECT ${expressions.join(", ")} FROM ${WORKING_VIEW}`))[0] ?? {} : {};
+  const qualityByColumn = new Map((qualityCache?.affectedColumns ?? []).map((item) => [item.column, item]));
+  return {
+    preparedId: activePreparedId,
+    totalRowCount: rowCount,
+    totalColumnCount: columns.length,
+    profiledColumnCount: selectedColumns.length,
+    columnsTruncated: selectedColumns.length < columns.length,
+    quality: qualityCache,
+    columns: selectedColumns.map((column, index) => {
+      const issue = qualityByColumn.get(column);
+      return {
+        name: column,
+        type: columnTypes.get(column),
+        missingCount: Number(stats[`missing_${index}`] ?? issue?.missing ?? 0),
+        distinctCount: Number(stats[`distinct_${index}`] ?? 0),
+        min: stats[`min_${index}`] ?? null,
+        max: stats[`max_${index}`] ?? null,
+        mixedType: Boolean(issue?.mixed),
+        observedTypes: issue?.types ?? [typeToUi(columnTypes.get(column))],
+        semantics: { unit: null, currency: null, sensitivity: "unknown", requiresReview: true, source: "not-defined" },
+      };
+    }),
+  };
 }
 
 async function exportRows(format, filters) {
@@ -495,7 +590,8 @@ async function exportRows(format, filters) {
   }
   const filteredRows = await query(`SELECT ${displayProjection()} FROM ${WORKING_VIEW} ${where.sql}`, where.parameters);
   const baseName = sourceName.replace(/\.[^.]+$/, "") || "tabulaflow-data";
-  return encodeSpreadsheetExport(filteredRows, columns, format, `${baseName}-filtered`);
+  const hasFilters = Object.values(filters ?? {}).some(Boolean);
+  return encodeSpreadsheetExport(filteredRows, columns, format, hasFilters ? `${baseName}-filtered` : baseName);
 }
 
 async function activatePrepared(preparedId, filters = {}, requestedAggregateColumns) {
@@ -634,22 +730,38 @@ async function compileGraphNode(graph, nodeId, cache = new Map(), visiting = new
   return relation;
 }
 
-async function previewComposeNode(graph, nodeId) {
+async function previewComposeNode(graph, nodeId, options = {}) {
   const relation = await compileGraphNode(graph, nodeId);
   const schema = relation.schema?.length ? relation.schema : await describeRelation(relation.sql);
   const visibleSchema = schema.filter((column) => column.name !== INTERNAL_ROW_ID);
-  const projection = visibleSchema.map((column) => {
+  const requestedColumns = Array.isArray(options.columns) && options.columns.length
+    ? options.columns.map(String)
+    : visibleSchema.slice(0, WEBMCP_PREVIEW_COLUMN_LIMIT).map((column) => column.name);
+  if (requestedColumns.length > WEBMCP_PREVIEW_COLUMN_LIMIT) throw new Error(`A maximum of ${WEBMCP_PREVIEW_COLUMN_LIMIT} columns can be returned per request.`);
+  const schemaByName = new Map(visibleSchema.map((column) => [column.name, column]));
+  const selectedSchema = requestedColumns.map((column) => {
+    const definition = schemaByName.get(column);
+    if (!definition) throw new Error(`Column not found on Compose node ${nodeId}: ${column}`);
+    return definition;
+  });
+  const page = normalizedPage(options.offset, options.limit);
+  const projection = selectedSchema.map((column) => {
     const identifier = quoteIdentifier(column.name);
     return /DATE|TIME/.test(String(column.type).toUpperCase()) ? `CAST(${identifier} AS VARCHAR) AS ${identifier}` : identifier;
   }).join(", ");
   const count = await query(`SELECT COUNT(*) AS row_count FROM (${relation.sql}) AS compose_count`);
-  const preview = await query(`SELECT ${projection} FROM (${relation.sql}) AS compose_preview LIMIT 100`);
+  const preview = await query(`SELECT ${projection} FROM (${relation.sql}) AS compose_preview LIMIT ${page.limit} OFFSET ${page.offset}`);
   return {
     nodeId,
-    columns: visibleSchema.map((column) => column.name),
-    columnTypes: Object.fromEntries(visibleSchema.map((column) => [column.name, column.type])),
+    columns: selectedSchema.map((column) => column.name),
+    totalColumnCount: visibleSchema.length,
+    columnsTruncated: selectedSchema.length < visibleSchema.length,
+    columnTypes: Object.fromEntries(selectedSchema.map((column) => [column.name, column.type])),
     schema: visibleSchema,
     rowCount: Number(count[0]?.row_count ?? 0),
+    previewRowCount: preview.length,
+    offset: page.offset,
+    limit: page.limit,
     preview,
   };
 }
@@ -658,8 +770,9 @@ async function exportComposeNode(graph, nodeId, format) {
   const result = await previewComposeNode(graph, nodeId);
   if (result.rowCount > DATA_LIMITS.maxExportRows) throw new Error(`Ekspor dibatasi ${DATA_LIMITS.maxExportRows.toLocaleString("id-ID")} baris.`);
   const relation = await compileGraphNode(graph, nodeId);
-  const rows = await query(`SELECT ${result.columns.map(quoteIdentifier).join(", ")} FROM (${relation.sql}) AS compose_export`);
-  return encodeSpreadsheetExport(rows, result.columns, format, `tabulaflow-${nodeId}`, "Composed Data");
+  const exportColumns = result.schema.map((column) => column.name);
+  const rows = await query(`SELECT ${exportColumns.map(quoteIdentifier).join(", ")} FROM (${relation.sql}) AS compose_export`);
+  return encodeSpreadsheetExport(rows, exportColumns, format, `tabulaflow-${nodeId}`, "Composed Data");
 }
 
 function reconcileWorkerFilters(filters = {}) {
@@ -756,11 +869,13 @@ async function handleRequest(type, payload) {
   if (type === "unregister-prepared") return unregisterPrepared(payload.preparedId);
   if (type === "materialize-compose-prepared") return materializeComposePrepared(payload.graph, payload.nodeId, payload.identifiers);
   if (type === "filter") return buildDataset(payload.filters, payload.aggregateColumns);
-  if (type === "search-aggregate") return searchAggregate(payload.column, payload.query, payload.filters);
+  if (type === "search-aggregate") return searchAggregate(payload.column, payload.query, payload.filters, payload.offset, payload.limit);
+  if (type === "prepare-preview") return previewPreparedData(payload.filters, payload.columns, payload.offset, payload.limit);
+  if (type === "data-profile") return profileDataColumns(payload.columns);
   if (type === "export") return exportRows(payload.format, payload.filters);
   if (type === "apply-recipe") return applyRecipe(payload.recipe, payload.filters, payload.aggregateColumns, payload.preparedId);
   if (type === "preview-recipe") return previewRecipe(payload.recipe, payload.stepIndex);
-  if (type === "compose-preview") return previewComposeNode(payload.graph, payload.nodeId);
+  if (type === "compose-preview") return previewComposeNode(payload.graph, payload.nodeId, payload.options);
   if (type === "compose-export") return exportComposeNode(payload.graph, payload.nodeId, payload.format);
   throw new Error("Operasi worker tidak dikenal.");
 }

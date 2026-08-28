@@ -83,9 +83,24 @@ export function hydrateComposeSchemas(graph) {
       try {
         const compiled = compileComposeOperation(node.kind, inputs, node.config);
         relations.set(node.id, compiled);
-        hydrated.set(node.id, { schema: compiled.schema, validationStatus: "valid" });
-      } catch {
-        hydrated.set(node.id, { schema: [], validationStatus: "invalid" });
+        hydrated.set(node.id, {
+          schema: compiled.schema,
+          lastValidSchema: compiled.schema,
+          validationStatus: "valid",
+          dataStatus: "ready",
+          validationError: null,
+        });
+      } catch (error) {
+        const lastValidSchema = node.lastValidSchema?.length
+          ? node.lastValidSchema
+          : node.schema ?? [];
+        hydrated.set(node.id, {
+          schema: lastValidSchema,
+          lastValidSchema,
+          validationStatus: "invalid",
+          dataStatus: "error",
+          validationError: error instanceof Error ? error.message : "Compose schema validation failed.",
+        });
       }
     }
   }
@@ -96,7 +111,15 @@ export function hydrateComposeSchemas(graph) {
     if (!next) return node;
     const currentSignature = schemaFingerprint(node.schema ?? []);
     const nextSignature = schemaFingerprint(next.schema);
-    if (currentSignature === nextSignature && node.validationStatus === next.validationStatus) return node;
+    const currentLastValidSignature = schemaFingerprint(node.lastValidSchema ?? []);
+    const nextLastValidSignature = schemaFingerprint(next.lastValidSchema ?? []);
+    if (
+      currentSignature === nextSignature
+      && currentLastValidSignature === nextLastValidSignature
+      && node.validationStatus === next.validationStatus
+      && node.dataStatus === next.dataStatus
+      && (node.validationError ?? null) === next.validationError
+    ) return node;
     changed = true;
     return { ...node, ...next };
   });

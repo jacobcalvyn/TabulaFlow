@@ -273,6 +273,30 @@ test("hydrates Compose schemas from prepared metadata before the canvas renders"
   assert.deepEqual(result.unresolvedNodeIds, []);
 });
 
+test("preserves the last valid Compose schema while an operation is invalid", () => {
+  const input = prepared("input", ["id", "status"]);
+  const graph = addPreparedInput(createFlowGraph(), input.sourceAsset, input.preparedInput);
+  const lastValidSchema = [{ name: "id", type: "VARCHAR" }, { name: "status", type: "VARCHAR" }];
+  const filtered = addComposeNode(graph, {
+    kind: "filter-rows",
+    name: "Invalid filter",
+    inputIds: [input.preparedInput.id],
+    config: { conjunction: "and", conditions: [{ column: "missing", operator: "equals", value: "open" }] },
+    schema: [],
+    lastValidSchema,
+    validationStatus: "needs-validation",
+    dataStatus: "stale",
+  });
+
+  const result = hydrateComposeSchemas(filtered.graph);
+  const node = result.graph.composeNodes[0];
+  assert.deepEqual(node.schema, lastValidSchema);
+  assert.deepEqual(node.lastValidSchema, lastValidSchema);
+  assert.equal(node.validationStatus, "invalid");
+  assert.equal(node.dataStatus, "error");
+  assert.match(node.validationError, /missing/i);
+});
+
 test("relink invalidation includes descendants of every prepared copy of a source", () => {
   const left = prepared("left");
   const right = prepared("right");
