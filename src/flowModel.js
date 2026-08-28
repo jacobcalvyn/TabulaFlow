@@ -1,5 +1,6 @@
 import { PREPARED_RECIPE_STATUS } from "./preparedRecipeState.js";
 import { compileComposeOperation } from "./composeSql.js";
+import { applySemanticModelToSchema, createSemanticModel, reconcileSemanticModel } from "./semanticModel.js";
 
 export const FLOW_SCHEMA_VERSION = 2;
 
@@ -51,6 +52,10 @@ export function schemaFingerprint(columns = []) {
     .toLocaleLowerCase("en-US");
 }
 
+function schemaMetadataFingerprint(columns = []) {
+  return JSON.stringify(columns.map((column) => ({ name: column.name, type: column.type ?? null, semantic: column.semantic ?? null })));
+}
+
 export function createFlowGraph() {
   return {
     schemaVersion: FLOW_SCHEMA_VERSION,
@@ -61,9 +66,7 @@ export function createFlowGraph() {
     preparedInputs: [],
     composeNodes: [],
     semanticModels: {},
-    validationRules: [],
-    validationRuns: [],
-    analyses: [],
+    metricDefinitions: [],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -86,6 +89,7 @@ export function hydrateComposeSchemas(graph) {
       progressed = true;
       try {
         const compiled = compileComposeOperation(node.kind, inputs, node.config);
+        compiled.schema = applySemanticModelToSchema(compiled.schema, graph.semanticModels?.[node.id]);
         relations.set(node.id, compiled);
         hydrated.set(node.id, {
           schema: compiled.schema,
@@ -113,10 +117,10 @@ export function hydrateComposeSchemas(graph) {
   const composeNodes = graph.composeNodes.map((node) => {
     const next = hydrated.get(node.id);
     if (!next) return node;
-    const currentSignature = schemaFingerprint(node.schema ?? []);
-    const nextSignature = schemaFingerprint(next.schema);
-    const currentLastValidSignature = schemaFingerprint(node.lastValidSchema ?? []);
-    const nextLastValidSignature = schemaFingerprint(next.lastValidSchema ?? []);
+    const currentSignature = schemaMetadataFingerprint(node.schema ?? []);
+    const nextSignature = schemaMetadataFingerprint(next.schema);
+    const currentLastValidSignature = schemaMetadataFingerprint(node.lastValidSchema ?? []);
+    const nextLastValidSignature = schemaMetadataFingerprint(next.lastValidSchema ?? []);
     if (
       currentSignature === nextSignature
       && currentLastValidSignature === nextLastValidSignature
@@ -212,7 +216,9 @@ export function createPreparedInput(fileMetadata, dataset, recipe = []) {
     schema: dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] ?? null })),
     position: { ...INITIAL_PREPARED_POSITION },
   };
-  return { sourceAsset, preparedInput };
+  const semanticModel = createSemanticModel(preparedInputId, preparedInput.schema);
+  preparedInput.schema = applySemanticModelToSchema(preparedInput.schema, semanticModel);
+  return { sourceAsset, preparedInput, semanticModel };
 }
 
 export function addPreparedInput(graph, sourceAsset, preparedInput) {
@@ -226,12 +232,16 @@ export function addPreparedInput(graph, sourceAsset, preparedInput) {
     sourceAssetId: matchingSource?.id ?? preparedInput.sourceAssetId,
     position: nextAvailablePosition(preparedInput.position, occupied),
   };
+  const semanticModel = reconcileSemanticModel(graph.semanticModels?.[positionedPreparedInput.id], positionedPreparedInput.id, positionedPreparedInput.schema);
+  const semanticPreparedInput = { ...positionedPreparedInput, schema: applySemanticModelToSchema(positionedPreparedInput.schema, semanticModel) };
   return {
     ...graph,
     revision: graph.revision + 1,
-    activeNodeId: positionedPreparedInput.id,
+    activeNodeId: semanticPreparedInput.id,
     sourceAssets: matchingSource ? graph.sourceAssets : [...graph.sourceAssets, sourceAsset],
-    preparedInputs: [...graph.preparedInputs, positionedPreparedInput],
+    preparedInputs: [...graph.preparedInputs, semanticPreparedInput],
+    semanticModels: { ...(graph.semanticModels ?? {}), [semanticPreparedInput.id]: semanticModel },
+    metricDefinitions: graph.metricDefinitions ?? [],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -311,12 +321,17 @@ export function autoArrangeNodePositions(graph) {
 }
 
 export function updatePreparedInput(graph, preparedInputId, changes) {
+  const current = graph.preparedInputs.find((item) => item.id === preparedInputId);
+  const nextSchema = changes.schema ?? current?.schema ?? [];
+  const semanticModel = reconcileSemanticModel(graph.semanticModels?.[preparedInputId], preparedInputId, nextSchema);
   return {
     ...graph,
     revision: graph.revision + 1,
     preparedInputs: graph.preparedInputs.map((item) => item.id === preparedInputId
-      ? { ...item, ...changes, recipe: changes.recipe ? cloneRecipe(changes.recipe) : item.recipe }
+      ? { ...item, ...changes, schema: applySemanticModelToSchema(nextSchema, semanticModel), recipe: changes.recipe ? cloneRecipe(changes.recipe) : item.recipe }
       : item),
+    semanticModels: { ...(graph.semanticModels ?? {}), [preparedInputId]: semanticModel },
+    metricDefinitions: graph.metricDefinitions ?? [],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -332,15 +347,17 @@ export function duplicatePreparedInput(graph, preparedInputId) {
     schema: source.schema.map((column) => ({ ...column })),
     position: { x: source.position.x + 320, y: source.position.y },
   };
+  const sourceModel = reconcileSemanticModel(graph.semanticModels?.[source.id], source.id, source.schema);
+  const copyModel = { ...structuredClone(sourceModel), targetId: copy.id, revision: 0 };
+  copy.schema = applySemanticModelToSchema(copy.schema, copyModel);
   return {
     graph: {
       ...graph,
       revision: graph.revision + 1,
       activeNodeId: copy.id,
       preparedInputs: [...graph.preparedInputs, copy],
-      semanticModels: graph.semanticModels?.[source.id]
-        ? { ...graph.semanticModels, [copy.id]: { ...structuredClone(graph.semanticModels[source.id]), targetId: copy.id, revision: 1, updatedAt: new Date().toISOString() } }
-        : graph.semanticModels ?? {},
+      semanticModels: { ...(graph.semanticModels ?? {}), [copy.id]: copyModel },
+      metricDefinitions: graph.metricDefinitions ?? [],
       updatedAt: new Date().toISOString(),
     },
     preparedInput: copy,
@@ -385,6 +402,9 @@ export function createPreparedFromCompose(graph, composeNodeId) {
     schema,
     position: { x: sourceNode.position.x + 320, y: sourceNode.position.y },
   };
+  const semanticModel = createSemanticModel(preparedInputId, schema);
+  semanticModel.fields = Object.fromEntries(schema.map((column) => [column.name, { ...semanticModel.fields[column.name], ...(column.semantic ?? {}), provenance: column.semantic?.provenance ?? { kind: "compose-result", nodeId: sourceNode.id, column: column.name } }]));
+  preparedInput.schema = applySemanticModelToSchema(schema, semanticModel);
   return {
     graph: {
       ...graph,
@@ -392,6 +412,8 @@ export function createPreparedFromCompose(graph, composeNodeId) {
       activeNodeId: preparedInput.id,
       sourceAssets: [...graph.sourceAssets, sourceAsset],
       preparedInputs: [...graph.preparedInputs, preparedInput],
+      semanticModels: { ...(graph.semanticModels ?? {}), [preparedInput.id]: semanticModel },
+      metricDefinitions: graph.metricDefinitions ?? [],
       updatedAt: new Date().toISOString(),
     },
     sourceAsset,
@@ -452,10 +474,8 @@ export function removeComposeNode(graph, nodeId) {
     revision: graph.revision + 1,
     activeNodeId: graph.activeNodeId === nodeId ? current.inputIds?.[0] ?? graph.preparedInputs[0]?.id ?? null : graph.activeNodeId,
     composeNodes,
-    semanticModels: Object.fromEntries(Object.entries(graph.semanticModels ?? {}).filter(([id]) => id !== nodeId)),
-    validationRules: (graph.validationRules ?? []).filter((rule) => rule.targetId !== nodeId),
-    validationRuns: (graph.validationRuns ?? []).filter((run) => run.targetId !== nodeId),
-    analyses: (graph.analyses ?? []).filter((analysis) => analysis.targetId !== nodeId),
+    semanticModels: Object.fromEntries(Object.entries(graph.semanticModels ?? {}).filter(([targetId]) => targetId !== nodeId)),
+    metricDefinitions: (graph.metricDefinitions ?? []).filter((metric) => metric.targetId !== nodeId),
     updatedAt: new Date().toISOString(),
   };
   validateFlowGraph(candidate);
@@ -484,10 +504,8 @@ export function removePreparedInput(graph, preparedInputId) {
       : graph.activeNodeId,
     sourceAssets,
     preparedInputs,
-    semanticModels: Object.fromEntries(Object.entries(graph.semanticModels ?? {}).filter(([id]) => id !== preparedInputId)),
-    validationRules: (graph.validationRules ?? []).filter((rule) => rule.targetId !== preparedInputId),
-    validationRuns: (graph.validationRuns ?? []).filter((run) => run.targetId !== preparedInputId),
-    analyses: (graph.analyses ?? []).filter((analysis) => analysis.targetId !== preparedInputId),
+    semanticModels: Object.fromEntries(Object.entries(graph.semanticModels ?? {}).filter(([targetId]) => targetId !== preparedInputId)),
+    metricDefinitions: (graph.metricDefinitions ?? []).filter((metric) => metric.targetId !== preparedInputId),
     updatedAt: new Date().toISOString(),
   };
   validateFlowGraph(candidate);

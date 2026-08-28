@@ -1,15 +1,14 @@
 import * as duckdb from "@duckdb/duckdb-wasm";
 import { DUCKDB_BUNDLES } from "@duckdb-bundles";
 import { compileComposeOperation } from "./composeSql.js";
+import { applySemanticModelToSchema } from "./semanticModel.js";
 import { DATA_LIMITS, makeDemoRows, normalizeEmptyValues, parseDataFile } from "./data.js";
-import { canExposeProfileRange, classifyColumnSemantics, redactAgentRows, shouldRedactAgentValues } from "./dataPrivacy.js";
+import { canExposeProfileRange, classifyColumnSemantics, redactAgentRows, resolveColumnSemantics, shouldRedactAgentValues } from "./dataPrivacy.js";
 import { encodeSpreadsheetExport, sanitizeExportBaseName } from "./dataExport.js";
 import { buildJoinKeyCandidates, rankJoinKeyCandidates } from "./joinRecommendations.js";
 import { recipeForExecution } from "./preparedRecipeState.js";
 import { collectSourceColumns } from "./sourceInspection.js";
 import { qualityCoverage, qualityProfileBatches } from "./qualityProfiling.js";
-import { compileAnalysis } from "./analysisEngine.js";
-import { compileValidationCondition, validationFields } from "./validationEngine.js";
 import { compileRecipe, compileRecipeSafely, INTERNAL_ROW_ID } from "./transformations.js";
 
 const AGGREGATE_LIMIT = 100;
@@ -540,8 +539,9 @@ async function searchAggregate(column, searchText, filters, offset = 0, limit = 
   };
 }
 
-async function searchAggregateForAgent(column, searchText, filters, offset = 0, limit = AGGREGATE_LIMIT) {
-  const semantics = classifyColumnSemantics(column, columnTypes.get(column));
+async function searchAggregateForAgent(column, searchText, filters, offset = 0, limit = AGGREGATE_LIMIT, semanticSchema = []) {
+  const definition = semanticSchema.find((item) => item.name === column) ?? { name: column, type: columnTypes.get(column) };
+  const semantics = resolveColumnSemantics(definition);
   if (!shouldRedactAgentValues(semantics)) {
     return { ...(await searchAggregate(column, searchText, filters, offset, Math.min(limit, 100))), semantics, valuesRedacted: false };
   }
@@ -571,7 +571,7 @@ async function searchAggregateForAgent(column, searchText, filters, offset = 0, 
   };
 }
 
-async function previewPreparedData(filters = {}, requestedColumns, offset = 0, limit = 100, { agentMode = false } = {}) {
+async function previewPreparedData(filters = {}, requestedColumns, offset = 0, limit = 100, { agentMode = false, semanticSchema = [] } = {}) {
   if (agentMode && (!Array.isArray(requestedColumns) || requestedColumns.length === 0)) {
     const error = new Error("Agent previews require an explicit non-empty columns list.");
     error.code = "EXPLICIT_COLUMNS_REQUIRED";
@@ -582,7 +582,8 @@ async function previewPreparedData(filters = {}, requestedColumns, offset = 0, l
   const where = buildWhere(filters);
   const counts = await query(`SELECT COUNT(*) AS filtered_count FROM ${WORKING_VIEW} ${where.sql}`, where.parameters);
   const preview = await query(`SELECT ${displayProjection(selectedColumns)} FROM ${WORKING_VIEW} ${where.sql} LIMIT ${page.limit} OFFSET ${page.offset}`, where.parameters);
-  const schema = selectedColumns.map((column) => ({ name: column, type: columnTypes.get(column) }));
+  const semanticByName = new Map(semanticSchema.map((column) => [column.name, column]));
+  const schema = selectedColumns.map((column) => semanticByName.get(column) ?? ({ name: column, type: columnTypes.get(column) }));
   const safePreview = agentMode ? redactAgentRows(preview, schema) : { rows: preview, redactedColumns: [] };
   return {
     preparedId: activePreparedId,
@@ -600,10 +601,11 @@ async function previewPreparedData(filters = {}, requestedColumns, offset = 0, l
   };
 }
 
-async function profileDataColumns(requestedColumns) {
+async function profileDataColumns(requestedColumns, semanticSchema = []) {
   const selectedColumns = selectedKnownColumns(requestedColumns, WEBMCP_PROFILE_COLUMN_LIMIT);
   if (!qualityCache) qualityCache = await analyzeQuality();
-  const semanticsByColumn = new Map(selectedColumns.map((column) => [column, classifyColumnSemantics(column, columnTypes.get(column))]));
+  const semanticByName = new Map(semanticSchema.map((column) => [column.name, column]));
+  const semanticsByColumn = new Map(selectedColumns.map((column) => [column, resolveColumnSemantics(semanticByName.get(column) ?? { name: column, type: columnTypes.get(column) })]));
   const expressions = selectedColumns.flatMap((column, index) => {
     const identifier = quoteIdentifier(column);
     const type = String(columnTypes.get(column)).toUpperCase();
@@ -769,7 +771,9 @@ async function preparedRelation(preparedId, graphPrepared) {
   if (!prepared || !source) throw new Error(`Source is unavailable in this session for ${graphPrepared?.name ?? preparedId}.`);
   const recipe = recipeForExecution(graphPrepared, prepared.recipe);
   const compiled = compileRecipe(recipe, prepared.sourceColumns, source.tableName);
-  const schema = await describeRelation(compiled.sql);
+  const described = await describeRelation(compiled.sql);
+  const graphSchema = new Map((graphPrepared?.schema ?? []).map((column) => [column.name, column]));
+  const schema = described.map((column) => ({ ...graphSchema.get(column.name), ...column }));
   return { sql: compiled.sql, schema };
 }
 
@@ -791,6 +795,7 @@ async function compileGraphNode(graph, nodeId, cache = new Map(), visiting = new
   const inputs = [];
   for (const inputId of node.inputIds ?? []) inputs.push(await compileGraphNode(graph, inputId, cache, visiting));
   const relation = compileComposeOperation(node.kind, inputs, node.config ?? {});
+  relation.schema = applySemanticModelToSchema(relation.schema, graph.semanticModels?.[node.id]);
   cache.set(nodeId, relation);
   visiting.delete(nodeId);
   return relation;
@@ -846,6 +851,61 @@ async function previewComposeNode(graph, nodeId, options = {}) {
   };
 }
 
+async function profileComposeNodeQuality(graph, nodeId) {
+  const relation = await compileGraphNode(graph, nodeId);
+  const schema = (relation.schema?.length ? relation.schema : await describeRelation(relation.sql)).filter((column) => column.name !== INTERNAL_ROW_ID);
+  const count = await query(`SELECT COUNT(*) AS row_count FROM (${relation.sql}) AS compose_quality_count`);
+  const totalRowCount = Number(count[0]?.row_count ?? 0);
+  let emptyCellCount = 0;
+  let mixedTypeColumnCount = 0;
+  const affectedColumns = [];
+  for (const batch of qualityProfileBatches(schema, QUALITY_PROFILE_BATCH_SIZE)) {
+    const expressions = [];
+    batch.forEach((column, index) => {
+      const identifier = quoteIdentifier(column.name);
+      expressions.push(`COUNT(*) FILTER (WHERE ${identifier} IS NULL OR TRIM(CAST(${identifier} AS VARCHAR)) = '') AS missing_${index}`);
+      if (/VARCHAR|CHAR|TEXT/.test(String(column.type).toUpperCase())) {
+        expressions.push(
+          `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NOT NULL) AS numeric_${index}`,
+          `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) IN ('true', 'false')) AS boolean_${index}`,
+          `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) NOT IN ('true', 'false') AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DATE) IS NOT NULL) AS date_${index}`,
+          `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) NOT IN ('true', 'false') AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DATE) IS NULL) AS text_${index}`,
+        );
+      }
+    });
+    const row = (await query(`SELECT ${expressions.join(", ")} FROM (${relation.sql}) AS compose_quality`))[0] ?? {};
+    batch.forEach((column, index) => {
+      const missing = Number(row[`missing_${index}`] ?? 0);
+      const categories = ["numeric", "boolean", "date", "text"].filter((kind) => Number(row[`${kind}_${index}`] ?? 0) > 0);
+      const mixed = categories.length > 1;
+      emptyCellCount += missing;
+      if (mixed) mixedTypeColumnCount += 1;
+      if (missing || mixed) affectedColumns.push({ column: column.name, missing, mixed, types: categories });
+    });
+  }
+  const sensitivityCounts = { public: 0, internal: 0, pii: 0, financial: 0, secret: 0 };
+  let semanticOverrideCount = 0;
+  for (const column of schema) {
+    const sensitivity = column.semantic?.sensitivity ?? "internal";
+    sensitivityCounts[sensitivity] = Number(sensitivityCounts[sensitivity] ?? 0) + 1;
+    if (column.semantic?.source === "override") semanticOverrideCount += 1;
+  }
+  const node = graph.composeNodes?.find((item) => item.id === nodeId);
+  const minimumSampleSize = Math.max(1, Number(node?.config?.minimumSampleSize ?? 1));
+  return {
+    nodeId,
+    totalRowCount,
+    columnCount: schema.length,
+    emptyCellCount,
+    mixedTypeColumnCount,
+    affectedColumns,
+    semanticCoverage: { total: schema.length, described: schema.filter((column) => Boolean(column.semantic)).length, overridden: semanticOverrideCount },
+    sensitivityCounts,
+    minimumSampleSize,
+    sampleWarning: totalRowCount < minimumSampleSize ? `Result has ${totalRowCount} rows, below the configured minimum sample size of ${minimumSampleSize}.` : null,
+  };
+}
+
 async function exportComposeNode(graph, nodeId, format) {
   const result = await previewComposeNode(graph, nodeId, { includeRows: false });
   if (result.rowCount > DATA_LIMITS.maxExportRows) throw new Error(`Ekspor dibatasi ${DATA_LIMITS.maxExportRows.toLocaleString("id-ID")} baris.`);
@@ -873,6 +933,7 @@ async function profileJoinColumns(relation, requestedColumns) {
     const nonMissing = Math.max(0, totalRows - missing);
     const distinct = Number(row[`distinct_${index}`] ?? 0);
     return [name, {
+      totalRowCount: totalRows,
       nullRatio: totalRows ? missing / totalRows : 1,
       uniquenessRatio: nonMissing ? distinct / nonMissing : 0,
     }];
@@ -897,7 +958,7 @@ async function composeConnectionOptions(graph, nodeId) {
       const targetRelation = await compileGraphNode(graph, target.id);
       const targetSchema = (targetRelation.schema?.length ? targetRelation.schema : await describeRelation(targetRelation.sql))
         .filter((column) => column.name !== INTERNAL_ROW_ID);
-      const candidateSet = buildJoinKeyCandidates(sourceSchema, targetSchema, { limit: 32 });
+      const candidateSet = buildJoinKeyCandidates(sourceSchema, targetSchema, { limit: 128 });
       candidateSet.candidates.forEach((candidate) => profiledSourceColumns.add(candidate.left));
       preliminaryTargets.push({ target, targetRelation, targetSchema, candidateSet });
     } catch (error) {
@@ -927,7 +988,7 @@ async function composeConnectionOptions(graph, nodeId) {
       keyPairCount: keyPairs.length,
       compatibleKeyPairCount: entry.candidateSet.compatiblePairCount,
       keyPairsTruncated: entry.candidateSet.compatiblePairCount > keyPairs.length,
-      ranking: ["exact-name", "normalized-name-similarity", "uniqueness", "null-ratio"],
+      ranking: ["exact-name", "semantic-identifier", "normalized-name-similarity", "uniqueness", "null-ratio", "population"],
       keyPairs,
     });
   }
@@ -1025,83 +1086,6 @@ async function previewRecipe(recipe, stepIndex, options = {}) {
   };
 }
 
-function redactRowsWithSemanticModel(rows, selectedSchema, semanticModel) {
-  const explicit = new Map((semanticModel?.fields ?? []).map((field) => [field.name, field]));
-  const redactedColumns = selectedSchema.filter((column) => {
-    const field = explicit.get(column.name);
-    if (field) return ["pii", "financial", "secret"].includes(field.sensitivity);
-    return shouldRedactAgentValues(classifyColumnSemantics(column.name, column.type));
-  }).map((column) => column.name);
-  const redacted = new Set(redactedColumns);
-  return {
-    redactedColumns,
-    rows: rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, redacted.has(key) && value !== null ? "[redacted]" : value]))),
-  };
-}
-
-async function runValidationRules(preparedId, rules = [], semanticModel = null) {
-  if (preparedId && preparedId !== activePreparedId) await activatePrepared(preparedId);
-  const schema = columns.map((name) => ({ name, type: columnTypes.get(name) ?? null }));
-  const populationRows = await query(`SELECT COUNT(*) AS population_count FROM ${WORKING_VIEW}`);
-  const populationCount = Number(populationRows[0]?.population_count ?? 0);
-  const results = [];
-  for (const rule of rules.filter((item) => item.enabled !== false)) {
-    const predicate = compileValidationCondition(rule.condition, schema);
-    const countResult = await query(`SELECT COUNT(*) AS impacted_count FROM ${WORKING_VIEW} WHERE ${predicate}`);
-    const impactedCount = Number(countResult[0]?.impacted_count ?? 0);
-    const sampleColumns = validationFields(rule.condition).slice(0, 5);
-    const sampleSchema = schema.filter((column) => sampleColumns.includes(column.name));
-    const projection = sampleColumns.map(quoteIdentifier).join(", ");
-    const rawExamples = impactedCount && projection
-      ? await query(`SELECT ${projection} FROM ${WORKING_VIEW} WHERE ${predicate} LIMIT 20`)
-      : [];
-    const safeExamples = redactRowsWithSemanticModel(rawExamples, sampleSchema, semanticModel);
-    results.push({
-      ruleId: rule.id,
-      name: rule.name,
-      severity: rule.severity,
-      impactedCount,
-      populationCount,
-      percentage: populationCount ? impactedCount / populationCount : 0,
-      examples: safeExamples.rows,
-      redactedColumns: safeExamples.redactedColumns,
-      recommendation: rule.recommendation ?? "",
-    });
-  }
-  return { preparedId: activePreparedId, populationCount, results, evaluatedAt: new Date().toISOString() };
-}
-
-async function runAnalysisDefinition(preparedId, definition, semanticModel = null, options = {}) {
-  if (preparedId && preparedId !== activePreparedId) await activatePrepared(preparedId);
-  const schema = columns.map((name) => ({ name, type: columnTypes.get(name) ?? null }));
-  const compiled = compileAnalysis(definition, schema, semanticModel, WORKING_VIEW);
-  const rawRows = await query(compiled.sql);
-  const rawGroupSizes = rawRows.map((row) => Number(row.__tf_group_count ?? 0));
-  const minimumPrivacyGroupSize = options.agentMode ? 3 : 1;
-  const visibleRows = rawRows.filter((row) => Number(row.__tf_group_count ?? 0) >= minimumPrivacyGroupSize);
-  const groupSizes = visibleRows.map((row) => Number(row.__tf_group_count ?? 0));
-  const resultRows = visibleRows.map(({ __tf_group_count, ...row }) => row);
-  const outputSchema = [
-    ...compiled.dimensions.map((name) => schema.find((column) => column.name === name)),
-    ...compiled.metricAliases.map((name) => ({ name, type: "DOUBLE" })),
-  ];
-  const safe = redactRowsWithSemanticModel(resultRows, outputSchema, semanticModel);
-  const minimumSampleSize = Math.max(1, Number(definition.minimumSampleSize) || 20);
-  return {
-    preparedId: activePreparedId,
-    analysisId: definition.id ?? null,
-    columns: outputSchema.map((column) => column.name),
-    rows: safe.rows,
-    groupSizes,
-    redactedColumns: safe.redactedColumns,
-    suppressedGroupCount: rawRows.length - visibleRows.length,
-    warnings: rawGroupSizes.some((count) => count < minimumSampleSize)
-      ? [{ code: "SMALL_SAMPLE", message: `One or more groups contain fewer than ${minimumSampleSize} rows.` }]
-      : [],
-    generatedAt: new Date().toISOString(),
-  };
-}
-
 async function handleRequest(type, payload) {
   if (type === "initialize") return initializeDuckDB().then(() => ({ engineVersion }));
   if (type === "load-file") {
@@ -1121,18 +1105,17 @@ async function handleRequest(type, payload) {
   if (type === "materialize-compose-prepared") return materializeComposePrepared(payload.graph, payload.nodeId, payload.identifiers);
   if (type === "filter") return buildDataset(payload.filters, payload.aggregateColumns);
   if (type === "search-aggregate") return searchAggregate(payload.column, payload.query, payload.filters, payload.offset, payload.limit);
-  if (type === "search-aggregate-agent") return searchAggregateForAgent(payload.column, payload.query, payload.filters, payload.offset, payload.limit);
+  if (type === "search-aggregate-agent") return searchAggregateForAgent(payload.column, payload.query, payload.filters, payload.offset, payload.limit, payload.semanticSchema);
   if (type === "resolve-agent-value") return { raw: resolveAgentValueReference(payload.valueRef, payload.column) };
-  if (type === "prepare-preview") return previewPreparedData(payload.filters, payload.columns, payload.offset, payload.limit, { agentMode: payload.agentMode });
-  if (type === "data-profile") return profileDataColumns(payload.columns);
+  if (type === "prepare-preview") return previewPreparedData(payload.filters, payload.columns, payload.offset, payload.limit, { agentMode: payload.agentMode, semanticSchema: payload.semanticSchema });
+  if (type === "data-profile") return profileDataColumns(payload.columns, payload.semanticSchema);
   if (type === "export") return exportRows(payload.format, payload.filters, payload.baseName);
   if (type === "apply-recipe") return applyRecipe(payload.recipe, payload.filters, payload.aggregateColumns, payload.preparedId);
   if (type === "preview-recipe") return previewRecipe(payload.recipe, payload.stepIndex, payload.options);
   if (type === "compose-preview") return previewComposeNode(payload.graph, payload.nodeId, payload.options);
+  if (type === "compose-quality") return profileComposeNodeQuality(payload.graph, payload.nodeId);
   if (type === "compose-export") return exportComposeNode(payload.graph, payload.nodeId, payload.format);
   if (type === "compose-connection-options") return composeConnectionOptions(payload.graph, payload.nodeId);
-  if (type === "validate-rules") return runValidationRules(payload.preparedId, payload.rules, payload.semanticModel);
-  if (type === "run-analysis") return runAnalysisDefinition(payload.preparedId, payload.definition, payload.semanticModel, payload.options);
   throw new Error("Operasi worker tidak dikenal.");
 }
 

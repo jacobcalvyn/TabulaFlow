@@ -1,9 +1,10 @@
 import { INTERNAL_ROW_ID, quoteIdentifier } from "./transformations.js";
+import { mergeFieldSemantics, resolveFieldSemantic } from "./semanticModel.js";
 
 const JOIN_TYPES = new Set(["inner", "left", "right", "full"]);
 const COLLISION_POLICIES = new Set(["fail", "suffix", "manual"]);
 const FILTER_OPERATORS = new Set(["equals", "not-equals", "contains", "not-contains", "greater-than", "greater-or-equal", "less-than", "less-or-equal", "is-null", "is-not-null", "is-empty", "is-not-empty"]);
-const AGGREGATE_FUNCTIONS = new Set(["count", "sum", "average", "min", "max", "count-distinct"]);
+const AGGREGATE_FUNCTIONS = new Set(["count", "sum", "average", "min", "max", "count-distinct", "median", "percentile"]);
 
 function visibleSchema(schema = []) {
   return schema.filter((column) => column.name !== INTERNAL_ROW_ID);
@@ -120,7 +121,14 @@ export function compileAppendSql(inputs, config = {}) {
   }
   return {
     sql: `SELECT ROW_NUMBER() OVER () AS ${quoteIdentifier(INTERNAL_ROW_ID)}, ${projection} FROM (${union}) AS appended`,
-    schema: selectedNames.map((name) => ({ name, type: types.get(name) })),
+    schema: selectedNames.map((name) => {
+      const sources = maps.map((map) => map.get(name)).filter(Boolean);
+      return {
+        name,
+        type: types.get(name),
+        semantic: mergeFieldSemantics(sources, { kind: "append", columns: sources.map((column) => column.name) }),
+      };
+    }),
   };
 }
 
@@ -133,8 +141,8 @@ function defaultJoinOutput(leftSchema, rightSchema, policy, config) {
   const leftSuffix = String(config.leftSuffix ?? "_left");
   const rightSuffix = String(config.rightSuffix ?? "_right");
   return [
-    ...left.map((column) => ({ side: "left", source: column.name, name: collisions.has(column.name.toLocaleLowerCase("en-US")) ? `${column.name}${leftSuffix}` : column.name, type: column.type })),
-    ...right.map((column) => ({ side: "right", source: column.name, name: collisions.has(column.name.toLocaleLowerCase("en-US")) ? `${column.name}${rightSuffix}` : column.name, type: column.type })),
+    ...left.map((column) => ({ side: "left", source: column.name, name: collisions.has(column.name.toLocaleLowerCase("en-US")) ? `${column.name}${leftSuffix}` : column.name, type: column.type, semantic: resolveFieldSemantic(column) })),
+    ...right.map((column) => ({ side: "right", source: column.name, name: collisions.has(column.name.toLocaleLowerCase("en-US")) ? `${column.name}${rightSuffix}` : column.name, type: column.type, semantic: resolveFieldSemantic(column) })),
   ];
 }
 
@@ -161,7 +169,7 @@ export function compileJoinSql(left, right, config = {}) {
     ? (Array.isArray(config.outputColumns) ? config.outputColumns.filter((column) => column.include !== false).map((column) => {
       const source = column.side === "right" ? rightMap.get(column.source) : leftMap.get(column.source);
       if (!source) throw new Error(`Kolom output Join "${column.source}" tidak tersedia.`);
-      return { side: column.side === "right" ? "right" : "left", source: column.source, name: String(column.name ?? column.source).trim(), type: source.type };
+      return { side: column.side === "right" ? "right" : "left", source: column.source, name: String(column.name ?? column.source).trim(), type: source.type, semantic: resolveFieldSemantic(source) };
     }) : [])
     : defaultJoinOutput(left.schema, right.schema, policy, config);
   if (Array.isArray(config.selectedOutputColumns)) {
@@ -175,7 +183,11 @@ export function compileJoinSql(left, right, config = {}) {
   const condition = keyPairs.map((pair) => `l.${quoteIdentifier(pair.left)} = r.${quoteIdentifier(pair.right)}`).join(" AND ");
   return {
     sql: `SELECT ROW_NUMBER() OVER () AS ${quoteIdentifier(INTERNAL_ROW_ID)}, ${projection} FROM (${left.sql}) AS l ${joinType.toUpperCase()} JOIN (${right.sql}) AS r ON ${condition}`,
-    schema: output.map(({ name, type }) => ({ name, type })),
+    schema: output.map(({ name, type, semantic, side, source }) => ({
+      name,
+      type,
+      semantic: { ...semantic, provenance: { kind: "join", side, column: source } },
+    })),
     keyPairs,
   };
 }
@@ -196,9 +208,20 @@ export function compileDistinctRowsSql(input, config = {}) {
   const columns = requested.length ? requested : visibleSchema(input.schema).map((column) => column.name);
   columns.forEach((name) => requireVisibleColumn(input, name, "Kolom pembanding"));
   if (!columns.length) throw new Error("Distinct rows memerlukan minimal satu kolom pembanding.");
+  const mode = String(config.mode ?? "representative-rows");
+  if (!new Set(["representative-rows", "project-columns"]).has(mode)) throw new Error("Distinct rows mode is not supported.");
+  if (mode === "project-columns") {
+    const projection = columns.map(quoteIdentifier).join(", ");
+    return {
+      sql: `SELECT ROW_NUMBER() OVER () AS ${quoteIdentifier(INTERNAL_ROW_ID)}, ${projection} FROM (SELECT DISTINCT ${projection} FROM (${input.sql}) AS distinct_source) AS d`,
+      schema: columns.map((name) => requireVisibleColumn(input, name)),
+      mode,
+    };
+  }
   return {
     sql: `SELECT * FROM (${input.sql}) AS d QUALIFY ROW_NUMBER() OVER (PARTITION BY ${columns.map((name) => `d.${quoteIdentifier(name)}`).join(", ")} ORDER BY d.${quoteIdentifier(INTERNAL_ROW_ID)}) = 1`,
     schema: visibleSchema(input.schema),
+    mode,
   };
 }
 
@@ -214,23 +237,43 @@ export function compileAggregateSql(input, config = {}) {
     const column = measure.column ? requireVisibleColumn(input, measure.column, "Kolom measure") : null;
     if (fn !== "count" && !column) throw new Error("Fungsi Aggregate ini memerlukan kolom measure.");
     const source = column ? `a.${quoteIdentifier(column.name)}` : "*";
-    const expression = fn === "count-distinct" ? `COUNT(DISTINCT ${source})` : `${fn === "average" ? "AVG" : fn.toUpperCase()}(${source})`;
+    const percentile = Number(measure.percentile ?? 0.9);
+    if (fn === "percentile" && (!Number.isFinite(percentile) || percentile <= 0 || percentile >= 1)) throw new Error("Percentile must be greater than 0 and less than 1.");
+    const expression = fn === "count-distinct"
+      ? `COUNT(DISTINCT ${source})`
+      : fn === "average"
+        ? `AVG(${source})`
+        : fn === "median"
+          ? `MEDIAN(${source})`
+          : fn === "percentile"
+            ? `QUANTILE_CONT(${source}, ${percentile})`
+            : `${fn.toUpperCase()}(${source})`;
     const fallback = `${fn.replace("-", "_")}_${column?.name ?? "rows"}`;
     const name = uniqueOutputName(measure.alias, used, fallback || `measure_${index + 1}`);
-    const type = ["count", "count-distinct"].includes(fn) ? "BIGINT" : fn === "average" ? "DOUBLE" : column?.type ?? "BIGINT";
-    return { expression, name, type };
+    const type = ["count", "count-distinct"].includes(fn) ? "BIGINT" : ["average", "median", "percentile"].includes(fn) ? "DOUBLE" : column?.type ?? "BIGINT";
+    return {
+      expression,
+      name,
+      type,
+      semantic: mergeFieldSemantics(column ? [column] : [], { kind: "aggregate", function: fn, column: column?.name ?? null }),
+    };
   });
   const projection = [
     ...groupBy.map((name) => `a.${quoteIdentifier(name)}`),
     ...compiledMeasures.map((measure) => `${measure.expression} AS ${quoteIdentifier(measure.name)}`),
   ];
   const groupSql = groupBy.length ? ` GROUP BY ${groupBy.map((name) => `a.${quoteIdentifier(name)}`).join(", ")}` : "";
+  const minimumSampleSize = Math.max(1, Math.floor(Number(config.minimumSampleSize) || 1));
+  const suppressSmallGroups = config.suppressSmallGroups === true && groupBy.length > 0;
+  const havingSql = suppressSmallGroups ? ` HAVING COUNT(*) >= ${minimumSampleSize}` : "";
   return {
-    sql: `SELECT ROW_NUMBER() OVER () AS ${quoteIdentifier(INTERNAL_ROW_ID)}, ${projection.join(", ")} FROM (${input.sql}) AS a${groupSql}`,
+    sql: `SELECT ROW_NUMBER() OVER () AS ${quoteIdentifier(INTERNAL_ROW_ID)}, ${projection.join(", ")} FROM (${input.sql}) AS a${groupSql}${havingSql}`,
     schema: [
       ...groupBy.map((name) => requireVisibleColumn(input, name)),
-      ...compiledMeasures.map(({ name, type }) => ({ name, type })),
+      ...compiledMeasures.map(({ name, type, semantic }) => ({ name, type, semantic })),
     ],
+    minimumSampleSize,
+    suppressSmallGroups,
   };
 }
 
@@ -279,13 +322,13 @@ export function compilePivotSql(input, config = {}) {
     const name = uniqueOutputName(typeof item === "object" ? item.alias : value, used, String(value));
     const caseSql = `CASE WHEN p.${quoteIdentifier(pivotColumn.name)} IS NOT DISTINCT FROM ${sqlLiteral(value)} THEN p.${quoteIdentifier(valueColumn.name)} END`;
     const expression = `${fn === "average" ? "AVG" : fn.toUpperCase()}(${caseSql})`;
-    return { name, expression, type: fn === "count" ? "BIGINT" : fn === "average" ? "DOUBLE" : valueColumn.type };
+    return { name, expression, type: fn === "count" ? "BIGINT" : fn === "average" ? "DOUBLE" : valueColumn.type, semantic: mergeFieldSemantics([valueColumn], { kind: "pivot", value: String(value), column: valueColumn.name }) };
   });
   const projection = [...groupBy.map((name) => `p.${quoteIdentifier(name)}`), ...pivoted.map((item) => `${item.expression} AS ${quoteIdentifier(item.name)}`)];
   const groupSql = groupBy.length ? ` GROUP BY ${groupBy.map((name) => `p.${quoteIdentifier(name)}`).join(", ")}` : "";
   return {
     sql: `SELECT ROW_NUMBER() OVER () AS ${quoteIdentifier(INTERNAL_ROW_ID)}, ${projection.join(", ")} FROM (${input.sql}) AS p${groupSql}`,
-    schema: [...groupBy.map((name) => requireVisibleColumn(input, name)), ...pivoted.map(({ name, type }) => ({ name, type }))],
+    schema: [...groupBy.map((name) => requireVisibleColumn(input, name)), ...pivoted.map(({ name, type, semantic }) => ({ name, type, semantic }))],
   };
 }
 
@@ -304,7 +347,11 @@ export function compileUnpivotSql(input, config = {}) {
   const union = valueColumns.map((name) => `SELECT ${selectIds ? `${selectIds}, ` : ""}${sqlLiteral(name)} AS ${quoteIdentifier(nameColumn)}, CAST(u.${quoteIdentifier(name)} AS ${outputValueType}) AS ${quoteIdentifier(valueColumn)} FROM (${input.sql}) AS u`).join(" UNION ALL ");
   return {
     sql: `SELECT ROW_NUMBER() OVER () AS ${quoteIdentifier(INTERNAL_ROW_ID)}, * FROM (${union}) AS unpivoted`,
-    schema: [...idColumns.map((name) => requireVisibleColumn(input, name)), { name: nameColumn, type: "VARCHAR" }, { name: valueColumn, type: outputValueType }],
+    schema: [
+      ...idColumns.map((name) => requireVisibleColumn(input, name)),
+      { name: nameColumn, type: "VARCHAR", semantic: { ...resolveFieldSemantic({ name: nameColumn, type: "VARCHAR" }), role: "dimension", sensitivity: "public", provenance: { kind: "unpivot-field", columns: valueColumns } } },
+      { name: valueColumn, type: outputValueType, semantic: mergeFieldSemantics(valueDefinitions, { kind: "unpivot-value", columns: valueColumns }) },
+    ],
   };
 }
 

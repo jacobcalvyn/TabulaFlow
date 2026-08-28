@@ -1,3 +1,5 @@
+import { classifyColumnSemantics } from "./dataPrivacy.js";
+
 function normalizeName(value) {
   return String(value ?? "")
     .normalize("NFKD")
@@ -52,17 +54,24 @@ export function buildJoinKeyCandidates(leftSchema = [], rightSchema = [], { limi
     for (const right of rightSchema) {
       if (normalizeType(left.type) !== normalizeType(right.type)) continue;
       compatiblePairCount += 1;
+      const leftRole = left.semantic?.role ?? left.semanticRole ?? classifyColumnSemantics(left.name, left.type).semanticRole;
+      const rightRole = right.semantic?.role ?? right.semanticRole ?? classifyColumnSemantics(right.name, right.type).semanticRole;
+      const normalizedExactName = normalizeName(left.name) === normalizeName(right.name);
       candidates.push({
         left: left.name,
         right: right.name,
         type: left.type,
         compatible: true,
         exactName: left.name === right.name,
+        normalizedExactName,
+        semanticIdentifier: leftRole === "identifier" && rightRole === "identifier",
         nameScore: joinNameSimilarity(left.name, right.name),
       });
     }
   }
   candidates.sort((left, right) => Number(right.exactName) - Number(left.exactName)
+    || Number(right.normalizedExactName) - Number(left.normalizedExactName)
+    || Number(right.semanticIdentifier) - Number(left.semanticIdentifier)
     || right.nameScore - left.nameScore
     || left.left.localeCompare(right.left)
     || left.right.localeCompare(right.right));
@@ -72,7 +81,10 @@ export function buildJoinKeyCandidates(leftSchema = [], rightSchema = [], { limi
 function columnQuality(stat = {}) {
   const uniqueness = Number.isFinite(stat.uniquenessRatio) ? stat.uniquenessRatio : 0;
   const completeness = Number.isFinite(stat.nullRatio) ? 1 - stat.nullRatio : 0;
-  return Math.max(0, Math.min(1, uniqueness * 0.7 + completeness * 0.3));
+  const population = Number(stat.totalRowCount ?? stat.rowCount ?? 0);
+  const populationScore = population >= 20 ? 1 : population / 20;
+  const extremeNullPenalty = completeness < 0.2 ? completeness * 0.25 : 1;
+  return Math.max(0, Math.min(1, (uniqueness * 0.62 + completeness * 0.28 + populationScore * 0.1) * extremeNullPenalty));
 }
 
 export function rankJoinKeyCandidates(candidates, leftStats = new Map(), rightStats = new Map(), { limit = 12 } = {}) {
@@ -80,7 +92,9 @@ export function rankJoinKeyCandidates(candidates, leftStats = new Map(), rightSt
     const leftQuality = columnQuality(leftStats.get(candidate.left));
     const rightQuality = columnQuality(rightStats.get(candidate.right));
     const dataQualityScore = (leftQuality + rightQuality) / 2;
-    const score = Math.min(1, candidate.nameScore * 0.72 + dataQualityScore * 0.28 + (candidate.exactName ? 0.08 : 0));
+    const semanticScore = candidate.semanticIdentifier ? 1 : 0;
+    const exactScore = candidate.exactName ? 1 : candidate.normalizedExactName ? 0.94 : candidate.nameScore;
+    const score = Math.min(1, exactScore * 0.52 + semanticScore * 0.22 + dataQualityScore * 0.26);
     return {
       ...candidate,
       score: Number(score.toFixed(4)),
@@ -95,6 +109,8 @@ export function rankJoinKeyCandidates(candidates, leftStats = new Map(), rightSt
     };
   }).sort((left, right) => right.score - left.score
     || Number(right.exactName) - Number(left.exactName)
+    || Number(right.normalizedExactName) - Number(left.normalizedExactName)
+    || Number(right.semanticIdentifier) - Number(left.semanticIdentifier)
     || left.left.localeCompare(right.left)
     || left.right.localeCompare(right.right))
     .slice(0, Math.max(1, limit));

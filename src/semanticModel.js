@@ -1,111 +1,140 @@
 import { classifyColumnSemantics } from "./dataPrivacy.js";
 
-export const FIELD_ROLES = Object.freeze(["identifier", "dimension", "measure", "timestamp", "status", "free-text", "attribute"]);
-export const FIELD_SENSITIVITIES = Object.freeze(["public", "internal", "pii", "financial", "secret"]);
-export const AGGREGATIONS = Object.freeze(["count", "count-distinct", "sum", "average", "median", "percentile", "min", "max"]);
+export const SEMANTIC_ROLES = Object.freeze(["identifier", "dimension", "measure", "timestamp", "status", "free-text", "attribute"]);
+export const SEMANTIC_SENSITIVITIES = Object.freeze(["public", "internal", "pii", "financial", "secret"]);
+export const METRIC_FUNCTIONS = Object.freeze(["count", "count-distinct", "sum", "average", "min", "max", "median", "percentile"]);
 
-function now() {
-  return new Date().toISOString();
+const SENSITIVITY_RANK = Object.freeze({ public: 0, internal: 1, financial: 2, pii: 3, secret: 4 });
+
+function inferredSensitivity(value, category) {
+  if (category === "credential") return "secret";
+  if (category === "financial") return "financial";
+  if (value === "sensitive") return "pii";
+  if (value === "potentially-sensitive") return "internal";
+  return "public";
 }
 
-function inferredRole(column, semantics) {
-  const name = String(column.name ?? "").toLowerCase();
-  const type = String(column.type ?? "").toUpperCase();
-  if (/DATE|TIME/.test(type)) return "timestamp";
-  if (/(^|[_\s])(status|state|stage)([_\s]|$)/.test(name)) return "status";
-  if (semantics.semanticRole === "identifier") return "identifier";
-  if (semantics.semanticRole === "measure") return "measure";
-  if (semantics.category === "free-text") return "free-text";
-  return semantics.semanticRole === "dimension" ? "dimension" : "attribute";
-}
-
-function inferredSensitivity(semantics) {
-  if (semantics.category === "financial") return "financial";
-  if (semantics.category === "credential") return "secret";
-  if (semantics.sensitivity === "sensitive" || semantics.sensitivity === "potentially-sensitive") return "pii";
-  return "internal";
-}
-
-function allowedAggregations(role) {
-  if (role === "measure") return [...AGGREGATIONS];
-  if (role === "identifier") return ["count", "count-distinct"];
-  return ["count", "count-distinct", "min", "max"];
-}
-
-export function inferFieldDefinition(column) {
-  const semantics = classifyColumnSemantics(column.name, column.type);
-  const role = inferredRole(column, semantics);
+export function inferFieldSemantic(column, provenance = null) {
+  const inferred = classifyColumnSemantics(column?.name, column?.type);
   return {
-    name: column.name,
-    businessName: column.name,
-    description: "",
-    dataType: column.type ?? null,
-    role,
+    businessName: column?.name ?? "",
+    role: inferred.semanticRole ?? "attribute",
     unit: null,
-    sensitivity: inferredSensitivity(semantics),
-    allowedAggregations: allowedAggregations(role),
-    provenance: { kind: "source", column: column.name },
-    inferred: true,
+    sensitivity: inferredSensitivity(inferred.sensitivity, inferred.category),
+    allowedAggregations: inferred.semanticRole === "measure"
+      ? ["sum", "average", "min", "max", "median", "percentile"]
+      : inferred.semanticRole === "identifier"
+        ? ["count", "count-distinct"]
+        : ["count", "count-distinct"],
+    provenance,
+    source: "inferred",
+  };
+}
+
+export function resolveFieldSemantic(column, provenance = null) {
+  return {
+    ...inferFieldSemantic(column, provenance),
+    ...(column?.semantic ?? {}),
+    provenance: column?.semantic?.provenance ?? column?.provenance ?? provenance,
   };
 }
 
 export function createSemanticModel(targetId, schema = []) {
   return {
     targetId,
-    revision: 1,
-    fields: schema.map(inferFieldDefinition),
-    metrics: [],
-    entities: [],
-    updatedAt: now(),
+    revision: 0,
+    fields: Object.fromEntries(schema.map((column) => [column.name, resolveFieldSemantic(column, {
+      kind: "source",
+      targetId,
+      column: column.name,
+    })])),
   };
 }
 
 export function reconcileSemanticModel(model, targetId, schema = []) {
-  const current = model?.targetId === targetId ? model : createSemanticModel(targetId, []);
-  const existing = new Map((current.fields ?? []).map((field) => [field.name, field]));
-  const fields = schema.map((column) => {
-    const previous = existing.get(column.name);
-    return previous ? { ...previous, dataType: column.type ?? previous.dataType ?? null } : inferFieldDefinition(column);
-  });
-  return { ...current, targetId, fields, revision: Math.max(1, Number(current.revision) || 1), updatedAt: current.updatedAt ?? now() };
-}
-
-export function updateSemanticField(model, fieldName, changes) {
-  const fields = model.fields.map((field) => {
-    if (field.name !== fieldName) return field;
-    const role = changes.role ?? field.role;
-    if (!FIELD_ROLES.includes(role)) throw new Error(`Unsupported semantic role: ${role}`);
-    const sensitivity = changes.sensitivity ?? field.sensitivity;
-    if (!FIELD_SENSITIVITIES.includes(sensitivity)) throw new Error(`Unsupported sensitivity: ${sensitivity}`);
-    const aggregations = changes.allowedAggregations ?? field.allowedAggregations;
-    if (!Array.isArray(aggregations) || aggregations.some((item) => !AGGREGATIONS.includes(item))) throw new Error("Unsupported field aggregation.");
-    if (role !== "measure" && aggregations.some((item) => ["sum", "average", "median", "percentile"].includes(item))) {
-      throw new Error("Only measures can use numeric aggregations.");
-    }
-    return {
-      ...field,
-      ...changes,
-      businessName: String(changes.businessName ?? field.businessName).trim() || field.name,
-      role,
-      sensitivity,
-      allowedAggregations: [...new Set(aggregations)],
-      inferred: false,
-    };
-  });
-  if (!fields.some((field) => field.name === fieldName)) throw new Error(`Semantic field not found: ${fieldName}`);
-  return { ...model, fields, revision: model.revision + 1, updatedAt: now() };
-}
-
-export function semanticFieldMap(model) {
-  return new Map((model?.fields ?? []).map((field) => [field.name, field]));
-}
-
-export function ensureAnalyticsState(graph) {
+  const current = model?.fields ?? {};
   return {
-    ...graph,
-    semanticModels: graph.semanticModels && typeof graph.semanticModels === "object" ? graph.semanticModels : {},
-    validationRules: Array.isArray(graph.validationRules) ? graph.validationRules : [],
-    validationRuns: Array.isArray(graph.validationRuns) ? graph.validationRuns : [],
-    analyses: Array.isArray(graph.analyses) ? graph.analyses : [],
+    targetId,
+    revision: Number(model?.revision ?? 0),
+    fields: Object.fromEntries(schema.map((column) => [column.name, {
+      ...resolveFieldSemantic(column, { kind: "source", targetId, column: column.name }),
+      ...(current[column.name] ?? {}),
+    }])),
+  };
+}
+
+export function updateSemanticField(model, fieldName, changes = {}) {
+  if (!model?.fields?.[fieldName]) throw new Error(`Semantic field not found: ${fieldName}`);
+  const role = changes.role ?? model.fields[fieldName].role;
+  const sensitivity = changes.sensitivity ?? model.fields[fieldName].sensitivity;
+  if (!SEMANTIC_ROLES.includes(role)) throw new Error(`Unsupported semantic role: ${role}`);
+  if (!SEMANTIC_SENSITIVITIES.includes(sensitivity)) throw new Error(`Unsupported semantic sensitivity: ${sensitivity}`);
+  return {
+    ...model,
+    revision: Number(model.revision ?? 0) + 1,
+    fields: {
+      ...model.fields,
+      [fieldName]: {
+        ...model.fields[fieldName],
+        ...changes,
+        role,
+        sensitivity,
+        source: "override",
+      },
+    },
+  };
+}
+
+export function applySemanticModelToSchema(schema = [], model = null) {
+  return schema.map((column) => ({
+    ...column,
+    semantic: {
+      ...resolveFieldSemantic(column),
+      ...(model?.fields?.[column.name] ?? {}),
+    },
+  }));
+}
+
+export function strictestSensitivity(semantics = []) {
+  return semantics.reduce((current, item) => {
+    const candidate = item?.sensitivity ?? "public";
+    return (SENSITIVITY_RANK[candidate] ?? 0) > (SENSITIVITY_RANK[current] ?? 0) ? candidate : current;
+  }, "public");
+}
+
+export function mergeFieldSemantics(columns = [], provenance = null) {
+  const resolved = columns.filter(Boolean).map((column) => resolveFieldSemantic(column));
+  if (!resolved.length) return resolveFieldSemantic({ name: provenance?.column ?? "derived", type: null }, provenance);
+  const primary = resolved[0];
+  return {
+    ...primary,
+    sensitivity: strictestSensitivity(resolved),
+    provenance,
+    source: "derived",
+  };
+}
+
+export function normalizeMetricDefinition(definition, schema = []) {
+  const id = String(definition?.id ?? globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`);
+  const name = String(definition?.name ?? "").trim();
+  const fn = String(definition?.function ?? "count").toLowerCase();
+  if (!name) throw new Error("Metric definition requires a name.");
+  if (!METRIC_FUNCTIONS.includes(fn)) throw new Error(`Unsupported metric function: ${fn}`);
+  const column = definition?.column ? String(definition.column) : null;
+  if (fn !== "count" && !schema.some((item) => item.name === column)) throw new Error(`Metric column not found: ${column}`);
+  const percentile = fn === "percentile" ? Number(definition?.percentile ?? 0.9) : null;
+  if (fn === "percentile" && (!Number.isFinite(percentile) || percentile <= 0 || percentile >= 1)) {
+    throw new Error("Metric percentile must be greater than 0 and less than 1.");
+  }
+  return {
+    id,
+    name,
+    function: fn,
+    column,
+    percentile,
+    description: String(definition?.description ?? "").trim(),
+    unit: definition?.unit ?? null,
+    format: definition?.format ?? null,
+    updatedAt: new Date().toISOString(),
   };
 }

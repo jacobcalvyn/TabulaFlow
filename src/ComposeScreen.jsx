@@ -207,10 +207,15 @@ function UnaryOperationInspector({ operation, flow, byId, position, onCancel, on
   const [operator, setOperator] = useState(initial.conditions?.[0]?.operator ?? "equals");
   const [value, setValue] = useState(initial.conditions?.[0]?.value ?? "");
   const [selectedColumns, setSelectedColumns] = useState(() => initial.columns ?? initial.valueColumns ?? (kind === "unpivot" ? [] : names));
+  const [distinctMode, setDistinctMode] = useState(initial.mode ?? "representative-rows");
   const [groupColumn, setGroupColumn] = useState(initial.groupBy?.[0] ?? "");
   const [aggregateFunction, setAggregateFunction] = useState(initial.measures?.[0]?.function ?? initial.aggregate ?? "count");
   const [measureColumn, setMeasureColumn] = useState(initial.measures?.[0]?.column ?? initial.valueColumn ?? names[0] ?? "");
   const [alias, setAlias] = useState(initial.measures?.[0]?.alias ?? "count");
+  const [aggregateMeasures, setAggregateMeasures] = useState(() => (initial.measures?.length ? initial.measures : [{ function: "count", column: "", alias: "count" }]).map((measure) => ({ ...measure, percentile: measure.percentile ?? 0.9 })));
+  const [minimumSampleSize, setMinimumSampleSize] = useState(initial.minimumSampleSize ?? 1);
+  const [suppressSmallGroups, setSuppressSmallGroups] = useState(initial.suppressSmallGroups === true);
+  const reusableMetrics = (flow.metricDefinitions ?? []).filter((metric) => metric.targetId === inputId);
   const [pivotColumn, setPivotColumn] = useState(initial.pivotColumn ?? names[0] ?? "");
   const [pivotValues, setPivotValues] = useState((initial.values ?? []).join(", "));
   const [fieldColumn, setFieldColumn] = useState(initial.fieldColumn ?? "field");
@@ -226,10 +231,17 @@ function UnaryOperationInspector({ operation, flow, byId, position, onCancel, on
       if (!hidesValue && !value.trim()) throw new Error(t("filterValueRequired"));
       return { conjunction: "and", conditions: [{ column, operator, value }] };
     }
-    if (kind === "distinct-rows") return { columns: selectedColumns };
+    if (kind === "distinct-rows") return { columns: selectedColumns, mode: distinctMode };
     if (kind === "aggregate") return {
       groupBy: groupColumn ? [groupColumn] : [],
-      measures: [{ function: aggregateFunction, column: aggregateFunction === "count" ? "" : measureColumn, alias: alias.trim() || aggregateFunction.replace("-", "_") }],
+      measures: aggregateMeasures.map((measure) => ({
+        function: measure.function,
+        column: measure.function === "count" ? "" : measure.column,
+        alias: measure.alias.trim() || measure.function.replace("-", "_"),
+        ...(measure.function === "percentile" ? { percentile: Number(measure.percentile) } : {}),
+      })),
+      minimumSampleSize: Number(minimumSampleSize) || 1,
+      suppressSmallGroups,
     };
     if (kind === "pivot") return {
       groupBy: groupColumn ? [groupColumn] : [],
@@ -272,7 +284,7 @@ function UnaryOperationInspector({ operation, flow, byId, position, onCancel, on
       }
     }, 220);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [kind, column, operator, value, selectedColumns, groupColumn, aggregateFunction, measureColumn, alias, pivotColumn, pivotValues, fieldColumn, valueColumn]);
+  }, [kind, column, operator, value, selectedColumns, distinctMode, groupColumn, aggregateFunction, measureColumn, alias, aggregateMeasures, minimumSampleSize, suppressSmallGroups, pivotColumn, pivotValues, fieldColumn, valueColumn]);
 
   const submit = async (event) => {
     event.preventDefault();
@@ -291,7 +303,8 @@ function UnaryOperationInspector({ operation, flow, byId, position, onCancel, on
 
   const toggleColumn = (name) => setSelectedColumns((current) => current.includes(name) ? current.filter((item) => item !== name) : [...current, name]);
   const filterOperators = ["equals", "not-equals", "contains", "not-contains", "greater-than", "greater-or-equal", "less-than", "less-or-equal", "is-null", "is-not-null", "is-empty", "is-not-empty"];
-  const aggregateFunctions = ["count", "sum", "average", "min", "max", "count-distinct"];
+  const aggregateFunctions = ["count", "sum", "average", "min", "max", "count-distinct", "median", "percentile"];
+  const updateAggregateMeasure = (index, changes) => setAggregateMeasures((current) => current.map((measure, measureIndex) => measureIndex === index ? { ...measure, ...changes } : measure));
 
   return (
     <form className="compose-operation-popover compose-operation-builder compose-unary-builder" style={{ transform: `translate(${position.x}px, ${position.y}px)` }} onSubmit={submit}>
@@ -303,11 +316,27 @@ function UnaryOperationInspector({ operation, flow, byId, position, onCancel, on
           {!hidesValue && <label><span>{t("filterValue")}</span><input value={value} onChange={(event) => setValue(event.target.value)} /></label>}
         </div>}
 
-        {kind === "aggregate" && <div className="compose-unary-fields">
-          <label><span>{t("groupBy")}</span><select value={groupColumn} onChange={(event) => setGroupColumn(event.target.value)}><option value="">{t("none")}</option>{names.map((name) => <option key={name}>{name}</option>)}</select></label>
-          <label><span>{t("aggregateFunction")}</span><select value={aggregateFunction} onChange={(event) => setAggregateFunction(event.target.value)}>{aggregateFunctions.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
-          {aggregateFunction !== "count" && <label><span>{t("measure")}</span><select value={measureColumn} onChange={(event) => setMeasureColumn(event.target.value)}>{names.map((name) => <option key={name}>{name}</option>)}</select></label>}
-          <label><span>{t("alias")}</span><input value={alias} onChange={(event) => setAlias(event.target.value)} /></label>
+        {kind === "aggregate" && <div className="compose-aggregate-editor">
+          {reusableMetrics.length > 0 && <label className="compose-reusable-metric"><span>{t("reusableMetric")}</span><select defaultValue="" onChange={(event) => {
+            const metric = reusableMetrics.find((item) => item.id === event.target.value);
+            if (metric) setAggregateMeasures((current) => [...current, { function: metric.function, column: metric.column ?? "", alias: metric.name, percentile: metric.percentile ?? 0.9 }]);
+            event.target.value = "";
+          }}><option value="">{t("addReusableMetric")}</option>{reusableMetrics.map((metric) => <option key={metric.id} value={metric.id}>{metric.name}</option>)}</select></label>}
+          <div className="compose-unary-fields">
+            <label><span>{t("groupBy")}</span><select value={groupColumn} onChange={(event) => setGroupColumn(event.target.value)}><option value="">{t("none")}</option>{names.map((name) => <option key={name}>{name}</option>)}</select></label>
+            <label><span>{t("minimumSampleSize")}</span><input type="number" min="1" value={minimumSampleSize} onChange={(event) => setMinimumSampleSize(event.target.value)} /></label>
+            <label className="compose-checkbox-field"><input type="checkbox" checked={suppressSmallGroups} disabled={!groupColumn} onChange={(event) => setSuppressSmallGroups(event.target.checked)} /><span>{t("suppressSmallGroups")}</span></label>
+          </div>
+          <div className="compose-metric-list">
+            {aggregateMeasures.map((measure, index) => <div className="compose-metric-row" key={index}>
+              <label><span>{t("aggregateFunction")}</span><select value={measure.function} onChange={(event) => updateAggregateMeasure(index, { function: event.target.value, column: measure.column || names[0] || "" })}>{aggregateFunctions.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+              {measure.function !== "count" && <label><span>{t("measure")}</span><select value={measure.column || names[0] || ""} onChange={(event) => updateAggregateMeasure(index, { column: event.target.value })}>{names.map((name) => <option key={name}>{name}</option>)}</select></label>}
+              {measure.function === "percentile" && <label><span>{t("percentile")}</span><input type="number" min="0.01" max="0.99" step="0.01" value={measure.percentile} onChange={(event) => updateAggregateMeasure(index, { percentile: event.target.value })} /></label>}
+              <label><span>{t("alias")}</span><input value={measure.alias} onChange={(event) => updateAggregateMeasure(index, { alias: event.target.value })} /></label>
+              <button type="button" className="compose-metric-row__remove" aria-label={t("removeMetric")} disabled={aggregateMeasures.length === 1} onClick={() => setAggregateMeasures((current) => current.filter((_, measureIndex) => measureIndex !== index))}><Trash /></button>
+            </div>)}
+            <button type="button" className="compose-add-metric" onClick={() => setAggregateMeasures((current) => [...current, { function: "count", column: "", alias: `count_${current.length + 1}`, percentile: 0.9 }])}>+ {t("addMetric")}</button>
+          </div>
         </div>}
 
         {kind === "pivot" && <div className="compose-unary-fields">
@@ -318,6 +347,7 @@ function UnaryOperationInspector({ operation, flow, byId, position, onCancel, on
           <label className="compose-unary-fields__wide"><span>{t("pivotValues")}</span><input value={pivotValues} onChange={(event) => setPivotValues(event.target.value)} placeholder="Jakarta, Bandung" /></label>
         </div>}
 
+        {kind === "distinct-rows" && <div className="compose-distinct-mode"><strong>{t("distinctOutputMode")}</strong><div><button type="button" className={distinctMode === "representative-rows" ? "is-active" : ""} onClick={() => setDistinctMode("representative-rows")}>{t("representativeRows")}</button><button type="button" className={distinctMode === "project-columns" ? "is-active" : ""} onClick={() => setDistinctMode("project-columns")}>{t("projectDistinctColumns")}</button></div></div>}
         {(kind === "distinct-rows" || kind === "unpivot") && <div className="compose-checkbox-list"><strong>{t(kind === "distinct-rows" ? "comparisonColumns" : "unpivotColumns")}</strong><div>{schema.map((item) => <label key={item.name}><input type="checkbox" checked={selectedColumns.includes(item.name)} onChange={() => toggleColumn(item.name)} /><span>{item.name}</span><small>{item.type}</small></label>)}</div></div>}
         {kind === "unpivot" && <div className="compose-unary-fields"><label><span>{t("fieldColumnName")}</span><input value={fieldColumn} onChange={(event) => setFieldColumn(event.target.value)} /></label><label><span>{t("valueColumnName")}</span><input value={valueColumn} onChange={(event) => setValueColumn(event.target.value)} /></label></div>}
       </section>
@@ -326,7 +356,7 @@ function UnaryOperationInspector({ operation, flow, byId, position, onCancel, on
   );
 }
 
-export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNode, onPreviewDraft, onCreateNode, onUpdateNode, onDeleteNode, onDeletePrepared, onMoveNode, onAutoArrange, onDuplicate, onCreatePrepared, onEditPreparation, onExport, deleteRequest, onDeleteRequestShown, onDeleteConfirmation }) {
+export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNode, onPreviewDraft, onCreateNode, onUpdateNode, onDeleteNode, onDeletePrepared, onMoveNode, onAutoArrange, onDuplicate, onCreatePrepared, onEditPreparation, onExport, onGetNodeQuality, deleteRequest, onDeleteRequestShown, onDeleteConfirmation }) {
   const { formatNumber, t } = useI18n();
   const nodes = useMemo(() => [
     ...flow.preparedInputs.map((node) => ({ ...node, nodeType: "dataset" })),
@@ -362,6 +392,35 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
     onDeleteRequestShown?.(deleteRequest.token);
   }, [deleteRequest, flow.composeNodes, flow.preparedInputs, onDeleteRequestShown]);
   const [previewOpen, setPreviewOpen] = useState(false);
+  const [qualityOpen, setQualityOpen] = useState(false);
+  const [nodeQuality, setNodeQuality] = useState(null);
+  const [qualityLoading, setQualityLoading] = useState(false);
+  const [qualityError, setQualityError] = useState("");
+
+  useEffect(() => {
+    setNodeQuality(null);
+    setQualityOpen(false);
+    setQualityError("");
+  }, [flow.activeNodeId]);
+
+  const toggleNodeQuality = async () => {
+    if (qualityOpen) {
+      setQualityOpen(false);
+      return;
+    }
+    if (!flow.activeNodeId || !onGetNodeQuality) return;
+    setQualityOpen(true);
+    if (nodeQuality) return;
+    setQualityLoading(true);
+    setQualityError("");
+    try {
+      setNodeQuality(await onGetNodeQuality(flow.activeNodeId));
+    } catch (cause) {
+      setQualityError(cause instanceof Error ? cause.message : t("qualityLoadFailed"));
+    } finally {
+      setQualityLoading(false);
+    }
+  };
   const [isMobile, setIsMobile] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 580px)").matches);
   const [viewScale, setViewScale] = useState(1);
   const canvasRef = useRef(null);
@@ -691,7 +750,8 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
         </section>
 
         <section className={`compose-preview ${previewOpen ? "compose-preview--open" : "compose-preview--closed"}`}>
-          <header><div><strong>{t("previewData")}</strong>{preview && <span>{formatNumber(preview.rowCount)} {t("rows")} · {preview.columns.length} {t("columns")}</span>}</div><div className="compose-preview__actions">{previewOpen && preview && <><button type="button" onClick={() => onExport("csv")}><DownloadSimple /> CSV</button><button type="button" onClick={() => onExport("xlsx")}><FileXls /> Excel</button></>}<button className="compose-preview__toggle" type="button" onClick={() => setPreviewOpen((current) => !current)} aria-expanded={previewOpen}>{previewOpen ? <CaretDown /> : <CaretUp />}{t(previewOpen ? "hidePreview" : "showPreview")}</button></div></header>
+          <header><div><strong>{t("previewData")}</strong>{preview && <span>{formatNumber(preview.rowCount)} {t("rows")} · {preview.columns.length} {t("columns")}</span>}</div><div className="compose-preview__actions">{flow.activeNodeId && <button type="button" onClick={toggleNodeQuality} aria-expanded={qualityOpen}>{t("qualityShort")}</button>}{previewOpen && preview && <><button type="button" onClick={() => onExport("csv")}><DownloadSimple /> CSV</button><button type="button" onClick={() => onExport("xlsx")}><FileXls /> Excel</button></>}<button className="compose-preview__toggle" type="button" onClick={() => setPreviewOpen((current) => !current)} aria-expanded={previewOpen}>{previewOpen ? <CaretDown /> : <CaretUp />}{t(previewOpen ? "hidePreview" : "showPreview")}</button></div></header>
+          {qualityOpen && <div className="compose-node-quality" role="status">{qualityLoading ? t("loading") : qualityError || (nodeQuality && <><span>{formatNumber(nodeQuality.emptyCellCount)} {t("emptyCells")}</span><span>{formatNumber(nodeQuality.mixedTypeColumnCount)} {t("mixedColumns")}</span><span>{nodeQuality.semanticCoverage.described}/{nodeQuality.semanticCoverage.total} {t("semanticFields")}</span>{nodeQuality.sampleWarning && <strong>{nodeQuality.sampleWarning}</strong>}</>)}</div>}
           {previewOpen && (loading ? <p>{t("loading")}</p> : error ? <p className="error-message" role="alert">{error}</p> : preview ? <PreviewTable preview={preview} /> : <p>{t("selectNodePreview")}</p>)}
         </section>
       </div>

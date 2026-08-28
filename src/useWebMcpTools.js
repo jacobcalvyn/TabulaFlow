@@ -11,7 +11,7 @@ const WORKSPACE_INPUT_SCHEMA = Object.freeze({
   properties: {
     workspace: {
       type: "string",
-      enum: ["source", "prepare", "compose", "analyze", "account"],
+      enum: ["source", "prepare", "compose", "account"],
       description: "The TabulaFlow workspace to show.",
     },
   },
@@ -60,6 +60,7 @@ const MUTATION_META = {
   expectedRevision: { type: "integer", minimum: 0, description: "Workspace revision returned by the latest workspace-state read." },
   requestId: { type: "string", minLength: 8, maxLength: 160, description: "Unique idempotency key for this logical mutation." },
 };
+const MUTATION_EXECUTION_MODE = { type: "string", enum: ["wait", "async"], default: "wait", description: "Use async for long-running work, then poll tabulaflow_get_operation_status." };
 
 const VALUE_SCHEMA = {
   oneOf: [
@@ -162,7 +163,26 @@ const COMPOSE_OPERATION_SCHEMA = Object.freeze({
     strictObject({ kind: { const: "difference" }, leftId: ID, rightId: ID, leftKey: ID, rightKey: ID, mode: { type: "string", enum: ["left-only", "right-only"] }, name: OPTIONAL_NAME }, ["kind", "leftId", "rightId", "leftKey", "rightKey", "mode"]),
     strictObject({ kind: { const: "filter-rows" }, inputId: ID, column: ID, operator: { type: "string", enum: FILTER_VALUE_OPERATORS }, value: VALUE_SCHEMA, name: OPTIONAL_NAME }, ["kind", "inputId", "column", "operator", "value"]),
     strictObject({ kind: { const: "filter-rows" }, inputId: ID, column: ID, operator: { type: "string", enum: FILTER_VALUELESS_OPERATORS }, name: OPTIONAL_NAME }, ["kind", "inputId", "column", "operator"]),
-    strictObject({ kind: { const: "distinct-rows" }, inputId: ID, columns: COLUMN_NAMES, name: OPTIONAL_NAME }, ["kind", "inputId", "columns"]),
+    strictObject({ kind: { const: "distinct-rows" }, inputId: ID, columns: COLUMN_NAMES, mode: { type: "string", enum: ["representative-rows", "project-columns"], default: "representative-rows" }, name: OPTIONAL_NAME }, ["kind", "inputId", "columns"]),
+    strictObject({
+      kind: { const: "aggregate" },
+      inputId: ID,
+      groupBy: { type: "array", items: ID, uniqueItems: true },
+      metrics: {
+        type: "array",
+        minItems: 1,
+        maxItems: 20,
+        items: strictObject({
+          function: { type: "string", enum: ["count", "count-distinct", "sum", "average", "min", "max", "median", "percentile"] },
+          measureColumn: ID,
+          alias: ID,
+          percentile: { type: "number", exclusiveMinimum: 0, exclusiveMaximum: 1 },
+        }, ["function", "alias"]),
+      },
+      minimumSampleSize: { type: "integer", minimum: 1, default: 1 },
+      suppressSmallGroups: { type: "boolean", default: false },
+      name: OPTIONAL_NAME,
+    }, ["kind", "inputId", "metrics"]),
     strictObject({ kind: { const: "aggregate" }, inputId: ID, groupBy: { type: "array", items: ID, uniqueItems: true }, function: { const: "count" }, measureColumn: ID, alias: ID, name: OPTIONAL_NAME }, ["kind", "inputId", "function", "alias"]),
     strictObject({ kind: { const: "aggregate" }, inputId: ID, groupBy: { type: "array", items: ID, uniqueItems: true }, function: { type: "string", enum: ["sum", "average", "min", "max", "count-distinct"] }, measureColumn: ID, alias: ID, name: OPTIONAL_NAME }, ["kind", "inputId", "function", "measureColumn", "alias"]),
     strictObject({ kind: { const: "pivot" }, inputId: ID, groupBy: { type: "array", items: ID, uniqueItems: true }, pivotColumn: ID, valueColumn: ID, aggregate: { type: "string", enum: ["sum", "count", "average", "min", "max"] }, values: { type: "array", items: VALUE_SCHEMA, minItems: 1 }, name: OPTIONAL_NAME }, ["kind", "inputId", "pivotColumn", "valueColumn", "aggregate", "values"]),
@@ -220,6 +240,34 @@ const COMPOSE_PREVIEW_SCHEMA = Object.freeze(strictObject({
   offset: { type: "integer", minimum: 0, default: 0 },
   limit: { type: "integer", minimum: 1, maximum: 20, default: 20 },
 }, ["nodeId", "columns"]));
+const COMPOSE_QUALITY_SCHEMA = Object.freeze(strictObject({ nodeId: ID }));
+const OPERATION_STATUS_SCHEMA = Object.freeze(strictObject({ operationId: ID }));
+const SEMANTIC_MODEL_SCHEMA = Object.freeze(strictObject({ targetId: ID }));
+const UPDATE_SEMANTIC_FIELD_SCHEMA = Object.freeze(strictObject({
+  targetId: ID,
+  fieldName: ID,
+  changes: strictObject({
+    businessName: { type: "string", minLength: 1 },
+    role: { type: "string", enum: ["identifier", "dimension", "measure", "timestamp", "status", "free-text", "attribute"] },
+    unit: { type: ["string", "null"] },
+    sensitivity: { type: "string", enum: ["public", "internal", "pii", "financial", "secret"] },
+    allowedAggregations: { type: "array", items: { type: "string", enum: ["count", "count-distinct", "sum", "average", "min", "max", "median", "percentile"] }, uniqueItems: true },
+  }, []),
+  ...MUTATION_META,
+}, ["targetId", "fieldName", "changes", "expectedRevision", "requestId"]));
+const METRIC_DEFINITION_SCHEMA = Object.freeze(strictObject({
+  id: ID,
+  targetId: ID,
+  name: ID,
+  function: { type: "string", enum: ["count", "count-distinct", "sum", "average", "min", "max", "median", "percentile"] },
+  column: ID,
+  percentile: { type: "number", exclusiveMinimum: 0, exclusiveMaximum: 1 },
+  description: { type: "string" },
+  unit: { type: ["string", "null"] },
+  format: { type: ["string", "null"] },
+  ...MUTATION_META,
+}, ["targetId", "name", "function", "expectedRevision", "requestId"]));
+const DELETE_METRIC_DEFINITION_SCHEMA = Object.freeze(strictObject({ id: ID, ...MUTATION_META }));
 const VALIDATE_COMPOSE_OPERATION_SCHEMA = Object.freeze(strictObject({
   operation: COMPOSE_OPERATION_SCHEMA,
   previewColumns: { type: "array", items: ID, maxItems: 20, uniqueItems: true, description: "Optional explicit columns for a bounded row preview. Omit for metadata-only validation." },
@@ -236,7 +284,8 @@ const UPDATE_COMPOSE_OPERATION_SCHEMA = Object.freeze(strictObject({
   nodeId: ID,
   operation: COMPOSE_OPERATION_SCHEMA,
   ...MUTATION_META,
-}));
+  executionMode: MUTATION_EXECUTION_MODE,
+}, ["nodeId", "operation", "expectedRevision", "requestId"]));
 const SOURCE_RELINK_SCHEMA = Object.freeze(strictObject({ sourceAssetId: ID }));
 const CLOUD_FILE_SCHEMA = Object.freeze(strictObject({ fileId: ID, ...MUTATION_META }));
 
@@ -273,54 +322,11 @@ const REPLACE_RECIPE_SCHEMA = Object.freeze(strictObject({
   recipe: RECIPE_PREVIEW_SCHEMA.properties.recipe,
   expectedRecipeRevision: { type: "integer", minimum: 0, description: "Recipe revision returned by tabulaflow_get_recipe." },
   ...MUTATION_META,
-}));
+  executionMode: MUTATION_EXECUTION_MODE,
+}, ["preparedId", "recipe", "expectedRecipeRevision", "expectedRevision", "requestId"]));
 const VALUE_ACTION_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, action: VALUE_ACTION_SCHEMA.properties.action, column: ID, value: AGENT_VALUE_SCHEMA, ...MUTATION_META }));
-const CREATE_COMPOSE_OPERATION_V2_SCHEMA = Object.freeze(strictObject({ operation: COMPOSE_OPERATION_SCHEMA, ...MUTATION_META }));
+const CREATE_COMPOSE_OPERATION_V2_SCHEMA = Object.freeze(strictObject({ operation: COMPOSE_OPERATION_SCHEMA, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["operation", "expectedRevision", "requestId"]));
 const AUTO_ARRANGE_V2_SCHEMA = Object.freeze(strictObject({ ...MUTATION_META }));
-const SEMANTIC_TARGET_SCHEMA = Object.freeze(strictObject({ preparedId: ID }));
-const UPDATE_SEMANTIC_FIELD_SCHEMA = Object.freeze(strictObject({
-  preparedId: ID,
-  fieldName: ID,
-  changes: strictObject({
-    businessName: { type: "string", minLength: 1 },
-    description: { type: "string" },
-    role: { type: "string", enum: ["identifier", "dimension", "measure", "timestamp", "status", "free-text", "attribute"] },
-    unit: { oneOf: [{ type: "string" }, { type: "null" }] },
-    sensitivity: { type: "string", enum: ["public", "internal", "pii", "financial", "secret"] },
-    allowedAggregations: { type: "array", items: { type: "string", enum: ["count", "count-distinct", "sum", "average", "median", "percentile", "min", "max"] }, uniqueItems: true },
-  }, []),
-  ...MUTATION_META,
-}));
-const VALIDATION_RULE_SCHEMA = Object.freeze(strictObject({
-  id: ID,
-  name: { type: "string", minLength: 1 },
-  severity: { type: "string", enum: ["info", "warning", "critical"] },
-  condition: strictObject({
-    field: ID,
-    operator: { type: "string", enum: ["equals", "not-equals", "greater-than", "greater-or-equal", "less-than", "less-or-equal", "is-null", "is-not-null", "is-empty", "is-not-empty"] },
-    rightField: ID,
-    value: VALUE_SCHEMA,
-  }, ["field", "operator"]),
-  recommendation: { type: "string" },
-  enabled: { type: "boolean" },
-}, ["name", "severity", "condition"]));
-const UPSERT_VALIDATION_RULE_SCHEMA = Object.freeze(strictObject({ preparedId: ID, rule: VALIDATION_RULE_SCHEMA, ...MUTATION_META }));
-const VALIDATE_DATASET_SCHEMA = Object.freeze(strictObject({ preparedId: ID, ...MUTATION_META }));
-const ANALYSIS_DEFINITION_SCHEMA = Object.freeze(strictObject({
-  id: ID,
-  name: { type: "string", minLength: 1 },
-  dimensions: { type: "array", items: ID, maxItems: 8, uniqueItems: true },
-  metrics: { type: "array", minItems: 1, maxItems: 12, items: strictObject({
-    function: { type: "string", enum: ["count", "count-distinct", "sum", "average", "median", "percentile", "min", "max"] },
-    column: ID,
-    alias: ID,
-    percentile: { type: "number", minimum: 0.01, maximum: 0.99 },
-  }, ["function", "alias"]) },
-  minimumSampleSize: { type: "integer", minimum: 1, default: 20 },
-  limit: { type: "integer", minimum: 1, maximum: 1000, default: 200 },
-}, ["name", "metrics"]));
-const RUN_ANALYSIS_SCHEMA = Object.freeze(strictObject({ preparedId: ID, analysis: ANALYSIS_DEFINITION_SCHEMA, ...MUTATION_META }));
-
 function webMcpResult(message, data) {
   return {
     content: [{ type: "text", text: message }],
@@ -347,7 +353,7 @@ function filterSelection(raw) {
 const WEBMCP_CAPABILITIES = Object.freeze({
   contractVersion: "2.4",
   authenticationRequired: false,
-  workspaces: ["source", "prepare", "compose", "analyze", "account"],
+  workspaces: ["source", "prepare", "compose", "account"],
   actions: [
     "inspect-workspace",
     "navigate-workspace",
@@ -378,10 +384,10 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     "cloud-file-access",
     "inspect-shared-activity",
     "inspect-changes-since-cursor",
-    "manage-semantic-model",
-    "manage-validation-rules",
-    "run-quality-gate",
-    "run-reusable-analysis",
+    "inspect-mutation-operation",
+    "inspect-and-override-semantics",
+    "inspect-compose-quality",
+    "manage-reusable-metrics",
   ],
   safeguards: {
     localFileSelection: "user-action-required",
@@ -396,7 +402,6 @@ const WORKFLOW_GUIDE = Object.freeze({
     { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
     { workspace: "prepare", purpose: "Inspect one prepared dataset, apply temporary filters, and maintain its independent ordered recipe." },
     { workspace: "compose", purpose: "Create a dependency graph across prepared datasets and operation results without mutating upstream inputs." },
-    { workspace: "analyze", purpose: "Define business semantics, run saved cross-field validation, enforce the quality gate, and execute reusable multi-metric analysis." },
   ],
   collaboration: {
     observeBeforeActing: "Read workspace state and the target dataset or node immediately before a mutation.",
@@ -411,9 +416,9 @@ const OPERATION_GUIDES = Object.freeze({
   append: { inputs: 2, purpose: "Stack rows from two compatible inputs while preserving all visible columns.", parameters: ["inputIds", "name?"], compatibility: "Shared column names must have compatible types; columns present on only one side are retained.", example: { kind: "append", inputIds: ["prepared-a", "prepared-b"] }, undoable: "Delete the leaf operation after user confirmation." },
   join: { inputs: 2, purpose: "Match two inputs using explicit same-type keys.", parameters: ["leftId", "rightId", "leftKey", "rightKey", "joinType", "name?"], compatibility: "Key types must match exactly; duplicate output names receive automatic suffixes.", example: { kind: "join", leftId: "prepared-orders", rightId: "prepared-customers", leftKey: "customer_id", rightKey: "id", joinType: "left" }, undoable: "Update its configuration or delete the leaf operation." },
   difference: { inputs: 2, purpose: "Return rows that exist only on the chosen side using explicit matching keys.", parameters: ["leftId", "rightId", "leftKey", "rightKey", "mode", "name?"], compatibility: "Matching key types must be compatible.", example: { kind: "difference", leftId: "prepared-a", rightId: "prepared-b", leftKey: "id", rightKey: "id", mode: "left-only" }, undoable: "Update its configuration or delete the leaf operation." },
-  aggregate: { inputs: 1, purpose: "Group rows and calculate count, sum, average, min, max, or distinct count.", parameters: ["inputId", "groupBy?", "function", "measureColumn?", "alias", "name?"], compatibility: "Every function except count requires a measure column; numeric measures are required for numeric aggregation functions.", example: { kind: "aggregate", inputId: "prepared-orders", groupBy: ["status"], function: "sum", measureColumn: "amount", alias: "total_amount" }, undoable: "Update its configuration or delete the leaf operation." },
+  aggregate: { inputs: 1, purpose: "Group rows and calculate multiple reusable metrics in one node, including median and percentile.", parameters: ["inputId", "groupBy?", "metrics", "minimumSampleSize?", "suppressSmallGroups?", "name?"], compatibility: "Every function except count requires a measure column. Percentile requires a value between 0 and 1.", example: { kind: "aggregate", inputId: "prepared-orders", groupBy: ["status"], metrics: [{ function: "count", alias: "shipments" }, { function: "sum", measureColumn: "amount", alias: "total_amount" }, { function: "percentile", measureColumn: "amount", percentile: 0.9, alias: "p90_amount" }], minimumSampleSize: 20, suppressSmallGroups: true }, undoable: "Update its configuration or delete the leaf operation." },
   "filter-rows": { inputs: 1, purpose: "Keep rows that satisfy a persistent condition in Compose.", parameters: ["inputId", "column", "operator", "value?", "name?"], compatibility: "Comparison operators require a value; null and empty operators do not accept one.", example: { kind: "filter-rows", inputId: "prepared-orders", column: "status", operator: "equals", value: "open" }, undoable: "Update its configuration or delete the leaf operation." },
-  "distinct-rows": { inputs: 1, purpose: "Keep one row for each unique combination of comparison columns.", parameters: ["inputId", "columns", "name?"], compatibility: "At least one existing column is required.", example: { kind: "distinct-rows", inputId: "prepared-orders", columns: ["tracking_id"] }, undoable: "Update its configuration or delete the leaf operation." },
+  "distinct-rows": { inputs: 1, purpose: "Keep one representative row per unique key or return only the projected distinct columns.", parameters: ["inputId", "columns", "mode?", "name?"], compatibility: "At least one existing column is required. representative-rows preserves the full schema; project-columns returns only comparison columns.", example: { kind: "distinct-rows", inputId: "prepared-orders", columns: ["tracking_id"], mode: "project-columns" }, undoable: "Update its configuration or delete the leaf operation." },
   pivot: { inputs: 1, purpose: "Turn distinct row values into columns using an aggregate.", parameters: ["inputId", "groupBy?", "pivotColumn", "valueColumn", "aggregate", "values", "name?"], compatibility: "Pivot/value columns and explicit pivot values must exist.", example: { kind: "pivot", inputId: "prepared-orders", groupBy: ["region"], pivotColumn: "status", valueColumn: "amount", aggregate: "sum", values: ["open", "closed"] }, undoable: "Update its configuration or delete the leaf operation." },
   unpivot: { inputs: 1, purpose: "Turn multiple value columns into field/value rows.", parameters: ["inputId", "idColumns?", "valueColumns", "fieldColumn", "valueColumn", "name?"], compatibility: "At least one value column is required and output names must not collide.", example: { kind: "unpivot", inputId: "prepared-costs", idColumns: ["id"], valueColumns: ["fee", "tax"], fieldColumn: "cost_type", valueColumn: "cost_value" }, undoable: "Update its configuration or delete the leaf operation." },
 });
@@ -488,6 +493,17 @@ export function createWebMcpTools(contextRef, availability) {
       const { actions } = activeContext(contextRef);
       const result = await actions.getChangesSince(cursor, { limit });
       return webMcpResult(`Returned ${result.events.length} changes after cursor ${cursor}.`, result);
+    },
+  }, {
+    name: "tabulaflow_get_operation_status",
+    title: "Get mutation operation status",
+    description: "Poll a long-running WebMCP mutation accepted with executionMode async. Returns accepted, running, committed, or failed with its final result or diagnostic.",
+    inputSchema: OPERATION_STATUS_SCHEMA,
+    annotations: { readOnlyHint: true },
+    async execute({ operationId }) {
+      const { actions } = activeContext(contextRef);
+      const result = await actions.getOperationStatus(operationId);
+      return webMcpResult(`Mutation operation ${operationId} is ${result.status}.`, result);
     },
   }, {
     name: "tabulaflow_open_workspace",
@@ -583,15 +599,70 @@ export function createWebMcpTools(contextRef, availability) {
         return webMcpResult(`Read the recipe for ${result.name}.`, result);
       },
     }, {
+      name: "tabulaflow_get_semantic_model",
+      title: "Get dataset or node semantics",
+      description: "Read business names, roles, units, sensitivity, allowed aggregations, and provenance for a prepared dataset or Compose node.",
+      inputSchema: SEMANTIC_MODEL_SCHEMA,
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
+      async execute({ targetId }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.getSemanticModel(targetId);
+        return webMcpResult(`Read semantic metadata for ${targetId}.`, result);
+      },
+    }, {
+      name: "tabulaflow_update_semantic_field",
+      title: "Update semantic field metadata",
+      description: "Override one field's business role, unit, sensitivity, or allowed aggregations. Derived Compose nodes inherit the override through schema lineage.",
+      inputSchema: UPDATE_SEMANTIC_FIELD_SCHEMA,
+      annotations: { readOnlyHint: false },
+      async execute({ targetId, fieldName, changes, expectedRevision, requestId }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.updateSemanticField(targetId, fieldName, changes, { expectedRevision, requestId });
+        return webMcpResult(`Updated semantic metadata for ${fieldName}.`, result);
+      },
+    }, {
+      name: "tabulaflow_list_metric_definitions",
+      title: "List reusable metric definitions",
+      description: "List reusable aggregate metric definitions for one dataset, including function, source column, unit, and format.",
+      inputSchema: SEMANTIC_MODEL_SCHEMA,
+      annotations: { readOnlyHint: true },
+      async execute({ targetId }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.listMetricDefinitions(targetId);
+        return webMcpResult(`Returned ${result.metrics.length} reusable metrics.`, result);
+      },
+    }, {
+      name: "tabulaflow_upsert_metric_definition",
+      title: "Save a reusable metric definition",
+      description: "Create or update a reusable metric definition after validating the target schema and aggregation function.",
+      inputSchema: METRIC_DEFINITION_SCHEMA,
+      annotations: { readOnlyHint: false },
+      async execute({ expectedRevision, requestId, ...definition }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.upsertMetricDefinition(definition, { expectedRevision, requestId });
+        return webMcpResult(`Saved reusable metric ${result.metric.name}.`, result);
+      },
+    }, {
+      name: "tabulaflow_delete_metric_definition",
+      title: "Delete a reusable metric definition",
+      description: "Delete only the reusable metric definition. Existing Compose nodes keep their copied metric configuration.",
+      inputSchema: DELETE_METRIC_DEFINITION_SCHEMA,
+      annotations: { readOnlyHint: false },
+      async execute({ id, expectedRevision, requestId }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.deleteMetricDefinition(id, { expectedRevision, requestId });
+        return webMcpResult(`Deleted reusable metric ${id}.`, result);
+      },
+    }, {
       name: "tabulaflow_replace_recipe",
       title: "Replace a Prepare recipe atomically",
       description: "Validate and commit one complete ordered recipe as a single mutation. Requires both current workspace and recipe revisions, so rapid agent edits cannot reorder or overwrite steps silently.",
       inputSchema: REPLACE_RECIPE_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ preparedId, recipe, expectedRecipeRevision, expectedRevision, requestId }) {
+      async execute({ preparedId, recipe, expectedRecipeRevision, expectedRevision, requestId, executionMode }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.replaceRecipe(preparedId, recipe, expectedRecipeRevision, { expectedRevision, requestId });
-        return webMcpResult(`Replaced the recipe with ${recipe.length} ordered steps.`, result);
+        const result = await actions.replaceRecipe(preparedId, recipe, expectedRecipeRevision, { expectedRevision, requestId, executionMode });
+        return webMcpResult(result.status === "accepted" ? "Recipe replacement was accepted for background execution." : `Replaced the recipe with ${recipe.length} ordered steps.`, result);
       },
     }, {
       name: "tabulaflow_duplicate_prepared_dataset",
@@ -603,72 +674,6 @@ export function createWebMcpTools(contextRef, availability) {
         const { actions } = activeContext(contextRef);
         const result = await actions.duplicatePrepared(preparedId, { expectedRevision, requestId });
         return webMcpResult(`Duplicated prepared dataset ${preparedId}.`, result);
-      },
-    }, {
-      name: "tabulaflow_get_semantic_model",
-      title: "Get a dataset semantic model",
-      description: "Read business names, roles, units, sensitivity, provenance, and permitted aggregations for every field in one prepared dataset.",
-      inputSchema: SEMANTIC_TARGET_SCHEMA,
-      annotations: { readOnlyHint: true, untrustedContentHint: true },
-      async execute({ preparedId }) {
-        const { actions } = activeContext(contextRef);
-        const result = await actions.getSemanticModel(preparedId);
-        return webMcpResult(`Read the semantic model for ${preparedId}.`, result);
-      },
-    }, {
-      name: "tabulaflow_update_semantic_field",
-      title: "Update one semantic field",
-      description: "Update the business definition of one field by stable prepared ID and exact field name. This changes the same persisted semantic model shown in Analyze.",
-      inputSchema: UPDATE_SEMANTIC_FIELD_SCHEMA,
-      annotations: { readOnlyHint: false },
-      async execute({ preparedId, fieldName, changes, expectedRevision, requestId }) {
-        const { actions } = activeContext(contextRef);
-        const result = await actions.updateSemanticField(preparedId, fieldName, changes, { expectedRevision, requestId });
-        return webMcpResult(`Updated semantic field ${fieldName}.`, result);
-      },
-    }, {
-      name: "tabulaflow_get_validation_results",
-      title: "Get validation rules and results",
-      description: "Read the saved business validation rules, latest result, quality-gate status, and dataset revision for one prepared dataset.",
-      inputSchema: SEMANTIC_TARGET_SCHEMA,
-      annotations: { readOnlyHint: true, untrustedContentHint: true },
-      async execute({ preparedId }) {
-        const { actions } = activeContext(contextRef);
-        const result = await actions.getValidationResults(preparedId);
-        return webMcpResult(`Read validation state for ${preparedId}.`, result);
-      },
-    }, {
-      name: "tabulaflow_upsert_validation_rule",
-      title: "Create or update a validation rule",
-      description: "Create or replace one saved business rule. Cross-field comparisons use rightField; literal comparisons use value. Results become stale until validation runs again.",
-      inputSchema: UPSERT_VALIDATION_RULE_SCHEMA,
-      annotations: { readOnlyHint: false },
-      async execute({ preparedId, rule, expectedRevision, requestId }) {
-        const { actions } = activeContext(contextRef);
-        const result = await actions.upsertValidationRule(preparedId, rule, { expectedRevision, requestId });
-        return webMcpResult(`Saved validation rule ${result.rule.name}.`, result);
-      },
-    }, {
-      name: "tabulaflow_validate_dataset",
-      title: "Run dataset validation",
-      description: "Evaluate every enabled saved validation rule, persist privacy-safe result counts and bounded redacted examples, and update the Analyze quality gate.",
-      inputSchema: VALIDATE_DATASET_SCHEMA,
-      annotations: { readOnlyHint: false, untrustedContentHint: true },
-      async execute({ preparedId, expectedRevision, requestId }) {
-        const { actions } = activeContext(contextRef);
-        const result = await actions.validateDataset(preparedId, { expectedRevision, requestId });
-        return webMcpResult(`Validation completed with gate status ${result.run.gateStatus}.`, result);
-      },
-    }, {
-      name: "tabulaflow_run_analysis",
-      title: "Run and save an analysis",
-      description: "Run a reusable grouped multi-metric analysis under the dataset semantic aggregation rules. Results are bounded and sensitive dimensions are redacted.",
-      inputSchema: RUN_ANALYSIS_SCHEMA,
-      annotations: { readOnlyHint: false, untrustedContentHint: true },
-      async execute({ preparedId, analysis, expectedRevision, requestId }) {
-        const { actions } = activeContext(contextRef);
-        const result = await actions.runAnalysis(preparedId, analysis, { expectedRevision, requestId });
-        return webMcpResult(`Ran analysis ${result.definition.name}.`, result);
       },
     });
   }
@@ -912,6 +917,17 @@ export function createWebMcpTools(contextRef, availability) {
         return webMcpResult(`Returned ${result.previewRowCount} rows from Compose node ${nodeId}.`, result);
       },
     }, {
+      name: "tabulaflow_get_compose_node_quality",
+      title: "Get Compose node quality",
+      description: "Profile one Compose result for empty cells, mixed-type columns, semantic coverage, sensitivity totals, and minimum-sample warnings.",
+      inputSchema: COMPOSE_QUALITY_SCHEMA,
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
+      async execute({ nodeId }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.getComposeNodeQuality(nodeId);
+        return webMcpResult(`Profiled Compose node ${nodeId}.`, result);
+      },
+    }, {
       name: "tabulaflow_validate_compose_operation",
       title: "Validate a Compose operation",
       description: "Dry-run a candidate operation and return diagnostics, output counts, and schema delta without changing the graph. Rows require explicit previewColumns and are limited to 20.",
@@ -987,10 +1003,10 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Transactionally validate and create Append, Join, Difference, Aggregate, Filter rows, Distinct rows, Pivot, or Unpivot in the visible Compose graph.",
       inputSchema: CREATE_COMPOSE_OPERATION_V2_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ operation, expectedRevision, requestId }) {
+      async execute({ operation, expectedRevision, requestId, executionMode }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.createComposeOperation(operation, { expectedRevision, requestId });
-        return webMcpResult(`Created Compose operation ${result.name}.`, result);
+        const result = await actions.createComposeOperation(operation, { expectedRevision, requestId, executionMode });
+        return webMcpResult(result.status === "accepted" ? "Compose operation creation was accepted for background execution." : `Created Compose operation ${result.name}.`, result);
       },
     }, {
       name: "tabulaflow_update_compose_operation",
@@ -998,10 +1014,10 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Transactionally validate and replace an existing Compose operation configuration while preserving its stable node ID.",
       inputSchema: UPDATE_COMPOSE_OPERATION_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ nodeId, operation, expectedRevision, requestId }) {
+      async execute({ nodeId, operation, expectedRevision, requestId, executionMode }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.updateComposeOperation(nodeId, operation, { expectedRevision, requestId });
-        return webMcpResult(`Updated Compose operation ${result.name}.`, result);
+        const result = await actions.updateComposeOperation(nodeId, operation, { expectedRevision, requestId, executionMode });
+        return webMcpResult(result.status === "accepted" ? "Compose operation update was accepted for background execution." : `Updated Compose operation ${result.name}.`, result);
       },
     }, {
       name: "tabulaflow_promote_compose_result",

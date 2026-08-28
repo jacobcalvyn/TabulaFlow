@@ -35,6 +35,7 @@ function createContext() {
         async getAvailableActions(targetId) { calls.push(["available-actions", targetId]); return { targetId, actions: ["inspect"] }; },
         async getActivityLog(options) { calls.push(["activity", options]); return { events: [{ sequence: 12, actor: "agent" }], cursor: 12, hasMore: false }; },
         async getChangesSince(cursor, options) { calls.push(["changes", cursor, options]); return { events: [], cursor, hasMore: false }; },
+        async getOperationStatus(operationId) { calls.push(["operation-status", operationId]); return { operationId, status: "committed" }; },
         async openWorkspace(workspace) { calls.push(["workspace", workspace]); return { workspace, workspaceRevision: REVISION, activityCursor: 12, activePreparedId: "prepared-a", activeNodeId: "operation-a" }; },
         async requestSourceFileSelection() { calls.push(["file"]); },
         async requestSourceRelink(sourceAssetId) { calls.push(["relink", sourceAssetId]); },
@@ -43,14 +44,13 @@ function createContext() {
         async requestCloudUpload() { calls.push(["cloud-upload"]); },
         async selectPrepared(preparedId, meta) { calls.push(["prepared", preparedId, meta]); },
         async getRecipe(preparedId) { calls.push(["recipe", preparedId]); return { preparedId, name: "Orders", recipe: [] }; },
+        async getSemanticModel(targetId) { calls.push(["semantic", targetId]); return { targetId, revision: 0, fields: {} }; },
+        async updateSemanticField(targetId, fieldName, changes, meta) { calls.push(["semantic-update", targetId, fieldName, changes, meta]); return result({ targetId, fieldName }); },
+        async listMetricDefinitions(targetId) { calls.push(["metric-list", targetId]); return { targetId, metrics: [] }; },
+        async upsertMetricDefinition(definition, meta) { calls.push(["metric-upsert", definition, meta]); return result({ metric: definition }); },
+        async deleteMetricDefinition(id, meta) { calls.push(["metric-delete", id, meta]); return result({ id, deleted: true }); },
         async replaceRecipe(preparedId, recipe, expectedRecipeRevision, meta) { calls.push(["replace-recipe", preparedId, recipe, expectedRecipeRevision, meta]); return result({ recipeRevision: expectedRecipeRevision + 1 }); },
         async duplicatePrepared(preparedId, meta) { calls.push(["duplicate", preparedId, meta]); return result({ preparedInputId: "prepared-b" }); },
-        async getSemanticModel(preparedId) { calls.push(["semantic", preparedId]); return { preparedId, semanticModel: { revision: 1, fields: [] } }; },
-        async updateSemanticField(preparedId, fieldName, changes, meta) { calls.push(["semantic-update", preparedId, fieldName, changes, meta]); return result({ preparedId, semanticRevision: 2 }); },
-        async getValidationResults(preparedId) { calls.push(["validation-results", preparedId]); return { preparedId, rules: [], latestRun: null }; },
-        async upsertValidationRule(preparedId, rule, meta) { calls.push(["validation-upsert", preparedId, rule, meta]); return result({ rule: { ...rule, id: rule.id ?? "rule-a" } }); },
-        async validateDataset(preparedId, meta) { calls.push(["validation-run", preparedId, meta]); return result({ run: { gateStatus: "analysis-ready", results: [] } }); },
-        async runAnalysis(preparedId, analysis, meta) { calls.push(["analysis-run", preparedId, analysis, meta]); return result({ definition: { ...analysis, id: analysis.id ?? "analysis-a" }, result: { columns: ["row_count"], rows: [{ row_count: 10 }] } }); },
         async getPrepareDataset(preparedId) { calls.push(["dataset", preparedId]); return { preparedId, name: "Orders", columns: ["status", "amount"] }; },
         async getDataProfile(preparedId, columns) { calls.push(["profile", preparedId, columns]); return { columns: [{ name: "status" }] }; },
         async queryColumnValues(preparedId, column, search, options) { calls.push(["values", preparedId, column, search, options]); return { column, values: [{ value: "open", count: 4 }], matchCount: 1 }; },
@@ -69,6 +69,7 @@ function createContext() {
         async getComposeGraph() { calls.push(["graph"]); return { nodes: [{ id: "operation-a" }], edges: [], workspaceRevision: REVISION }; },
         async getComposeNode(nodeId) { calls.push(["compose-node", nodeId]); return { id: nodeId, name: "Filtered orders" }; },
         async getComposeNodePreview(nodeId, columns, options) { calls.push(["node-preview", nodeId, columns, options]); return { previewRowCount: 1, rows: [{ status: "open" }] }; },
+        async getComposeNodeQuality(nodeId) { calls.push(["node-quality", nodeId]); return { nodeId, emptyCellCount: 0, mixedTypeColumnCount: 0 }; },
         async validateComposeOperation(operation, options) { calls.push(["validate", operation, options]); return { valid: true, output: { rowCount: 4, columnCount: 2 }, schemaDelta: {}, diagnostics: [] }; },
         async getConnectionOptions(nodeId) { calls.push(["connections", nodeId]); return { nodeId, targets: [] }; },
         async selectComposeNode(nodeId, meta) { calls.push(["node", nodeId, meta]); },
@@ -93,22 +94,20 @@ function toolByName(tools, name) {
 const GLOBAL_TOOL_NAMES = [
   "tabulaflow_get_workspace_state", "tabulaflow_get_capabilities", "tabulaflow_get_workflow_guide",
   "tabulaflow_describe_operation", "tabulaflow_get_available_actions", "tabulaflow_get_activity_log",
-  "tabulaflow_get_changes_since", "tabulaflow_open_workspace",
+  "tabulaflow_get_changes_since", "tabulaflow_get_operation_status", "tabulaflow_open_workspace",
   "tabulaflow_request_source_file", "tabulaflow_request_source_relink", "tabulaflow_list_cloud_files",
   "tabulaflow_open_cloud_file", "tabulaflow_request_cloud_upload",
 ];
 
 const ALL_TOOL_NAMES = [
   ...GLOBAL_TOOL_NAMES,
-  "tabulaflow_select_prepared_dataset", "tabulaflow_get_recipe", "tabulaflow_replace_recipe", "tabulaflow_duplicate_prepared_dataset",
-  "tabulaflow_get_semantic_model", "tabulaflow_update_semantic_field", "tabulaflow_get_validation_results",
-  "tabulaflow_upsert_validation_rule", "tabulaflow_validate_dataset", "tabulaflow_run_analysis",
+  "tabulaflow_select_prepared_dataset", "tabulaflow_get_recipe", "tabulaflow_get_semantic_model", "tabulaflow_update_semantic_field", "tabulaflow_list_metric_definitions", "tabulaflow_upsert_metric_definition", "tabulaflow_delete_metric_definition", "tabulaflow_replace_recipe", "tabulaflow_duplicate_prepared_dataset",
   "tabulaflow_get_prepare_dataset", "tabulaflow_get_data_profile", "tabulaflow_query_column_values",
   "tabulaflow_get_prepare_preview", "tabulaflow_preview_recipe_change", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter",
   "tabulaflow_remove_preview_filter", "tabulaflow_clear_preview_filters", "tabulaflow_export_prepare",
   "tabulaflow_add_recipe_step", "tabulaflow_update_recipe_step", "tabulaflow_set_recipe_step_enabled",
   "tabulaflow_move_recipe_step", "tabulaflow_undo_recipe", "tabulaflow_redo_recipe", "tabulaflow_apply_value_action",
-  "tabulaflow_get_compose_graph", "tabulaflow_get_compose_node", "tabulaflow_get_node_preview",
+  "tabulaflow_get_compose_graph", "tabulaflow_get_compose_node", "tabulaflow_get_node_preview", "tabulaflow_get_compose_node_quality",
   "tabulaflow_validate_compose_operation", "tabulaflow_get_connection_options", "tabulaflow_select_compose_node",
   "tabulaflow_auto_arrange_compose", "tabulaflow_move_compose_node", "tabulaflow_export_compose",
   "tabulaflow_create_compose_operation", "tabulaflow_update_compose_operation", "tabulaflow_promote_compose_result",
@@ -120,7 +119,7 @@ test("WebMCP exposes contextual Agent-Ready v2 tools", () => {
   assert.deepEqual(createWebMcpTools(ref, { hasDataset: false, hasPrepared: false, hasComposeNodes: false }).map((tool) => tool.name), GLOBAL_TOOL_NAMES);
   const allTools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   assert.deepEqual(allTools.map((tool) => tool.name), ALL_TOOL_NAMES);
-  assert.equal(new Set(ALL_TOOL_NAMES).size, 53);
+  assert.equal(new Set(ALL_TOOL_NAMES).size, 54);
 });
 
 test("WebMCP read plane observes workflow, Prepare data, and Compose data", async () => {
@@ -133,9 +132,10 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_available_actions").execute({ targetId: "prepared-a" });
   await toolByName(tools, "tabulaflow_get_activity_log").execute({ limit: 20, actor: "agent" });
   await toolByName(tools, "tabulaflow_get_changes_since").execute({ cursor: 12, limit: 20 });
+  await toolByName(tools, "tabulaflow_get_operation_status").execute({ operationId: "operation-1" });
   await toolByName(tools, "tabulaflow_get_recipe").execute({ preparedId: "prepared-a" });
-  await toolByName(tools, "tabulaflow_get_semantic_model").execute({ preparedId: "prepared-a" });
-  await toolByName(tools, "tabulaflow_get_validation_results").execute({ preparedId: "prepared-a" });
+  await toolByName(tools, "tabulaflow_get_semantic_model").execute({ targetId: "prepared-a" });
+  await toolByName(tools, "tabulaflow_list_metric_definitions").execute({ targetId: "prepared-a" });
   await toolByName(tools, "tabulaflow_get_prepare_dataset").execute({ preparedId: "prepared-a" });
   await toolByName(tools, "tabulaflow_get_data_profile").execute({ preparedId: "prepared-a", columns: ["status"] });
   await toolByName(tools, "tabulaflow_query_column_values").execute({ preparedId: "prepared-a", column: "status", search: "op", offset: 0, limit: 20 });
@@ -144,6 +144,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_compose_graph").execute({});
   await toolByName(tools, "tabulaflow_get_compose_node").execute({ nodeId: "operation-a" });
   await toolByName(tools, "tabulaflow_get_node_preview").execute({ nodeId: "operation-a", columns: ["status"], offset: 0, limit: 20 });
+  await toolByName(tools, "tabulaflow_get_compose_node_quality").execute({ nodeId: "operation-a" });
   const candidate = { kind: "filter-rows", inputId: "prepared-a", column: "status", operator: "equals", value: "open" };
   await toolByName(tools, "tabulaflow_validate_compose_operation").execute({ operation: candidate });
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
@@ -152,14 +153,14 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   assert.equal(capabilities.structuredContent.contractVersion, "2.4");
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");
   assert.equal(capabilities.structuredContent.safeguards.deletion, "visible-user-confirmation-required");
-  assert.equal(guide.structuredContent.flow.length, 4);
+  assert.equal(guide.structuredContent.flow.length, 3);
   assert.equal(operation.structuredContent.inputs, 2);
   assert.ok(tools.filter((tool) => tool.annotations?.untrustedContentHint).length >= 10);
   assert.deepEqual(calls, [
-    ["available-actions", "prepared-a"], ["activity", { limit: 20, targetId: undefined, actor: "agent" }], ["changes", 12, { limit: 20 }], ["recipe", "prepared-a"], ["semantic", "prepared-a"], ["validation-results", "prepared-a"], ["dataset", "prepared-a"],
+    ["available-actions", "prepared-a"], ["activity", { limit: 20, targetId: undefined, actor: "agent" }], ["changes", 12, { limit: 20 }], ["operation-status", "operation-1"], ["recipe", "prepared-a"], ["semantic", "prepared-a"], ["metric-list", "prepared-a"], ["dataset", "prepared-a"],
     ["profile", "prepared-a", ["status"]], ["values", "prepared-a", "status", "op", { offset: 0, limit: 20 }],
     ["prepare-preview", "prepared-a", ["status"], { offset: 0, limit: 20 }], ["recipe-preview", "prepared-a", [], 0, { previewColumns: undefined, previewLimit: 10 }],
-    ["graph"], ["compose-node", "operation-a"], ["node-preview", "operation-a", ["status"], { offset: 0, limit: 20 }],
+    ["graph"], ["compose-node", "operation-a"], ["node-preview", "operation-a", ["status"], { offset: 0, limit: 20 }], ["node-quality", "operation-a"],
     ["validate", candidate, { previewColumns: undefined, previewLimit: 10 }], ["connections", "prepared-a"],
   ]);
 });
@@ -178,11 +179,6 @@ test("WebMCP mutations target stable IDs and carry revision plus idempotency met
   await toolByName(tools, "tabulaflow_request_cloud_upload").execute({});
   await toolByName(tools, "tabulaflow_select_prepared_dataset").execute({ preparedId: "prepared-a", ...mutation("prepared-select-001") });
   await toolByName(tools, "tabulaflow_duplicate_prepared_dataset").execute({ preparedId: "prepared-a", ...mutation("duplicate-001") });
-  await toolByName(tools, "tabulaflow_update_semantic_field").execute({ preparedId: "prepared-a", fieldName: "amount", changes: { businessName: "Order amount", role: "measure" }, ...mutation("semantic-update-001") });
-  const rule = { name: "Amount required", severity: "critical", condition: { field: "amount", operator: "is-null" } };
-  await toolByName(tools, "tabulaflow_upsert_validation_rule").execute({ preparedId: "prepared-a", rule, ...mutation("validation-upsert-001") });
-  await toolByName(tools, "tabulaflow_validate_dataset").execute({ preparedId: "prepared-a", ...mutation("validation-run-001") });
-  await toolByName(tools, "tabulaflow_run_analysis").execute({ preparedId: "prepared-a", analysis: { name: "Orders", metrics: [{ function: "count", alias: "row_count" }] }, ...mutation("analysis-run-001") });
   await toolByName(tools, "tabulaflow_set_aggregate_columns").execute({ preparedId: "prepared-a", columns: ["status"], ...mutation("aggregate-columns-001") });
   const filtered = await toolByName(tools, "tabulaflow_set_preview_filter").execute({ preparedId: "prepared-a", column: "status", value: "open", ...mutation("filter-set-001") });
   await toolByName(tools, "tabulaflow_remove_preview_filter").execute({ preparedId: "prepared-a", column: "status", ...mutation("filter-remove-001") });
@@ -243,8 +239,10 @@ test("WebMCP mutation schemas require collaboration metadata and conditional val
   assert.ok(filters.some((branch) => branch.required.includes("value")));
   assert.ok(filters.some((branch) => !Object.hasOwn(branch.properties, "value")));
   const aggregates = branches.filter((branch) => branch.properties.kind.const === "aggregate");
-  assert.equal(aggregates.length, 2);
+  assert.equal(aggregates.length, 3);
   assert.ok(aggregates.some((branch) => branch.required.includes("measureColumn")));
+  assert.ok(aggregates.some((branch) => branch.required.includes("metrics")));
+  assert.equal(toolByName(tools, "tabulaflow_replace_recipe").inputSchema.properties.executionMode.default, "wait");
   const previewStep = toolByName(tools, "tabulaflow_preview_recipe_change").inputSchema.properties.recipe.items;
   assert.ok(previewStep.required.includes("id"));
   assert.equal(toolByName(tools, "tabulaflow_preview_recipe_change").inputSchema.properties.previewLimit.maximum, 20);

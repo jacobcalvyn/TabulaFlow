@@ -37,6 +37,14 @@ test("agent previews redact sensitive columns while preserving nulls and safe ca
   assert.deepEqual(result.rows, [{ "Nomor Resi": "[redacted]", Status: "DELIVERED", Email: null }]);
 });
 
+test("explicit semantic sensitivity overrides drive agent redaction", () => {
+  const result = redactAgentRows([{ shipment_state: "IN_TRANSIT", customer_name: "Alice" }], [
+    { name: "shipment_state", type: "VARCHAR", semantic: { role: "status", sensitivity: "internal" } },
+    { name: "customer_name", type: "VARCHAR", semantic: { role: "attribute", sensitivity: "pii" } },
+  ]);
+  assert.deepEqual(result.rows, [{ shipment_state: "IN_TRANSIT", customer_name: "[redacted]" }]);
+});
+
 test("Join recommendations rank semantic names and data quality instead of returning every type-compatible pair", () => {
   const left = [
     { name: "Nomor Resi", type: "VARCHAR" },
@@ -57,6 +65,19 @@ test("Join recommendations rank semantic names and data quality instead of retur
   assert.equal(ranked.length, 2);
   assert.deepEqual([ranked[0].left, ranked[0].right], ["Nomor Resi", "nomor_resi"]);
   assert.ok(ranked[0].score > ranked[1].score);
+});
+
+test("Join recommendations prefer exact semantic identifiers over sparse boolean columns", () => {
+  const left = [{ name: "shipment_id", type: "VARCHAR", semantic: { role: "identifier" } }, { name: "active", type: "BOOLEAN" }];
+  const right = [{ name: "shipment_id", type: "VARCHAR", semantic: { role: "identifier" } }, { name: "active", type: "BOOLEAN" }];
+  const preliminary = buildJoinKeyCandidates(left, right, { limit: 12 });
+  const leftStats = new Map([
+    ["shipment_id", { uniquenessRatio: 1, nullRatio: 0, totalRowCount: 171 }],
+    ["active", { uniquenessRatio: 1, nullRatio: 0.993, totalRowCount: 171 }],
+  ]);
+  const rightStats = new Map(leftStats);
+  const ranked = rankJoinKeyCandidates(preliminary.candidates, leftStats, rightStats, { limit: 4 });
+  assert.deepEqual([ranked[0].left, ranked[0].right], ["shipment_id", "shipment_id"]);
 });
 
 test("dry-run schema deltas contain metadata only", () => {

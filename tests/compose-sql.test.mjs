@@ -91,6 +91,13 @@ test("distinct rows uses the selected comparison columns", () => {
   });
   assert.match(result.sql, /PARTITION BY d\."id"/);
   assert.deepEqual(result.schema.map((column) => column.name), ["id", "status"]);
+
+  const projected = compileDistinctRowsSql(relation("orders", [["id", "VARCHAR"], ["status", "VARCHAR"]]), {
+    columns: ["id"],
+    mode: "project-columns",
+  });
+  assert.deepEqual(projected.schema.map((column) => column.name), ["id"]);
+  assert.match(projected.sql, /SELECT DISTINCT "id"/);
 });
 
 test("aggregate supports grouped measures with stable output types", () => {
@@ -101,13 +108,32 @@ test("aggregate supports grouped measures with stable output types", () => {
       { function: "count-distinct", column: "amount", alias: "unique_amounts" },
     ],
   });
-  assert.deepEqual(result.schema, [
+  assert.deepEqual(result.schema.map(({ name, type }) => ({ name, type })), [
     { name: "city", type: "VARCHAR" },
     { name: "total_amount", type: "DOUBLE" },
     { name: "unique_amounts", type: "BIGINT" },
   ]);
   assert.match(result.sql, /SUM\(a\."amount"\) AS "total_amount"/);
   assert.match(result.sql, /COUNT\(DISTINCT a\."amount"\)/);
+});
+
+test("aggregate supports median, percentile, and minimum sample suppression", () => {
+  const result = compileAggregateSql(relation("orders", [["city", "VARCHAR"], ["amount", "DOUBLE"]]), {
+    groupBy: ["city"],
+    measures: [
+      { function: "median", column: "amount", alias: "median_amount" },
+      { function: "percentile", column: "amount", percentile: 0.9, alias: "p90_amount" },
+    ],
+    minimumSampleSize: 20,
+    suppressSmallGroups: true,
+  });
+  assert.match(result.sql, /MEDIAN\(a\."amount"\)/);
+  assert.match(result.sql, /QUANTILE_CONT\(a\."amount", 0\.9\)/);
+  assert.match(result.sql, /HAVING COUNT\(\*\) >= 20/);
+  assert.deepEqual(result.schema.slice(1).map(({ name, type }) => ({ name, type })), [
+    { name: "median_amount", type: "DOUBLE" },
+    { name: "p90_amount", type: "DOUBLE" },
+  ]);
 });
 
 test("difference returns only one side and compares null keys explicitly", () => {
@@ -149,7 +175,7 @@ test("unpivot turns selected columns into field and value rows", () => {
     nameColumn: "month",
     valueColumn: "amount",
   });
-  assert.deepEqual(result.schema, [
+  assert.deepEqual(result.schema.map(({ name, type }) => ({ name, type })), [
     { name: "id", type: "VARCHAR" },
     { name: "month", type: "VARCHAR" },
     { name: "amount", type: "DOUBLE" },

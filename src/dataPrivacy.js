@@ -77,12 +77,26 @@ export function classifyColumnSemantics(name, type) {
 }
 
 export function shouldRedactAgentValues(semantics) {
-  return semantics?.sensitivity === "sensitive" || semantics?.sensitivity === "potentially-sensitive";
+  return ["sensitive", "potentially-sensitive", "pii", "financial", "secret"].includes(semantics?.sensitivity);
+}
+
+export function resolveColumnSemantics(column) {
+  const inferred = classifyColumnSemantics(column?.name, column?.type);
+  const override = column?.semantic ?? {};
+  const overrideSensitivity = override.sensitivity === "public" || override.sensitivity === "internal"
+    ? "non-sensitive"
+    : override.sensitivity;
+  return {
+    ...inferred,
+    ...override,
+    sensitivity: overrideSensitivity ?? inferred.sensitivity,
+    semanticRole: override.role ?? inferred.semanticRole,
+  };
 }
 
 export function redactAgentRows(rows, schema = []) {
   const redactedColumns = schema
-    .filter((column) => shouldRedactAgentValues(classifyColumnSemantics(column.name, column.type)))
+    .filter((column) => shouldRedactAgentValues(resolveColumnSemantics(column)))
     .map((column) => column.name);
   const redacted = new Set(redactedColumns);
   return {
@@ -92,6 +106,6 @@ export function redactAgentRows(rows, schema = []) {
 }
 
 export function canExposeProfileRange(semantics, type) {
-  if (semantics?.sensitivity !== "non-sensitive") return false;
+  if (!["non-sensitive", "public", "internal"].includes(semantics?.sensitivity)) return false;
   return /BOOL|INT|DECIMAL|NUMERIC|DOUBLE|FLOAT|REAL|DATE|TIME/.test(String(type ?? "").toUpperCase());
 }

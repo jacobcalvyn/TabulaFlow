@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Check,
-  ChartBar,
   ClockCounterClockwise,
   CaretDown,
   CaretLeft,
@@ -43,13 +42,16 @@ import {
 import { createActivityEvent, findSupersededActivity, pageActivityEvents } from "./activityModel.js";
 import { schemaDelta } from "./schemaDelta.js";
 import { nextWorkspaceRevision } from "./workspaceRevision.js";
-import { classifyColumnSemantics, shouldRedactAgentValues } from "./dataPrivacy.js";
+import { resolveColumnSemantics, shouldRedactAgentValues } from "./dataPrivacy.js";
+import {
+  applySemanticModelToSchema,
+  createSemanticModel,
+  normalizeMetricDefinition,
+  reconcileSemanticModel,
+  updateSemanticField,
+} from "./semanticModel.js";
 import { useI18n } from "./i18n.jsx";
 import { ComposeScreen } from "./ComposeScreen.jsx";
-import { AnalyzeScreen } from "./AnalyzeScreen.jsx";
-import { ensureAnalyticsState, reconcileSemanticModel, updateSemanticField } from "./semanticModel.js";
-import { normalizeValidationRule, qualityGateStatus } from "./validationEngine.js";
-import { normalizeAnalysisDefinition } from "./analysisEngine.js";
 import { activatePreparedForFlow } from "./preparedActivation.js";
 import { getCloudAccount, getCloudFiles, openCloudFile, uploadCloudFile } from "./cloudFiles.js";
 import {
@@ -86,10 +88,10 @@ import {
 const PROTECTED_RECIPE_VALUE = "__tabulaflowProtectedValue";
 
 function protectRecipeForAgent(recipe = [], schema = []) {
-  const types = new Map(schema.map((column) => [column.name, column.type]));
+  const columns = new Map(schema.map((column) => [column.name, column]));
   return recipe.map((step) => {
     const column = step.params?.column;
-    if (!column || !shouldRedactAgentValues(classifyColumnSemantics(column, types.get(column) ?? "VARCHAR"))) return structuredClone(step);
+    if (!column || !shouldRedactAgentValues(resolveColumnSemantics(columns.get(column) ?? { name: column, type: "VARCHAR" }))) return structuredClone(step);
     const params = { ...step.params };
     for (const key of ["value", "from", "to"]) {
       if (Object.hasOwn(params, key)) params[key] = { [PROTECTED_RECIPE_VALUE]: true };
@@ -114,23 +116,11 @@ function restoreProtectedRecipeValues(recipe = [], currentRecipe = []) {
 }
 
 function protectFiltersForAgent(filters = {}, schema = []) {
-  const types = new Map(schema.map((column) => [column.name, column.type]));
+  const columns = new Map(schema.map((column) => [column.name, column]));
   return Object.fromEntries(Object.entries(filters).map(([column, selection]) => {
-    if (!selection || !shouldRedactAgentValues(classifyColumnSemantics(column, types.get(column) ?? "VARCHAR"))) return [column, structuredClone(selection)];
+    if (!selection || !shouldRedactAgentValues(resolveColumnSemantics(columns.get(column) ?? { name: column, type: "VARCHAR" }))) return [column, structuredClone(selection)];
     return [column, { key: selection.valueRef ?? "[redacted]", label: "[redacted]", ...(selection.valueRef ? { valueRef: selection.valueRef } : {}) }];
   }));
-}
-
-function protectValidationRulesForAgent(rules = [], semanticModel = null) {
-  const fields = new Map((semanticModel?.fields ?? []).map((field) => [field.name, field]));
-  const protectCondition = (condition) => {
-    if (Array.isArray(condition?.all)) return { all: condition.all.map(protectCondition) };
-    if (Array.isArray(condition?.any)) return { any: condition.any.map(protectCondition) };
-    const field = fields.get(condition?.field);
-    if (!field || !["pii", "financial", "secret"].includes(field.sensitivity) || !Object.hasOwn(condition, "value")) return structuredClone(condition);
-    return { ...condition, value: "[redacted]" };
-  };
-  return rules.map((rule) => ({ ...structuredClone(rule), condition: protectCondition(rule.condition) }));
 }
 
 const ACCEPTED_FILES = ".xlsx,.xls,.csv,.json,.jsonl,.ndjson";
@@ -216,10 +206,6 @@ function Sidebar({ screen, collapsed, hasDataset, hasPrepared, hasFlow, onNaviga
           <span className="step-dot"><MagicWand weight="bold" /></span>
           {!collapsed && <span>{t("compose")}</span>}
         </button>
-        <button type="button" className={`step ${screen === "analyze" ? "step--active" : ""}`} onClick={() => onNavigate("analyze")} disabled={!hasPrepared} aria-current={screen === "analyze" ? "page" : undefined} title={t("analyzeData")}>
-          <span className="step-dot"><ChartBar weight="bold" /></span>
-          {!collapsed && <span>{t("analyze")}</span>}
-        </button>
       </nav>
 
       {screen === "data" && hasDataset && <div id="sidebar-steps" className="sidebar-steps-host" />}
@@ -297,11 +283,6 @@ const ACTIVITY_LABEL_KEYS = Object.freeze({
   delete_confirmed: "activityDeleteConfirmed",
   prepared_deleted: "activityPreparedDeleted",
   compose_operation_deleted: "activityOperationDeleted",
-  semantic_field_updated: "activitySemanticUpdated",
-  validation_rule_created: "activityValidationRuleCreated",
-  validation_rule_deleted: "activityValidationRuleDeleted",
-  dataset_validated: "activityDatasetValidated",
-  analysis_run: "activityAnalysisRun",
 });
 
 function AccountScreen({ onOpenFile, uploadRequestToken, onUploadRequestShown, activityEvents, activityLoading, activityError }) {
@@ -1901,9 +1882,6 @@ export function App() {
   const [composePreview, setComposePreview] = useState(null);
   const [composeLoading, setComposeLoading] = useState(false);
   const [composeError, setComposeError] = useState("");
-  const [analysisResult, setAnalysisResult] = useState(null);
-  const [analyticsBusy, setAnalyticsBusy] = useState(false);
-  const [analyticsError, setAnalyticsError] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [collapsed, setCollapsed] = useState(false);
@@ -2050,7 +2028,18 @@ export function App() {
       try {
         const stored = await loadStoredFlow();
         if (cancelled || !stored) return;
-        const cleaned = repairOverlappingNodePositions(removeBuiltInDemoData(validateFlowGraph(ensureAnalyticsState(stored))));
+        const storedFlow = structuredClone(stored);
+        storedFlow.semanticModels ??= {};
+        storedFlow.metricDefinitions ??= [];
+        delete storedFlow.validationRules;
+        delete storedFlow.validationRuns;
+        delete storedFlow.analyses;
+        storedFlow.preparedInputs = (storedFlow.preparedInputs ?? []).map((prepared) => {
+          const semanticModel = reconcileSemanticModel(storedFlow.semanticModels[prepared.id], prepared.id, prepared.schema ?? []);
+          storedFlow.semanticModels[prepared.id] = semanticModel;
+          return { ...prepared, schema: applySemanticModelToSchema(prepared.schema ?? [], semanticModel) };
+        });
+        const cleaned = repairOverlappingNodePositions(removeBuiltInDemoData(validateFlowGraph(storedFlow)));
         const consolidated = consolidateDuplicateFileSources(cleaned);
         await migrateConsolidatedSourceHandles(consolidated.sourceIdMap);
         const restored = markSourcesUnlinked(consolidated.graph);
@@ -2157,25 +2146,6 @@ export function App() {
     }];
   }), [activePreparedId, dataset?.filename, flow.preparedInputs, flow.sourceAssets]);
   const composeSchemaState = useMemo(() => hydrateComposeSchemas(flow), [flow]);
-  const analyticsTargetId = activePreparedId ?? flow.preparedInputs[0]?.id ?? null;
-  const analyticsPrepared = flow.preparedInputs.find((item) => item.id === analyticsTargetId) ?? null;
-  const analyticsSchema = analyticsPrepared?.schema ?? [];
-  const semanticModel = useMemo(
-    () => reconcileSemanticModel(flow.semanticModels?.[analyticsTargetId], analyticsTargetId, analyticsSchema),
-    [analyticsSchema, analyticsTargetId, flow.semanticModels],
-  );
-  const validationRules = useMemo(
-    () => (flow.validationRules ?? []).filter((rule) => rule.targetId === analyticsTargetId),
-    [analyticsTargetId, flow.validationRules],
-  );
-  const validationRun = useMemo(
-    () => (flow.validationRuns ?? []).find((run) => run.targetId === analyticsTargetId) ?? null,
-    [analyticsTargetId, flow.validationRuns],
-  );
-  const savedAnalyses = useMemo(
-    () => (flow.analyses ?? []).filter((analysis) => analysis.targetId === analyticsTargetId),
-    [analyticsTargetId, flow.analyses],
-  );
 
   useEffect(() => {
     if (screen !== "compose" || composeSchemaState.graph === flow) return;
@@ -2295,7 +2265,6 @@ export function App() {
     });
     const nextFlow = {
       ...updated,
-      validationRuns: (updated.validationRuns ?? []).map((run) => run.targetId === preparedId ? { ...run, status: "stale" } : run),
       composeNodes: updated.composeNodes.map((node) => descendantIds.has(node.id)
         ? {
           ...node,
@@ -2405,116 +2374,6 @@ export function App() {
       if (throwOnError) throw cause;
     } finally {
       setLoading(false);
-    }
-  };
-
-  const selectAnalyticsTarget = async (preparedId) => {
-    await openPrepared(preparedId, null, true);
-    setScreen("analyze");
-    setAnalysisResult(null);
-    setAnalyticsError("");
-  };
-
-  const saveSemanticField = async (fieldName, changes, activityContext = null) => {
-    if (!analyticsTargetId) throw new Error("A prepared dataset is required.");
-    setAnalyticsBusy(true);
-    setAnalyticsError("");
-    try {
-      const current = reconcileSemanticModel(flowRef.current.semanticModels?.[analyticsTargetId], analyticsTargetId, analyticsSchema);
-      const nextModel = updateSemanticField(current, fieldName, changes);
-      await commitFlow({ ...flowRef.current, semanticModels: { ...(flowRef.current.semanticModels ?? {}), [analyticsTargetId]: nextModel } });
-      const activity = await recordActivity({ action: "semantic_field_updated", targetType: "prepared", targetId: analyticsTargetId }, activityContext ?? undefined);
-      return { semanticModel: nextModel, activity };
-    } catch (cause) {
-      setAnalyticsError(cause instanceof Error ? cause.message : "Semantic field could not be saved.");
-      throw cause;
-    } finally {
-      setAnalyticsBusy(false);
-    }
-  };
-
-  const createValidationRule = async (draft, activityContext = null) => {
-    if (!analyticsTargetId) throw new Error("A prepared dataset is required.");
-    setAnalyticsBusy(true);
-    setAnalyticsError("");
-    try {
-      const rule = normalizeValidationRule({ ...draft, targetId: analyticsTargetId }, analyticsSchema);
-      const nextFlow = {
-        ...flowRef.current,
-        validationRules: [...(flowRef.current.validationRules ?? []), rule],
-        validationRuns: (flowRef.current.validationRuns ?? []).filter((run) => run.targetId !== analyticsTargetId),
-      };
-      await commitFlow(nextFlow);
-      const activity = await recordActivity({ action: "validation_rule_created", targetType: "validation-rule", targetId: rule.id }, activityContext ?? undefined);
-      return { rule, activity };
-    } catch (cause) {
-      setAnalyticsError(cause instanceof Error ? cause.message : "Validation rule could not be created.");
-      throw cause;
-    } finally {
-      setAnalyticsBusy(false);
-    }
-  };
-
-  const deleteValidationRule = async (ruleId, activityContext = null) => {
-    setAnalyticsBusy(true);
-    setAnalyticsError("");
-    try {
-      const nextFlow = {
-        ...flowRef.current,
-        validationRules: (flowRef.current.validationRules ?? []).filter((rule) => rule.id !== ruleId),
-        validationRuns: (flowRef.current.validationRuns ?? []).filter((run) => run.targetId !== analyticsTargetId),
-      };
-      await commitFlow(nextFlow);
-      const activity = await recordActivity({ action: "validation_rule_deleted", targetType: "validation-rule", targetId: ruleId }, activityContext ?? undefined);
-      return { deleted: true, activity };
-    } finally {
-      setAnalyticsBusy(false);
-    }
-  };
-
-  const runDatasetValidation = async (activityContext = null) => {
-    if (!analyticsTargetId || validationRules.length === 0) throw new Error("At least one validation rule is required.");
-    setAnalyticsBusy(true);
-    setAnalyticsError("");
-    try {
-      const result = await worker.validateRules(analyticsTargetId, validationRules, semanticModel);
-      const run = {
-        id: globalThis.crypto?.randomUUID?.() ?? `validation-${Date.now()}`,
-        targetId: analyticsTargetId,
-        datasetRevision: analyticsPrepared?.recipeVersion ?? 0,
-        semanticModelRevision: semanticModel.revision,
-        status: "current",
-        gateStatus: qualityGateStatus(validationRules, result.results),
-        ...result,
-      };
-      await commitFlow({ ...flowRef.current, validationRuns: [run, ...(flowRef.current.validationRuns ?? []).filter((item) => item.targetId !== analyticsTargetId)].slice(0, 50) });
-      const activity = await recordActivity({ action: "dataset_validated", targetType: "prepared", targetId: analyticsTargetId, summary: { rowCount: result.populationCount } }, activityContext ?? undefined);
-      return { run, activity };
-    } catch (cause) {
-      setAnalyticsError(cause instanceof Error ? cause.message : "Dataset validation failed.");
-      throw cause;
-    } finally {
-      setAnalyticsBusy(false);
-    }
-  };
-
-  const runSavedAnalysis = async (draft, activityContext = null) => {
-    if (!analyticsTargetId) throw new Error("A prepared dataset is required.");
-    setAnalyticsBusy(true);
-    setAnalyticsError("");
-    try {
-      const definition = normalizeAnalysisDefinition({ ...draft, targetId: analyticsTargetId }, analyticsSchema, semanticModel);
-      const result = await worker.runAnalysis(analyticsTargetId, definition, semanticModel);
-      const currentAnalyses = flowRef.current.analyses ?? [];
-      await commitFlow({ ...flowRef.current, analyses: [...currentAnalyses.filter((item) => item.id !== definition.id), definition] });
-      setAnalysisResult({ ...result, definition, datasetRevision: analyticsPrepared?.recipeVersion ?? 0, semanticModelRevision: semanticModel.revision });
-      const activity = await recordActivity({ action: "analysis_run", targetType: "analysis", targetId: definition.id, summary: { rowCount: result.rows.length, columnCount: result.columns.length } }, activityContext ?? undefined);
-      return { definition, result, activity };
-    } catch (cause) {
-      setAnalyticsError(cause instanceof Error ? cause.message : "Analysis failed.");
-      throw cause;
-    } finally {
-      setAnalyticsBusy(false);
     }
   };
 
@@ -2758,11 +2617,6 @@ export function App() {
       setScreen("compose");
       return { workspace, activePreparedId: activePreparedIdRef.current, activeNodeId: flowRef.current.activeNodeId, workspaceRevision: workspaceRevisionRef.current, activityCursor: activityEventsRef.current[0]?.sequence ?? 0 };
     }
-    if (workspace === "analyze") {
-      if (flowRef.current.preparedInputs.length === 0) throw new Error("Analyze requires at least one prepared dataset.");
-      setScreen("analyze");
-      return { workspace, activePreparedId: activePreparedIdRef.current ?? flowRef.current.preparedInputs[0].id, activeNodeId: flowRef.current.activeNodeId, workspaceRevision: workspaceRevisionRef.current, activityCursor: activityEventsRef.current[0]?.sequence ?? 0 };
-    }
     if (workspace !== "prepare") throw new Error(`Unknown workspace: ${workspace}`);
     const preparedId = flowRef.current.preparedInputs.some((item) => item.id === flowRef.current.activeNodeId)
       ? flowRef.current.activeNodeId
@@ -2851,6 +2705,7 @@ export function App() {
 
   const getPrepareDatasetFromTool = async (preparedId) => {
     const prepared = assertActivePreparedForTool(preparedId);
+    const schemaByName = new Map((prepared?.schema ?? []).map((column) => [column.name, column]));
     return {
       preparedId,
       name: prepared?.name ?? dataset.filename,
@@ -2860,10 +2715,10 @@ export function App() {
       filteredRowCount: dataset.filteredCount,
       previewRowCount: dataset.preview.length,
       columnCount: dataset.columns.length,
-      schema: dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] ?? null })),
+      schema: dataset.columns.map((name) => schemaByName.get(name) ?? ({ name, type: dataset.columnTypes?.[name] ?? null })),
       aggregateColumns: [...dataset.aggregateColumns],
       hiddenAggregateColumnCount: dataset.hiddenAggregateColumnCount,
-      filters: protectFiltersForAgent(filters, dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] }))),
+      filters: protectFiltersForAgent(filters, dataset.columns.map((name) => schemaByName.get(name) ?? ({ name, type: dataset.columnTypes?.[name] }))),
       quality: structuredClone(dataset.quality),
       recipeStatus: prepared?.recipeStatus ?? null,
       workspaceRevision: workspaceRevisionRef.current,
@@ -2871,19 +2726,21 @@ export function App() {
   };
 
   const getDataProfileFromTool = async (preparedId, columns) => {
-    assertActivePreparedForTool(preparedId);
-    return runWebMcpRead(() => worker.profileData(columns));
+    const prepared = assertActivePreparedForTool(preparedId);
+    return runWebMcpRead(() => worker.profileData(columns, prepared.schema ?? []));
   };
 
   const queryColumnValuesFromTool = async (preparedId, column, search, options) => {
     assertActivePreparedForTool(preparedId);
     if (!dataset.columns.includes(column)) throw new Error(`Column not found: ${column}`);
-    return runWebMcpRead(() => worker.searchAggregateForAgent(column, search, filters, options));
+    const prepared = flowRef.current.preparedInputs.find((item) => item.id === preparedId);
+    return runWebMcpRead(() => worker.searchAggregateForAgent(column, search, filters, { ...options, semanticSchema: prepared?.schema ?? [] }));
   };
 
   const getPreparePreviewFromTool = async (preparedId, columns, options) => {
     assertActivePreparedForTool(preparedId);
-    return runWebMcpRead(() => worker.previewPrepared(filters, columns, { ...options, agentMode: true }));
+    const prepared = flowRef.current.preparedInputs.find((item) => item.id === preparedId);
+    return runWebMcpRead(() => worker.previewPrepared(filters, columns, { ...options, semanticSchema: prepared?.schema ?? [], agentMode: true }));
   };
 
   const getRecipeFromTool = async (preparedId) => {
@@ -2902,86 +2759,63 @@ export function App() {
     };
   };
 
-  const analyticsContextForTool = (preparedId) => {
-    const prepared = flowRef.current.preparedInputs.find((item) => item.id === preparedId);
-    if (!prepared) throw new Error(`Prepared dataset not found: ${preparedId}`);
-    const model = reconcileSemanticModel(flowRef.current.semanticModels?.[preparedId], preparedId, prepared.schema ?? []);
-    return { prepared, model, schema: prepared.schema ?? [] };
+  const getSemanticModelFromTool = async (targetId) => {
+    const target = [...flowRef.current.preparedInputs, ...flowRef.current.composeNodes].find((item) => item.id === targetId);
+    if (!target) throw new Error(`Semantic target not found: ${targetId}`);
+    const model = reconcileSemanticModel(flowRef.current.semanticModels?.[targetId], targetId, target.schema ?? []);
+    return { ...structuredClone(model), schema: structuredClone(applySemanticModelToSchema(target.schema ?? [], model)), workspaceRevision: workspaceRevisionRef.current };
   };
 
-  const getSemanticModelFromTool = async (preparedId) => {
-    const { prepared, model } = analyticsContextForTool(preparedId);
-    return { preparedId, name: prepared.name, semanticModel: structuredClone(model), workspaceRevision: workspaceRevisionRef.current };
-  };
-
-  const updateSemanticFieldFromTool = async (preparedId, fieldName, changes, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
-    const { model } = analyticsContextForTool(preparedId);
-    const nextModel = updateSemanticField(model, fieldName, changes);
-    assertCurrent();
-    await commitFlow({ ...flowRef.current, semanticModels: { ...(flowRef.current.semanticModels ?? {}), [preparedId]: nextModel } });
-    setScreen("analyze");
-    const activity = await recordActivity({ action: "semantic_field_updated", targetType: "prepared", targetId: preparedId }, webMcpActivity(meta));
-    return { preparedId, semanticRevision: nextModel.revision, field: structuredClone(nextModel.fields.find((item) => item.name === fieldName)), activity };
-  }, `semantic:update:${preparedId}:${fieldName}:${JSON.stringify(changes)}`);
-
-  const getValidationResultsFromTool = async (preparedId) => {
-    const { prepared, model } = analyticsContextForTool(preparedId);
-    return {
-      preparedId,
-      datasetRevision: prepared.recipeVersion ?? 0,
-      rules: protectValidationRulesForAgent((flowRef.current.validationRules ?? []).filter((rule) => rule.targetId === preparedId), model),
-      latestRun: structuredClone((flowRef.current.validationRuns ?? []).find((run) => run.targetId === preparedId) ?? null),
-      workspaceRevision: workspaceRevisionRef.current,
-    };
-  };
-
-  const upsertValidationRuleFromTool = async (preparedId, draft, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
-    const { schema } = analyticsContextForTool(preparedId);
-    const rule = normalizeValidationRule({ ...draft, targetId: preparedId }, schema);
-    const rules = flowRef.current.validationRules ?? [];
-    assertCurrent();
-    await commitFlow({
-      ...flowRef.current,
-      validationRules: [...rules.filter((item) => item.id !== rule.id), rule],
-      validationRuns: (flowRef.current.validationRuns ?? []).filter((run) => run.targetId !== preparedId),
-    });
-    setScreen("analyze");
-    const activity = await recordActivity({ action: "validation_rule_created", targetType: "validation-rule", targetId: rule.id }, webMcpActivity(meta));
-    return { preparedId, rule, activity };
-  }, `validation:upsert:${preparedId}:${JSON.stringify(draft)}`);
-
-  const validateDatasetFromTool = async (preparedId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
-    const { prepared, model } = analyticsContextForTool(preparedId);
-    const rules = (flowRef.current.validationRules ?? []).filter((rule) => rule.targetId === preparedId);
-    if (!rules.length) throw new Error(`No validation rules exist for prepared dataset ${preparedId}.`);
-    const result = await worker.validateRules(preparedId, rules, model);
-    const run = {
-      id: globalThis.crypto?.randomUUID?.() ?? `validation-${Date.now()}`,
-      targetId: preparedId,
-      datasetRevision: prepared.recipeVersion ?? 0,
-      semanticModelRevision: model.revision,
-      status: "current",
-      gateStatus: qualityGateStatus(rules, result.results),
-      ...result,
+  const updateSemanticFieldFromTool = async (targetId, fieldName, changes, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    const graph = flowRef.current;
+    const target = [...graph.preparedInputs, ...graph.composeNodes].find((item) => item.id === targetId);
+    if (!target) throw new Error(`Semantic target not found: ${targetId}`);
+    const currentModel = reconcileSemanticModel(graph.semanticModels?.[targetId], targetId, target.schema ?? []);
+    const nextModel = updateSemanticField(currentModel, fieldName, changes);
+    const withModel = {
+      ...graph,
+      semanticModels: { ...(graph.semanticModels ?? {}), [targetId]: nextModel },
+      preparedInputs: graph.preparedInputs.map((item) => item.id === targetId ? { ...item, schema: applySemanticModelToSchema(item.schema ?? [], nextModel) } : item),
+      composeNodes: graph.composeNodes.map((item) => item.id === targetId ? { ...item, schema: applySemanticModelToSchema(item.schema ?? [], nextModel), lastValidSchema: applySemanticModelToSchema(item.lastValidSchema ?? item.schema ?? [], nextModel) } : item),
+      revision: graph.revision + 1,
+      updatedAt: new Date().toISOString(),
     };
     assertCurrent();
-    await commitFlow({ ...flowRef.current, validationRuns: [run, ...(flowRef.current.validationRuns ?? []).filter((item) => item.targetId !== preparedId)].slice(0, 50) });
-    setScreen("analyze");
-    const activity = await recordActivity({ action: "dataset_validated", targetType: "prepared", targetId: preparedId, summary: { rowCount: result.populationCount } }, webMcpActivity(meta));
-    return { run, activity };
-  }, `validation:run:${preparedId}`);
+    const hydrated = hydrateComposeSchemas(withModel).graph;
+    await commitFlow(hydrated);
+    await recordActivity({ action: "semantic_field_updated", targetType: target.kind ? "compose-node" : "prepared", targetId, summary: { fieldName, fieldsChanged: Object.keys(changes) } }, webMcpActivity(meta));
+    return { targetId, fieldName, field: nextModel.fields[fieldName], semanticRevision: nextModel.revision };
+  }, `semantic:update:${targetId}:${fieldName}:${JSON.stringify(changes)}`);
 
-  const runAnalysisFromTool = async (preparedId, draft, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
-    const { prepared, model, schema } = analyticsContextForTool(preparedId);
-    const definition = normalizeAnalysisDefinition({ ...draft, targetId: preparedId }, schema, model);
-    const result = await worker.runAnalysis(preparedId, definition, model, { agentMode: true });
+  const listMetricDefinitionsFromTool = async (targetId) => {
+    await getSemanticModelFromTool(targetId);
+    return { targetId, metrics: structuredClone((flowRef.current.metricDefinitions ?? []).filter((item) => item.targetId === targetId)), workspaceRevision: workspaceRevisionRef.current };
+  };
+
+  const upsertMetricDefinitionFromTool = async (definition, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    const graph = flowRef.current;
+    const target = [...graph.preparedInputs, ...graph.composeNodes].find((item) => item.id === definition.targetId);
+    if (!target) throw new Error(`Metric target not found: ${definition.targetId}`);
+    const metric = normalizeMetricDefinition(definition, target.schema ?? []);
+    const existing = graph.metricDefinitions ?? [];
+    const nextMetrics = existing.some((item) => item.id === metric.id)
+      ? existing.map((item) => item.id === metric.id ? { ...item, ...metric } : item)
+      : [...existing, metric];
     assertCurrent();
-    await commitFlow({ ...flowRef.current, analyses: [...(flowRef.current.analyses ?? []).filter((item) => item.id !== definition.id), definition] });
-    setAnalysisResult({ ...result, definition, datasetRevision: prepared.recipeVersion ?? 0, semanticModelRevision: model.revision });
-    setScreen("analyze");
-    const activity = await recordActivity({ action: "analysis_run", targetType: "analysis", targetId: definition.id, summary: { rowCount: result.rows.length, columnCount: result.columns.length } }, webMcpActivity(meta));
-    return { definition, result, activity };
-  }, `analysis:run:${preparedId}:${JSON.stringify(draft)}`);
+    await commitFlow({ ...graph, metricDefinitions: nextMetrics, revision: graph.revision + 1, updatedAt: new Date().toISOString() });
+    await recordActivity({ action: "metric_definition_saved", targetType: "metric", targetId: metric.id, summary: { targetId: metric.targetId, function: metric.function } }, webMcpActivity(meta));
+    return { metric };
+  }, `metric:upsert:${definition.id ?? "new"}:${JSON.stringify(definition)}`);
+
+  const deleteMetricDefinitionFromTool = async (id, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    const graph = flowRef.current;
+    const metric = (graph.metricDefinitions ?? []).find((item) => item.id === id);
+    if (!metric) throw new Error(`Metric definition not found: ${id}`);
+    assertCurrent();
+    await commitFlow({ ...graph, metricDefinitions: graph.metricDefinitions.filter((item) => item.id !== id), revision: graph.revision + 1, updatedAt: new Date().toISOString() });
+    await recordActivity({ action: "metric_definition_deleted", targetType: "metric", targetId: id, summary: { targetId: metric.targetId } }, webMcpActivity(meta));
+    return { id, deleted: true };
+  }, `metric:delete:${id}`);
 
   const previewRecipeChangeFromTool = async (preparedId, recipe, stepIndex, { previewColumns, previewLimit = 10 } = {}) => {
     assertActivePreparedForTool(preparedId);
@@ -3041,6 +2875,12 @@ export function App() {
     return runWebMcpRead(() => worker.previewCompose(flowRef.current, nodeId, { columns, ...options, agentMode: true }));
   };
 
+  const getComposeNodeQualityFromTool = async (nodeId) => {
+    await getComposeNodeFromTool(nodeId);
+    const result = await runWebMcpRead(() => worker.composeNodeQuality(flowRef.current, nodeId));
+    return { ...result, workspaceRevision: workspaceRevisionRef.current };
+  };
+
   const getConnectionOptionsFromTool = async (nodeId) => {
     await getComposeNodeFromTool(nodeId);
     const result = await runWebMcpRead(() => worker.composeConnectionOptions(flowRef.current, nodeId));
@@ -3051,10 +2891,10 @@ export function App() {
     if (!targetId) return {
       workspace: screen === "input" ? "source" : screen === "data" ? "prepare" : screen,
       workspaceRevision: workspaceRevisionRef.current,
-      actions: screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "analyze" ? ["inspect-semantic-model", "update-semantic-field", "manage-validation-rules", "validate-dataset", "run-analysis", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", "inspect-activity"],
+      actions: screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", "inspect-activity"],
     };
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === targetId);
-    if (prepared) return { targetId, kind: "dataset", actions: ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "export", "inspect-semantic-model", "update-semantic-field", "manage-validation-rules", "validate-dataset", "run-analysis", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
+    if (prepared) return { targetId, kind: "dataset", actions: ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "export", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
     const operation = flowRef.current.composeNodes.find((item) => item.id === targetId);
     if (operation) return { targetId, kind: operation.kind, actions: ["inspect", "preview", "update", "export", "promote-result", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
     throw new Error(`Target not found: ${targetId}`);
@@ -3193,8 +3033,15 @@ export function App() {
     } else {
       inputIds = [operation.inputId];
       if (operation.kind === "filter-rows") config = { conjunction: "and", conditions: [{ column: operation.column, operator: operation.operator, ...(operation.value !== undefined ? { value: operation.value } : {}) }] };
-      if (operation.kind === "distinct-rows") config = { columns: operation.columns };
-      if (operation.kind === "aggregate") config = { groupBy: operation.groupBy ?? [], measures: [{ function: operation.function, ...(operation.measureColumn ? { column: operation.measureColumn } : {}), alias: operation.alias }] };
+      if (operation.kind === "distinct-rows") config = { columns: operation.columns, mode: operation.mode ?? "representative-rows" };
+      if (operation.kind === "aggregate") config = {
+        groupBy: operation.groupBy ?? [],
+        measures: operation.metrics
+          ? operation.metrics.map((metric) => ({ function: metric.function, ...(metric.measureColumn ? { column: metric.measureColumn } : {}), alias: metric.alias, ...(metric.percentile !== undefined ? { percentile: metric.percentile } : {}) }))
+          : [{ function: operation.function, ...(operation.measureColumn ? { column: operation.measureColumn } : {}), alias: operation.alias }],
+        minimumSampleSize: operation.minimumSampleSize ?? 1,
+        suppressSmallGroups: operation.suppressSmallGroups === true,
+      };
       if (operation.kind === "pivot") config = { groupBy: operation.groupBy ?? [], pivotColumn: operation.pivotColumn, valueColumn: operation.valueColumn, aggregate: operation.aggregate, values: operation.values };
       if (operation.kind === "unpivot") config = { idColumns: operation.idColumns ?? [], valueColumns: operation.valueColumns, nameColumn: operation.fieldColumn, valueColumn: operation.valueColumn };
     }
@@ -3315,7 +3162,6 @@ export function App() {
       diagnostics: [
         ...(error ? [{ scope: "source-or-prepare", level: "error", message: error }] : []),
         ...(composeError ? [{ scope: "compose", level: "error", message: composeError }] : []),
-        ...(analyticsError ? [{ scope: "analyze", level: "error", message: analyticsError }] : []),
         ...(recipeRecovery.error ? [{ scope: "recipe", level: "error", message: recipeRecovery.error, stepId: recipeRecovery.invalidStepId }] : []),
         ...(activityError ? [{ scope: "activity", level: "warning", message: "Shared activity history is unavailable." }] : []),
       ],
@@ -3333,7 +3179,7 @@ export function App() {
         previewRowCount: dataset.preview.length,
         columnCount: dataset.columns.length,
         columns: [...dataset.columns],
-        schema: dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] ?? null })),
+        schema: dataset.columns.map((name) => flow.preparedInputs.find((item) => item.id === activePreparedId)?.schema?.find((column) => column.name === name) ?? ({ name, type: dataset.columnTypes?.[name] ?? null })),
         filterableColumns: [...dataset.aggregateColumns],
         filterableColumnsTruncated: dataset.aggregateColumns.length < dataset.columns.length,
         filters: protectFiltersForAgent(filters, dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] }))),
@@ -3359,27 +3205,20 @@ export function App() {
         ...flow.composeNodes.map((item) => ({ id: item.id, name: item.name, kind: item.kind, inputIds: [...item.inputIds], totalRowCount: item.rowCount, columnCount: item.schema?.length ?? null, validationStatus: item.validationStatus ?? null, dataStatus: item.dataStatus ?? "ready" })),
       ],
       sourceAssets: flow.sourceAssets.map((item) => ({ id: item.id, name: item.name, location: item.location, status: item.status, size: item.size ?? null })),
-      analyze: analyticsTargetId ? {
-        targetId: analyticsTargetId,
-        semanticRevision: semanticModel.revision,
-        validationRuleCount: validationRules.length,
-        qualityGateStatus: validationRun?.gateStatus ?? "not-evaluated",
-        savedAnalysisCount: savedAnalyses.length,
-      } : null,
     },
     actions: {
       openWorkspace,
       getAvailableActions: getAvailableActionsFromTool,
       getActivityLog: getActivityLogFromTool,
       getChangesSince: getChangesSinceFromTool,
+      getOperationStatus: (operationId) => webMcpMutationRunnerRef.current.getOperationStatus(operationId),
       selectPrepared: selectPreparedFromTool,
       getRecipe: getRecipeFromTool,
       getSemanticModel: getSemanticModelFromTool,
       updateSemanticField: updateSemanticFieldFromTool,
-      getValidationResults: getValidationResultsFromTool,
-      upsertValidationRule: upsertValidationRuleFromTool,
-      validateDataset: validateDatasetFromTool,
-      runAnalysis: runAnalysisFromTool,
+      listMetricDefinitions: listMetricDefinitionsFromTool,
+      upsertMetricDefinition: upsertMetricDefinitionFromTool,
+      deleteMetricDefinition: deleteMetricDefinitionFromTool,
       duplicatePrepared: duplicatePreparedFromTool,
       replaceRecipe: replaceRecipeFromTool,
       getPrepareDataset: getPrepareDatasetFromTool,
@@ -3395,6 +3234,7 @@ export function App() {
       getComposeGraph: getComposeGraphFromTool,
       getComposeNode: getComposeNodeFromTool,
       getComposeNodePreview: getComposeNodePreviewFromTool,
+      getComposeNodeQuality: getComposeNodeQualityFromTool,
       validateComposeOperation: validateComposeOperationFromTool,
       getConnectionOptions: getConnectionOptionsFromTool,
       requestSourceFileSelection,
@@ -3468,28 +3308,10 @@ export function App() {
           onCreatePrepared={createPreparationFromCompose}
           onEditPreparation={openPrepared}
           onExport={exportComposeNode}
+          onGetNodeQuality={getComposeNodeQualityFromTool}
           deleteRequest={webMcpDeleteRequest?.target === "recipe-step" ? null : webMcpDeleteRequest}
           onDeleteRequestShown={acknowledgeDeleteRequest}
           onDeleteConfirmation={resolveDeleteConfirmation}
-        />
-      ) : screen === "analyze" ? (
-        <AnalyzeScreen
-          preparedOptions={preparedOptions}
-          targetId={analyticsTargetId}
-          schema={analyticsSchema}
-          semanticModel={semanticModel}
-          rules={validationRules}
-          validationRun={validationRun}
-          analyses={savedAnalyses}
-          analysisResult={analysisResult}
-          busy={analyticsBusy}
-          error={analyticsError}
-          onTargetChange={selectAnalyticsTarget}
-          onSaveSemanticField={saveSemanticField}
-          onCreateRule={createValidationRule}
-          onDeleteRule={deleteValidationRule}
-          onRunValidation={runDatasetValidation}
-          onRunAnalysis={runSavedAnalysis}
         />
       ) : dataset ? (
         <DataScreen

@@ -229,7 +229,8 @@ test("creates an independent prepared dataset from a Compose result", () => {
   assert.equal(created.sourceAsset.upstreamNodeId, joined.node.id);
   assert.equal(created.preparedInput.name, "Orders joined prepared");
   assert.deepEqual(created.preparedInput.recipe, []);
-  assert.deepEqual(created.preparedInput.schema, [{ name: "id_left", type: "VARCHAR" }]);
+  assert.deepEqual(created.preparedInput.schema.map(({ name, type }) => ({ name, type })), [{ name: "id_left", type: "VARCHAR" }]);
+  assert.equal(created.preparedInput.schema[0].semantic.provenance.nodeId, joined.node.id);
   assert.deepEqual(created.preparedInput.position, { x: 920, y: 120 });
   assert.equal(created.graph.activeNodeId, created.preparedInput.id);
   assert.equal(isFlowFileSource(created.sourceAsset), false);

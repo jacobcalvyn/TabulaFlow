@@ -86,3 +86,23 @@ test("allows a failed mutation to be retried with the same key", async () => {
   assert.equal(attempts, 2);
   assert.equal(result.ok, true);
 });
+
+test("acknowledges long mutations asynchronously and exposes terminal status", async () => {
+  let revision = 10;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const run = createWebMcpMutationRunner({ getRevision: () => revision });
+  const accepted = await run({ expectedRevision: 10, requestId: "async-recipe-001", executionMode: "async" }, async () => {
+    await gate;
+    revision += 1;
+    return { recipeRevision: 4 };
+  }, "recipe:replace");
+  assert.equal(accepted.status, "accepted");
+  assert.equal(run.getOperationStatus(accepted.operationId).status, "running");
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const completed = run.getOperationStatus(accepted.operationId);
+  assert.equal(completed.status, "committed");
+  assert.equal(completed.result.recipeRevision, 4);
+  assert.equal(completed.result.workspaceRevision, 11);
+});
