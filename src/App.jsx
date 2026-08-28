@@ -10,12 +10,15 @@ import {
   FileJs,
   FileXls,
   GlobeSimple,
+  CloudArrowUp,
+  FolderOpen,
   MagnifyingGlass,
   MagicWand,
   Rows,
   ShieldCheck,
   UploadSimple,
   WarningCircle,
+  UserCircle,
   X,
 } from "@phosphor-icons/react";
 import { formatValue, isSupportedFile } from "./data.js";
@@ -33,6 +36,7 @@ import {
 import { useI18n } from "./i18n.jsx";
 import { ComposeScreen } from "./ComposeScreen.jsx";
 import { activatePreparedForFlow } from "./preparedActivation.js";
+import { getCloudAccount, getCloudFiles, openCloudFile, uploadCloudFile } from "./cloudFiles.js";
 import {
   PREPARED_RECIPE_STATUS,
   recipeForExecution,
@@ -153,7 +157,18 @@ function Sidebar({ screen, collapsed, hasDataset, hasPrepared, hasFlow, onNaviga
 
       <div className="sidebar-bottom-grid">
         <button
-          className="language-selector"
+          className={`sidebar-footer-action ${screen === "account" ? "sidebar-footer-action--active" : ""}`}
+          type="button"
+          onClick={() => onNavigate("account")}
+          aria-current={screen === "account" ? "page" : undefined}
+          aria-label={t("account")}
+          title={t("account")}
+        >
+          <UserCircle weight="bold" />
+          <span>{t("account")}</span>
+        </button>
+        <button
+          className="sidebar-footer-action"
           type="button"
           onClick={() => setLanguage(language === "en" ? "id" : "en")}
           aria-label={t("switchLanguage", { language: language === "en" ? t("indonesian") : t("english") })}
@@ -169,6 +184,137 @@ function Sidebar({ screen, collapsed, hasDataset, hasPrepared, hasFlow, onNaviga
         {!collapsed && <span>{t("hideSidebar")}</span>}
       </button>
     </aside>
+  );
+}
+
+function formatBytes(value, locale) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length);
+  const amount = bytes / (1024 ** exponent);
+  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: amount >= 10 ? 1 : 2 }).format(amount)} ${units[exponent - 1]}`;
+}
+
+function AccountScreen({ onOpenFile }) {
+  const { language, t } = useI18n();
+  const locale = language === "id" ? "id-ID" : "en-US";
+  const inputRef = useRef(null);
+  const [account, setAccount] = useState(null);
+  const [files, setFiles] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const nextAccount = await getCloudAccount();
+      setAccount(nextAccount);
+      if (nextAccount.authenticated) {
+        const result = await getCloudFiles();
+        setFiles(result.files ?? []);
+      } else {
+        setFiles([]);
+      }
+    } catch (cause) {
+      setAccount({ authenticated: false });
+      setFiles([]);
+      setError(cause instanceof Error ? cause.message : t("cloudUnavailable"));
+    } finally {
+      setLoading(false);
+    }
+  }, [t]);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  const upload = async (file) => {
+    if (!file) return;
+    setBusy(true);
+    setError("");
+    try {
+      await uploadCloudFile(file);
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("cloudUploadFailed"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const open = async (file) => {
+    setBusy(true);
+    setError("");
+    try {
+      await onOpenFile(await openCloudFile(file));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("cloudOpenFailed"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const used = account?.storage?.usedBytes ?? 0;
+  const quota = account?.storage?.quotaBytes ?? 0;
+  const percentage = quota > 0 ? Math.min(100, (used / quota) * 100) : 0;
+
+  return (
+    <main className="account-screen">
+      <header className="account-header">
+        <div>
+          <h1>{t("account")}</h1>
+          <p>{t("accountDescription")}</p>
+        </div>
+      </header>
+
+      {loading ? <p className="account-state">{t("loading")}</p> : !account?.authenticated ? (
+        <section className="account-guest-card">
+          <span className="account-hero-icon"><CloudArrowUp weight="duotone" /></span>
+          <h2>{t("cloudOptionalTitle")}</h2>
+          <p>{t("cloudOptionalDescription")}</p>
+          <a className="button button--primary" href="/signin-with-chatgpt?return_to=%2F%3Faccount%3D1">{t("signInChatGPT")}</a>
+          <small>{t("localWithoutLogin")}</small>
+        </section>
+      ) : (
+        <div className="account-content">
+          <section className="account-card account-profile-card">
+            <div className="account-card__heading">
+              <div><h2>{t("profileAccount")}</h2><p>{t("readOnlyAccount")}</p></div>
+              <a href="/signout-with-chatgpt?return_to=/">{t("signOut")}</a>
+            </div>
+            <dl className="account-details">
+              <div><dt>{t("name")}</dt><dd>{account.account?.name || account.account?.email || "—"}</dd></div>
+              <div><dt>{t("email")}</dt><dd>{account.account?.email || "—"}</dd></div>
+            </dl>
+          </section>
+
+          <section className="account-card account-storage-card">
+            <div className="account-card__heading">
+              <div><h2>{t("cloudStorage")}</h2><p>{t("cloudStorageDescription")}</p></div>
+              <strong>{formatBytes(used, locale)} / {formatBytes(quota, locale)}</strong>
+            </div>
+            <div className="storage-track" aria-label={t("storageUsage")} aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(percentage)} role="progressbar"><span style={{ width: `${percentage}%` }} /></div>
+            <p>{t("cloudFileCount", { count: account.storage?.fileCount ?? 0 })}</p>
+          </section>
+
+          <section className="account-card cloud-files-card">
+            <div className="account-card__heading">
+              <div><h2>{t("cloudFiles")}</h2><p>{t("cloudFilesDescription")}</p></div>
+              <button className="button button--secondary" type="button" disabled={busy} onClick={() => inputRef.current?.click()}><CloudArrowUp weight="bold" /> {t("uploadToCloud")}</button>
+              <input ref={inputRef} type="file" accept={ACCEPTED_FILES} hidden onChange={(event) => { void upload(event.target.files?.[0]); event.target.value = ""; }} />
+            </div>
+            {files.length ? <ul className="cloud-file-list">{files.map((file) => (
+              <li key={file.id}>
+                <div><strong>{file.name}</strong><span>{formatBytes(file.size, locale)} · {new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(file.createdAt))}</span></div>
+                <button type="button" disabled={busy} onClick={() => void open(file)}><FolderOpen weight="bold" /> {t("open")}</button>
+              </li>
+            ))}</ul> : <p className="account-empty">{t("noCloudFiles")}</p>}
+          </section>
+        </div>
+      )}
+      {error && <p className="error-message" role="alert">{error}</p>}
+    </main>
   );
 }
 
@@ -1556,7 +1702,7 @@ export function App() {
   const { t } = useI18n();
   const worker = useDataWorker();
   const recipeHistory = useRecipeHistory();
-  const [screen, setScreen] = useState("input");
+  const [screen, setScreen] = useState(() => new URLSearchParams(window.location.search).get("account") === "1" ? "account" : "input");
   const [dataset, setDataset] = useState(null);
   const [filters, setFilters] = useState({});
   const [flow, setFlow] = useState(createFlowGraph);
@@ -2073,7 +2219,7 @@ export function App() {
   return (
     <div className={`app-shell ${collapsed ? "app-shell--collapsed" : ""}`}>
       <Sidebar screen={screen} collapsed={collapsed} hasDataset={Boolean(dataset)} hasPrepared={flow.preparedInputs.length > 0} hasFlow={flow.preparedInputs.length > 0} onNavigate={(nextScreen) => {
-        if (nextScreen === "input" || (nextScreen === "compose" && flow.preparedInputs.length)) {
+        if (nextScreen === "input" || nextScreen === "account" || (nextScreen === "compose" && flow.preparedInputs.length)) {
           setScreen(nextScreen);
           return;
         }
@@ -2084,7 +2230,9 @@ export function App() {
         if (preparedId) void openPrepared(preparedId);
       }} onCollapse={() => setCollapsed((value) => !value)} />
       {flowDirty && <div className="flow-save-alert" role="alert"><span>{t("flowSaveFailed")}</span><button type="button" disabled={retryingFlowSave} onClick={retryFlowSave}>{t(retryingFlowSave ? "saving" : "retrySave")}</button></div>}
-      {screen === "input" ? (
+      {screen === "account" ? (
+        <AccountScreen onOpenFile={async (file) => { setScreen("input"); await loadFile(file, null); }} />
+      ) : screen === "input" ? (
         <InputScreen
           loading={loading}
           error={error}
