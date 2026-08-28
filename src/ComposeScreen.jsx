@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CaretDown, CaretUp, CheckCircle, Copy, CornersOut, Database, DownloadSimple, FileXls, Intersect, LinkSimple, MagnifyingGlassMinus, MagnifyingGlassPlus, PencilSimple, PlugsConnected, SlidersHorizontal, Trash, TreeStructure, X } from "@phosphor-icons/react";
+import { CaretDown, CaretUp, CheckCircle, Copy, CornersOut, Database, DownloadSimple, FileXls, Intersect, LinkSimple, MagnifyingGlassMinus, MagnifyingGlassPlus, PencilSimple, PlugsConnected, Plus, SlidersHorizontal, Trash, TreeStructure, X } from "@phosphor-icons/react";
 import { MdJoinFull, MdJoinInner, MdJoinLeft, MdJoinRight } from "react-icons/md";
 import { useI18n } from "./i18n.jsx";
 
@@ -328,14 +328,14 @@ function UnaryOperationInspector({ operation, flow, byId, position, onCancel, on
             <label className="compose-checkbox-field"><input type="checkbox" checked={suppressSmallGroups} disabled={!groupColumn} onChange={(event) => setSuppressSmallGroups(event.target.checked)} /><span>{t("suppressSmallGroups")}</span></label>
           </div>
           <div className="compose-metric-list">
-            {aggregateMeasures.map((measure, index) => <div className="compose-metric-row" key={index}>
+            {aggregateMeasures.map((measure, index) => <div className={`compose-metric-row compose-metric-row--${measure.function}`} key={index}>
               <label><span>{t("aggregateFunction")}</span><select value={measure.function} onChange={(event) => updateAggregateMeasure(index, { function: event.target.value, column: measure.column || names[0] || "" })}>{aggregateFunctions.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
               {measure.function !== "count" && <label><span>{t("measure")}</span><select value={measure.column || names[0] || ""} onChange={(event) => updateAggregateMeasure(index, { column: event.target.value })}>{names.map((name) => <option key={name}>{name}</option>)}</select></label>}
               {measure.function === "percentile" && <label><span>{t("percentile")}</span><input type="number" min="0.01" max="0.99" step="0.01" value={measure.percentile} onChange={(event) => updateAggregateMeasure(index, { percentile: event.target.value })} /></label>}
               <label><span>{t("alias")}</span><input value={measure.alias} onChange={(event) => updateAggregateMeasure(index, { alias: event.target.value })} /></label>
               <button type="button" className="compose-metric-row__remove" aria-label={t("removeMetric")} disabled={aggregateMeasures.length === 1} onClick={() => setAggregateMeasures((current) => current.filter((_, measureIndex) => measureIndex !== index))}><Trash /></button>
             </div>)}
-            <button type="button" className="compose-add-metric" onClick={() => setAggregateMeasures((current) => [...current, { function: "count", column: "", alias: `count_${current.length + 1}`, percentile: 0.9 }])}>+ {t("addMetric")}</button>
+            <button type="button" className="compose-add-metric" onClick={() => setAggregateMeasures((current) => [...current, { function: "count", column: "", alias: `count_${current.length + 1}`, percentile: 0.9 }])}><Plus weight="bold" />{t("addMetric")}</button>
           </div>
         </div>}
 
@@ -347,7 +347,13 @@ function UnaryOperationInspector({ operation, flow, byId, position, onCancel, on
           <label className="compose-unary-fields__wide"><span>{t("pivotValues")}</span><input value={pivotValues} onChange={(event) => setPivotValues(event.target.value)} placeholder="Jakarta, Bandung" /></label>
         </div>}
 
-        {kind === "distinct-rows" && <div className="compose-distinct-mode"><strong>{t("distinctOutputMode")}</strong><div><button type="button" className={distinctMode === "representative-rows" ? "is-active" : ""} onClick={() => setDistinctMode("representative-rows")}>{t("representativeRows")}</button><button type="button" className={distinctMode === "project-columns" ? "is-active" : ""} onClick={() => setDistinctMode("project-columns")}>{t("projectDistinctColumns")}</button></div></div>}
+        {kind === "distinct-rows" && <div className="compose-distinct-mode">
+          <strong>{t("distinctOutputMode")}</strong>
+          <div role="group" aria-label={t("distinctOutputMode")}>
+            <button type="button" className={distinctMode === "representative-rows" ? "is-active" : ""} aria-pressed={distinctMode === "representative-rows"} onClick={() => setDistinctMode("representative-rows")}>{t("representativeRows")}</button>
+            <button type="button" className={distinctMode === "project-columns" ? "is-active" : ""} aria-pressed={distinctMode === "project-columns"} onClick={() => setDistinctMode("project-columns")}>{t("projectDistinctColumns")}</button>
+          </div>
+        </div>}
         {(kind === "distinct-rows" || kind === "unpivot") && <div className="compose-checkbox-list"><strong>{t(kind === "distinct-rows" ? "comparisonColumns" : "unpivotColumns")}</strong><div>{schema.map((item) => <label key={item.name}><input type="checkbox" checked={selectedColumns.includes(item.name)} onChange={() => toggleColumn(item.name)} /><span>{item.name}</span><small>{item.type}</small></label>)}</div></div>}
         {kind === "unpivot" && <div className="compose-unary-fields"><label><span>{t("fieldColumnName")}</span><input value={fieldColumn} onChange={(event) => setFieldColumn(event.target.value)} /></label><label><span>{t("valueColumnName")}</span><input value={valueColumn} onChange={(event) => setValueColumn(event.target.value)} /></label></div>}
       </section>
@@ -474,6 +480,17 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
     window.addEventListener("keydown", cancel);
     return () => window.removeEventListener("keydown", cancel);
   }, []);
+
+  useEffect(() => {
+    if (!operation) return undefined;
+    const dismissInspector = (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target || target.closest(".compose-operation-builder")) return;
+      setOperation(null);
+    };
+    document.addEventListener("pointerdown", dismissInspector);
+    return () => document.removeEventListener("pointerdown", dismissInspector);
+  }, [operation]);
 
   const dismissConnection = () => {
     setConnectingFrom(null);

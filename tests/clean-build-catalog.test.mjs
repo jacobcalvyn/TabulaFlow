@@ -49,3 +49,14 @@ test("workspace flow and local file handles persist across refresh", () => {
   assert.match(appSource, /\brestoreFileFromHandle\b/);
   assert.match(appSource, /onRelinkSource/);
 });
+
+test("Formula column is grouped beside Choose columns in the aggregate heading", () => {
+  const aggregateHeading = appSource.indexOf('<header className="aggregate-heading">');
+  const formulaTrigger = appSource.indexOf('className="aggregate-heading__button aggregate-heading__button--formula"', aggregateHeading);
+  const columnPicker = appSource.indexOf('<div className="column-picker"', aggregateHeading);
+
+  assert.ok(aggregateHeading >= 0);
+  assert.ok(formulaTrigger > aggregateHeading);
+  assert.ok(columnPicker > formulaTrigger);
+  assert.doesNotMatch(appSource, /className="toolbar-actions"/);
+});

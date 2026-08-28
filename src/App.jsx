@@ -28,6 +28,7 @@ import { useDataWorker } from "./useDataWorker.js";
 import { useWebMcpTools } from "./useWebMcpTools.js";
 import { createWebMcpMutationRunner } from "./webMcpMutation.js";
 import { StepsPanel, TransformationForm } from "./StepsPanel.jsx";
+import { FormulaColumnEditor } from "./FormulaColumnEditor.jsx";
 import { useRecipeHistory } from "./useRecipeHistory.js";
 import { fileFromDroppedItem, isSameFileEntry, pickSourceFile, restoreFileFromHandle } from "./sourceFileHandles.js";
 import {
@@ -48,6 +49,7 @@ import {
   createSemanticModel,
   normalizeMetricDefinition,
   reconcileSemanticModel,
+  mergeFieldSemantics,
   updateSemanticField,
 } from "./semanticModel.js";
 import { useI18n } from "./i18n.jsx";
@@ -59,6 +61,7 @@ import {
   recipeForExecution,
 } from "./preparedRecipeState.js";
 import { createStep, CREATABLE_TRANSFORMATION_TYPES, valueRowActionParams } from "./transformations.js";
+import { getFormulaColumnReferences, validateFormula } from "./formulaEngine.js";
 import {
   addComposeNode,
   addPreparedInput,
@@ -162,10 +165,14 @@ const COLUMN_TYPE_OPTIONS = Object.freeze([
   { value: "TIMESTAMP", labelKey: "timestampType" },
 ]);
 
-function stepTouchesColumn(step, column) {
+function stepTouchesColumn(step, column, availableColumns = []) {
   const params = step.params ?? {};
-  const directFields = ["column", "leftColumn", "rightColumn", "valueColumn", "newName"];
+  const directFields = ["column", "leftColumn", "rightColumn", "valueColumn", "newName", "outputColumn"];
   if (directFields.some((field) => params[field] === column)) return true;
+  if (step.type === "calculated-field") {
+    const validation = validateFormula(params.expression, availableColumns.map((name) => ({ name, type: "UNKNOWN" })));
+    if (validation.valid && validation.referencedColumns.includes(column)) return true;
+  }
   return ["columns", "groupColumns"].some((field) => {
     const value = params[field];
     const columns = Array.isArray(value) ? value : String(value ?? "").split(",");
@@ -1311,10 +1318,15 @@ function DataScreen({
   const [stepPreview, setStepPreview] = useState(null);
   const [previewingStep, setPreviewingStep] = useState(false);
   const [preparedMenuOpen, setPreparedMenuOpen] = useState(false);
+  const [formulaEditorOpen, setFormulaEditorOpen] = useState(false);
+  const [formulaApplying, setFormulaApplying] = useState(false);
+  const [formulaError, setFormulaError] = useState("");
   const splitRef = useRef(null);
   const preparedSelectorRef = useRef(null);
   const columnPickerRef = useRef(null);
   const transformPopoverRef = useRef(null);
+  const formulaPopoverRef = useRef(null);
+  const formulaTriggerRef = useRef(null);
   const [sidebarStepsTarget, setSidebarStepsTarget] = useState(null);
   const activeFilterCount = Object.keys(filters).length;
   const filterSignature = JSON.stringify(filters);
@@ -1327,6 +1339,8 @@ function DataScreen({
     setPreparedMenuOpen(false);
     setColumnMenuOpen(false);
     setTransformPopover(null);
+    setFormulaEditorOpen(false);
+    setFormulaError("");
     setTransformError("");
     setAggregateColumns(dataset.aggregateColumns);
     setColumnDraft(dataset.aggregateColumns);
@@ -1403,6 +1417,27 @@ function DataScreen({
       window.removeEventListener("resize", closeOnViewportChange);
     };
   }, [transformPopover]);
+
+  useEffect(() => {
+    if (!formulaEditorOpen) return undefined;
+    const closeOnOutsideClick = (event) => {
+      if (formulaPopoverRef.current?.contains(event.target) || formulaTriggerRef.current?.contains(event.target)) return;
+      setFormulaEditorOpen(false);
+      setFormulaError("");
+    };
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") {
+        setFormulaEditorOpen(false);
+        setFormulaError("");
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick, true);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick, true);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [formulaEditorOpen]);
 
   const applyFilters = useCallback(async (nextFilters, nextAggregateColumns = aggregateColumns) => {
     setStepPreview(null);
@@ -1522,6 +1557,38 @@ function DataScreen({
       setInvalidStepId(step.id);
     } finally {
       setTransformApplying(false);
+    }
+  };
+
+  const previewFormulaStep = async (params, referencedColumns, stepId = null, editingRecipe = recipe) => {
+    const formulaStep = stepId
+      ? { ...editingRecipe.find((step) => step.id === stepId), type: "calculated-field", params }
+      : createStep("calculated-field", params);
+    const nextRecipe = stepId
+      ? editingRecipe.map((step) => step.id === stepId ? formulaStep : step)
+      : [...editingRecipe, formulaStep];
+    const stepIndex = nextRecipe.findIndex((step) => step.id === formulaStep.id);
+    const columns = [...new Set([...referencedColumns.slice(0, 3), params.outputColumn])];
+    return onRecipePreview(nextRecipe, stepIndex, { columns, limit: 10 });
+  };
+
+  const addFormulaColumn = async (params) => {
+    const step = createStep("calculated-field", params);
+    setFormulaApplying(true);
+    setFormulaError("");
+    setRecipeError("");
+    setInvalidStepId(null);
+    try {
+      const result = await onRecipeChange([...recipe, step]);
+      acceptRecipeResult(result);
+      setFormulaEditorOpen(false);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : t("formulaApplyFailed");
+      setFormulaError(message);
+      setRecipeError(message);
+      setInvalidStepId(step.id);
+    } finally {
+      setFormulaApplying(false);
     }
   };
 
@@ -1698,6 +1765,22 @@ function DataScreen({
         </div>
       </header>
 
+      {formulaEditorOpen && createPortal(
+        <section ref={formulaPopoverRef} className="formula-column-popover" aria-label={t("formulaColumn")}>
+          <FormulaColumnEditor
+            schema={dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] ?? "UNKNOWN" }))}
+            title={t("formulaColumn")}
+            submitLabel={t("add")}
+            applying={formulaApplying}
+            error={formulaError}
+            onPreview={(params, referencedColumns) => previewFormulaStep(params, referencedColumns)}
+            onSubmit={addFormulaColumn}
+            onCancel={() => { setFormulaEditorOpen(false); setFormulaError(""); }}
+          />
+        </section>,
+        document.body,
+      )}
+
       {transformPopover && createPortal(
         <section
           ref={transformPopoverRef}
@@ -1752,40 +1835,47 @@ function DataScreen({
               <h2 id="aggregate-title">{t("aggregateTitle")}</h2>
               {dataset.columns.length > aggregateColumns.length && <span>{t("columnsShown", { shown: aggregateColumns.length, total: dataset.columns.length })}</span>}
             </div>
-            <div className="column-picker" ref={columnPickerRef}>
-              <button type="button" className="column-picker__trigger" onClick={() => {
-                setColumnDraft(aggregateColumns);
-                setColumnQuery("");
-                setColumnMenuOpen((value) => !value);
-              }} aria-expanded={columnMenuOpen}>
-                <Rows weight="bold" /> {t("chooseColumns")} <CaretDown weight="bold" />
+            <div className="aggregate-heading__actions">
+              <button ref={formulaTriggerRef} className="aggregate-heading__button aggregate-heading__button--formula" type="button" onClick={() => { setColumnMenuOpen(false); setTransformPopover(null); setPreparedMenuOpen(false); setFormulaError(""); setFormulaEditorOpen((current) => !current); }} disabled={loading || recipeApplying} aria-label={t("formulaColumn")} title={t("formulaColumn")} aria-expanded={formulaEditorOpen}>
+                <MagicWand weight="bold" /> {t("formulaColumn")}
               </button>
-              {columnMenuOpen && (
-                <div className="column-picker__menu" role="dialog" aria-label={t("aggregateColumnPicker")}>
-                  <header><strong>{t("miniTableColumns")}</strong><span>{t("maximum", { count: dataset.aggregateColumnLimit })}</span></header>
-                  <label className="column-picker__search"><MagnifyingGlass /><input value={columnQuery} onChange={(event) => setColumnQuery(event.target.value)} placeholder={t("searchColumns")} aria-label={t("searchColumns")} /></label>
-                  <div className="column-picker__bulk-actions" aria-label={t("columnSelectionActions")}>
-                    <button
-                      type="button"
-                      onClick={() => setColumnDraft(dataset.columns.slice(0, dataset.aggregateColumnLimit))}
-                      disabled={columnDraft.length === Math.min(dataset.columns.length, dataset.aggregateColumnLimit)}
-                    >
-                      {t("selectAll")}
-                    </button>
-                    <button type="button" onClick={() => setColumnDraft([])} disabled={columnDraft.length === 0}>
-                      {t("unselectAll")}
-                    </button>
+              <div className="column-picker" ref={columnPickerRef}>
+                <button type="button" className="column-picker__trigger" onClick={() => {
+                  setFormulaEditorOpen(false);
+                  setFormulaError("");
+                  setColumnDraft(aggregateColumns);
+                  setColumnQuery("");
+                  setColumnMenuOpen((value) => !value);
+                }} aria-expanded={columnMenuOpen}>
+                  <Rows weight="bold" /> {t("chooseColumns")} <CaretDown weight="bold" />
+                </button>
+                {columnMenuOpen && (
+                  <div className="column-picker__menu" role="dialog" aria-label={t("aggregateColumnPicker")}>
+                    <header><strong>{t("miniTableColumns")}</strong><span>{t("maximum", { count: dataset.aggregateColumnLimit })}</span></header>
+                    <label className="column-picker__search"><MagnifyingGlass /><input value={columnQuery} onChange={(event) => setColumnQuery(event.target.value)} placeholder={t("searchColumns")} aria-label={t("searchColumns")} /></label>
+                    <div className="column-picker__bulk-actions" aria-label={t("columnSelectionActions")}>
+                      <button
+                        type="button"
+                        onClick={() => setColumnDraft(dataset.columns.slice(0, dataset.aggregateColumnLimit))}
+                        disabled={columnDraft.length === Math.min(dataset.columns.length, dataset.aggregateColumnLimit)}
+                      >
+                        {t("selectAll")}
+                      </button>
+                      <button type="button" onClick={() => setColumnDraft([])} disabled={columnDraft.length === 0}>
+                        {t("unselectAll")}
+                      </button>
+                    </div>
+                    <div className="column-picker__options">
+                      {visibleColumnOptions.map((column) => {
+                        const checked = columnDraft.includes(column);
+                        return <label key={column}><input type="checkbox" checked={checked} disabled={!checked && columnDraft.length >= dataset.aggregateColumnLimit} onChange={() => toggleAggregateColumn(column)} /><span title={column}>{column}</span></label>;
+                      })}
+                      {visibleColumnOptions.length === 0 && <p>{t("noColumnsFound")}</p>}
+                    </div>
+                    <footer><span>{t("selectedCount", { count: columnDraft.length })}</span><button type="button" onClick={applyAggregateColumns} disabled={updating}>{t("apply")}</button></footer>
                   </div>
-                  <div className="column-picker__options">
-                    {visibleColumnOptions.map((column) => {
-                      const checked = columnDraft.includes(column);
-                      return <label key={column}><input type="checkbox" checked={checked} disabled={!checked && columnDraft.length >= dataset.aggregateColumnLimit} onChange={() => toggleAggregateColumn(column)} /><span title={column}>{column}</span></label>;
-                    })}
-                    {visibleColumnOptions.length === 0 && <p>{t("noColumnsFound")}</p>}
-                  </div>
-                  <footer><span>{t("selectedCount", { count: columnDraft.length })}</span><button type="button" onClick={applyAggregateColumns} disabled={updating}>{t("apply")}</button></footer>
-                </div>
-              )}
+                )}
+              </div>
             </div>
           </header>
           <VirtualAggregateRow
@@ -1804,7 +1894,7 @@ function DataScreen({
                 onReplaceValue={replaceValueInline}
                 onValueAction={applyValueRowAction}
                 transformOpen={transformPopover?.column === aggregate.column}
-                transformUsed={recipe.some((step) => step.enabled !== false && stepTouchesColumn(step, aggregate.column))}
+                transformUsed={recipe.some((step) => step.enabled !== false && stepTouchesColumn(step, aggregate.column, dataset.columns))}
                 filterSignature={filterSignature}
               />
             )}
@@ -1843,6 +1933,7 @@ function DataScreen({
           open
           embedded
           columns={[...dataset.sourceColumns, ...dataset.columns]}
+          schema={dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] ?? "UNKNOWN" }))}
           recipe={recipe}
           stepStates={dataset.stepStates ?? []}
           invalidStepId={invalidStepId}
@@ -1854,6 +1945,7 @@ function DataScreen({
           onUndo={() => applyHistoryAction(onRecipeUndo)}
           onRedo={() => applyHistoryAction(onRecipeRedo)}
           onPreview={previewAfterStep}
+          onPreviewDraft={(stepId, params, referencedColumns) => previewFormulaStep(params, referencedColumns, stepId)}
           previewedStepId={stepPreview?.stepId ?? null}
           deleteRequest={deleteRequest}
           onDeleteRequestShown={onDeleteRequestShown}
@@ -2256,13 +2348,52 @@ export function App() {
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === preparedId);
     const recipeVersion = (prepared?.recipeVersion ?? 0) + 1;
     const descendantIds = collectDescendantNodeIds(flowRef.current, [preparedId]);
-    const updated = updatePreparedInput(flowRef.current, preparedId, {
+    let updated = updatePreparedInput(flowRef.current, preparedId, {
       recipe,
       recipeStatus: PREPARED_RECIPE_STATUS.APPLIED,
       recipeVersion,
       rowCount: result.rowCount,
       schema: result.columns.map((name) => ({ name, type: result.columnTypes?.[name] ?? null })),
     });
+    const previousFields = flowRef.current.semanticModels?.[preparedId]?.fields ?? {};
+    const currentModel = updated.semanticModels?.[preparedId];
+    const preparedSchema = updated.preparedInputs.find((item) => item.id === preparedId)?.schema ?? [];
+    for (const step of recipe) {
+      if (step.type !== "calculated-field" || step.enabled === false) continue;
+      const outputColumn = String(step.params?.outputColumn ?? "").trim();
+      if (!outputColumn || !currentModel?.fields?.[outputColumn]) continue;
+      const existing = currentModel.fields[outputColumn];
+      if (existing.source === "override") continue;
+      let references = [];
+      try {
+        references = getFormulaColumnReferences(step.params?.expression);
+      } catch {
+        continue;
+      }
+      const dependencyFields = references.map((name) => {
+        const column = preparedSchema.find((item) => item.name === name) ?? { name, type: null };
+        return { ...column, semantic: currentModel.fields[name] ?? previousFields[name] };
+      });
+      currentModel.fields[outputColumn] = {
+        ...mergeFieldSemantics(dependencyFields, {
+          kind: "calculated-field",
+          targetId: preparedId,
+          stepId: step.id,
+          column: outputColumn,
+          dependencies: references,
+        }),
+        businessName: outputColumn,
+      };
+    }
+    if (currentModel) {
+      updated = {
+        ...updated,
+        semanticModels: { ...updated.semanticModels, [preparedId]: currentModel },
+        preparedInputs: updated.preparedInputs.map((item) => item.id === preparedId
+          ? { ...item, schema: applySemanticModelToSchema(item.schema ?? [], currentModel) }
+          : item),
+      };
+    }
     const nextFlow = {
       ...updated,
       composeNodes: updated.composeNodes.map((node) => descendantIds.has(node.id)
@@ -2605,7 +2736,7 @@ export function App() {
     return { filename: result.filename, format, totalRowCount: dataset.rowCount, filteredRowCount: dataset.filteredCount, activity };
   };
 
-  const previewRecipe = (recipe, stepIndex) => worker.previewRecipe(recipe, stepIndex);
+  const previewRecipe = (recipe, stepIndex, options = {}) => worker.previewRecipe(recipe, stepIndex, options);
 
   const openWorkspace = async (workspace) => {
     if (workspace === "source" || workspace === "account") {
@@ -2891,10 +3022,10 @@ export function App() {
     if (!targetId) return {
       workspace: screen === "input" ? "source" : screen === "data" ? "prepare" : screen,
       workspaceRevision: workspaceRevisionRef.current,
-      actions: screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", "inspect-activity"],
+      actions: screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", "inspect-activity"],
     };
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === targetId);
-    if (prepared) return { targetId, kind: "dataset", actions: ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "export", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
+    if (prepared) return { targetId, kind: "dataset", actions: ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", "export", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
     const operation = flowRef.current.composeNodes.find((item) => item.id === targetId);
     if (operation) return { targetId, kind: operation.kind, actions: ["inspect", "preview", "update", "export", "promote-result", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
     throw new Error(`Target not found: ${targetId}`);
@@ -3151,7 +3282,7 @@ export function App() {
 
   useWebMcpTools({
     state: {
-      contractVersion: "2.4",
+      contractVersion: "2.5",
       workspaceRevision,
       flowId: flow.id,
       flowRevision: flow.revision,

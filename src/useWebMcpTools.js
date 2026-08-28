@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { CALCULATION_CATALOG, FORMULA_EXPRESSION_VERSION } from "./formulaEngine.js";
 
 const EMPTY_INPUT_SCHEMA = Object.freeze({
   type: "object",
@@ -140,6 +141,14 @@ const RECIPE_STEP_DEFINITION_SCHEMA = Object.freeze({
     strictObject({
       type: { const: "remove-columns" },
       params: strictObject({ columns: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, uniqueItems: true } }),
+    }),
+    strictObject({
+      type: { const: "calculated-field" },
+      params: strictObject({
+        outputColumn: { type: "string", minLength: 1 },
+        expression: { type: "string", minLength: 1, maxLength: 10000 },
+        expressionVersion: { const: FORMULA_EXPRESSION_VERSION },
+      }),
     }),
   ],
 });
@@ -351,7 +360,7 @@ function filterSelection(raw) {
 }
 
 const WEBMCP_CAPABILITIES = Object.freeze({
-  contractVersion: "2.4",
+  contractVersion: "2.5",
   authenticationRequired: false,
   workspaces: ["source", "prepare", "compose", "account"],
   actions: [
@@ -388,6 +397,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     "inspect-and-override-semantics",
     "inspect-compose-quality",
     "manage-reusable-metrics",
+    "inspect-calculation-language",
   ],
   safeguards: {
     localFileSelection: "user-action-required",
@@ -397,7 +407,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
 });
 
 const WORKFLOW_GUIDE = Object.freeze({
-  contractVersion: "2.4",
+  contractVersion: "2.5",
   flow: [
     { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
     { workspace: "prepare", purpose: "Inspect one prepared dataset, apply temporary filters, and maintain its independent ordered recipe." },
@@ -451,6 +461,15 @@ export function createWebMcpTools(contextRef, availability) {
     annotations: { readOnlyHint: true },
     execute() {
       return webMcpResult("TabulaFlow uses the Source to Prepare to Compose workflow.", WORKFLOW_GUIDE);
+    },
+  }, {
+    name: "tabulaflow_get_calculation_catalog",
+    title: "Get the Formula column language catalog",
+    description: "Read the complete safe Formula column syntax, allowlisted functions, cast types, examples, and expression contract version before drafting a calculated-field recipe step. Formula column is row-level and create-only in Prepare.",
+    inputSchema: EMPTY_INPUT_SCHEMA,
+    annotations: { readOnlyHint: true },
+    execute() {
+      return webMcpResult("Returned the safe Prepare Formula column language catalog.", CALCULATION_CATALOG);
     },
   }, {
     name: "tabulaflow_describe_operation",

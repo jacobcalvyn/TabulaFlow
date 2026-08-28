@@ -21,6 +21,7 @@ import {
   transformationParamsAreComplete,
 } from "./transformations.js";
 import { useI18n } from "./i18n.jsx";
+import { FormulaColumnEditor } from "./FormulaColumnEditor.jsx";
 
 const TYPE_OPTIONS = ["VARCHAR", "BIGINT", "DOUBLE", "BOOLEAN", "DATE", "TIMESTAMP"];
 const FIELD_DEFINITIONS = {
@@ -204,6 +205,7 @@ export function StepsPanel({
   embedded = false,
   panelRef,
   columns,
+  schema = columns,
   recipe,
   stepStates,
   invalidStepId,
@@ -216,6 +218,7 @@ export function StepsPanel({
   onUndo,
   onRedo,
   onPreview,
+  onPreviewDraft,
   previewedStepId,
   deleteRequest,
   onDeleteRequestShown,
@@ -234,6 +237,9 @@ export function StepsPanel({
   const sheetDragMovedRef = useRef(false);
   const dismissTimerRef = useRef(null);
   const stateById = useMemo(() => new Map(stepStates.map((state) => [state.id, state])), [stepStates]);
+  const editingStep = recipe.find((step) => step.id === editingId);
+  const editingInputColumns = stateById.get(editingId)?.inputColumns ?? columns;
+  const editingSchema = schema.filter((column) => editingInputColumns.includes(typeof column === "string" ? column : column.name));
 
   const revealForm = () => {
     window.clearTimeout(dismissTimerRef.current);
@@ -419,17 +425,31 @@ export function StepsPanel({
           >
             <CaretDown weight="bold" />
           </button>
-          <TransformationForm
-            key={editingId}
-            columns={columns}
-            initialType={recipe.find((step) => step.id === editingId)?.type}
-            initialParams={{ ...DEFAULT_PARAMS[recipe.find((step) => step.id === editingId)?.type], ...recipe.find((step) => step.id === editingId)?.params }}
-            title={t("editStep")}
-            submitLabel={t("save")}
-            applying={applying}
-            onSubmit={submitEdit}
-            onCancel={dismissForm}
-          />
+          {editingStep?.type === "calculated-field" ? (
+            <FormulaColumnEditor
+              key={editingId}
+              schema={editingSchema}
+              initialParams={editingStep.params}
+              title={t("editFormulaColumn")}
+              submitLabel={t("save")}
+              applying={applying}
+              onPreview={onPreviewDraft ? (params, referencedColumns) => onPreviewDraft(editingId, params, referencedColumns) : undefined}
+              onSubmit={(params) => submitEdit("calculated-field", params)}
+              onCancel={dismissForm}
+            />
+          ) : (
+            <TransformationForm
+              key={editingId}
+              columns={columns}
+              initialType={editingStep?.type}
+              initialParams={{ ...DEFAULT_PARAMS[editingStep?.type], ...editingStep?.params }}
+              title={t("editStep")}
+              submitLabel={t("save")}
+              applying={applying}
+              onSubmit={submitEdit}
+              onCancel={dismissForm}
+            />
+          )}
         </section>
       ) : null}
     </aside>

@@ -1,3 +1,5 @@
+import { compileFormula, FORMULA_EXPRESSION_VERSION } from "./formulaEngine.js";
+
 const INTERNAL_ROW_ID = "__tf_row_id";
 
 export const TRANSFORMATION_TYPES = Object.freeze([
@@ -14,6 +16,7 @@ export const TRANSFORMATION_TYPES = Object.freeze([
   { type: "select-columns", group: "Build", label: "Pilih kolom" },
   { type: "remove-columns", group: "Build", label: "Hapus kolom" },
   { type: "sort", group: "Build", label: "Urutkan baris" },
+  { type: "calculated-field", group: "Build", label: "Kolom rumus" },
   { type: "calculated-column", group: "Build", label: "Kolom perhitungan" },
   { type: "conditional-column", group: "Build", label: "Kolom bersyarat" },
   { type: "group-aggregate", group: "Build", label: "Kelompokkan & agregasi" },
@@ -39,6 +42,9 @@ const AGGREGATE_FUNCTIONS = new Set(["COUNT", "SUM", "AVG", "MIN", "MAX"]);
 const VALUELESS_DELETE_OPERATORS = new Set(["is-null", "is-not-null", "is-empty", "is-not-empty"]);
 
 export function transformationParamsAreComplete(type, params = {}) {
+  if (type === "calculated-field") {
+    return String(params.outputColumn ?? "").trim().length > 0 && String(params.expression ?? "").trim().length > 0;
+  }
   if (type !== "delete-rows") return true;
   const operator = String(params.operator ?? "");
   if (!operator) return false;
@@ -203,6 +209,13 @@ function compileEnabledStep(step, input, columns) {
     const identifier = requireColumn(columns, params.column);
     const direction = params.direction === "desc" ? "DESC" : "ASC";
     sql = `SELECT * FROM ${source} ORDER BY ${identifier} ${direction} NULLS LAST`;
+  } else if (step.type === "calculated-field") {
+    const expressionVersion = Number(params.expressionVersion ?? FORMULA_EXPRESSION_VERSION);
+    if (expressionVersion !== FORMULA_EXPRESSION_VERSION) throw new Error(`Versi ekspresi ${expressionVersion} belum didukung.`);
+    const name = requireOutputName(columns, params.outputColumn);
+    const formula = compileFormula(params.expression, columns.map((column) => ({ name: column, type: "UNKNOWN" })));
+    sql = `SELECT *, ${formula.sql} AS ${quoteIdentifier(name)} FROM ${source}`;
+    nextColumns.push(name);
   } else if (step.type === "calculated-column") {
     const left = requireColumn(columns, params.leftColumn);
     const operator = String(params.operator ?? "");
@@ -327,6 +340,7 @@ export function summarizeStep(step) {
   if (["remove-duplicates", "select-columns", "remove-columns"].includes(step.type)) return normalizeColumns(params.columns).join(", ") || "Pilih kolom";
   if (step.type === "replace-value") return `${params.column ?? "?"}: ${params.from ?? ""} → ${params.to ?? ""}`;
   if (step.type === "fill-empty") return `${params.column ?? "?"} → ${params.value ?? ""}`;
+  if (step.type === "calculated-field") return String(params.outputColumn ?? "Kolom baru");
   if (["calculated-column", "conditional-column", "group-aggregate"].includes(step.type)) return String(params.newName ?? "Kolom baru");
   return getStepLabel(step.type);
 }

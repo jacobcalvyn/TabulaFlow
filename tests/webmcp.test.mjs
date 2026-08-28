@@ -12,7 +12,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "2.4", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "2.5", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -92,7 +92,7 @@ function toolByName(tools, name) {
 }
 
 const GLOBAL_TOOL_NAMES = [
-  "tabulaflow_get_workspace_state", "tabulaflow_get_capabilities", "tabulaflow_get_workflow_guide",
+  "tabulaflow_get_workspace_state", "tabulaflow_get_capabilities", "tabulaflow_get_workflow_guide", "tabulaflow_get_calculation_catalog",
   "tabulaflow_describe_operation", "tabulaflow_get_available_actions", "tabulaflow_get_activity_log",
   "tabulaflow_get_changes_since", "tabulaflow_get_operation_status", "tabulaflow_open_workspace",
   "tabulaflow_request_source_file", "tabulaflow_request_source_relink", "tabulaflow_list_cloud_files",
@@ -119,7 +119,7 @@ test("WebMCP exposes contextual Agent-Ready v2 tools", () => {
   assert.deepEqual(createWebMcpTools(ref, { hasDataset: false, hasPrepared: false, hasComposeNodes: false }).map((tool) => tool.name), GLOBAL_TOOL_NAMES);
   const allTools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   assert.deepEqual(allTools.map((tool) => tool.name), ALL_TOOL_NAMES);
-  assert.equal(new Set(ALL_TOOL_NAMES).size, 54);
+  assert.equal(new Set(ALL_TOOL_NAMES).size, 55);
 });
 
 test("WebMCP read plane observes workflow, Prepare data, and Compose data", async () => {
@@ -128,6 +128,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   const state = await toolByName(tools, "tabulaflow_get_workspace_state").execute({});
   const capabilities = await toolByName(tools, "tabulaflow_get_capabilities").execute({});
   const guide = await toolByName(tools, "tabulaflow_get_workflow_guide").execute({});
+  const calculationCatalog = await toolByName(tools, "tabulaflow_get_calculation_catalog").execute({});
   const operation = await toolByName(tools, "tabulaflow_describe_operation").execute({ kind: "join" });
   await toolByName(tools, "tabulaflow_get_available_actions").execute({ targetId: "prepared-a" });
   await toolByName(tools, "tabulaflow_get_activity_log").execute({ limit: 20, actor: "agent" });
@@ -150,7 +151,9 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "2.4");
+  assert.equal(capabilities.structuredContent.contractVersion, "2.5");
+  assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
+  assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");
   assert.equal(capabilities.structuredContent.safeguards.deletion, "visible-user-confirmation-required");
   assert.equal(guide.structuredContent.flow.length, 3);
@@ -247,6 +250,10 @@ test("WebMCP mutation schemas require collaboration metadata and conditional val
   assert.ok(previewStep.required.includes("id"));
   assert.equal(toolByName(tools, "tabulaflow_preview_recipe_change").inputSchema.properties.previewLimit.maximum, 20);
   assert.equal(toolByName(tools, "tabulaflow_validate_compose_operation").inputSchema.properties.previewLimit.maximum, 20);
+  const recipeStepDefinitions = toolByName(tools, "tabulaflow_add_recipe_step").inputSchema.properties.step.oneOf;
+  const formulaDefinition = recipeStepDefinitions.find((branch) => branch.properties.type.const === "calculated-field");
+  assert.deepEqual(formulaDefinition.properties.params.required, ["outputColumn", "expression", "expressionVersion"]);
+  assert.equal(formulaDefinition.properties.params.properties.expressionVersion.const, 1);
   assert.deepEqual(toolByName(tools, "tabulaflow_get_prepare_preview").inputSchema.required, ["preparedId", "columns"]);
   assert.equal(toolByName(tools, "tabulaflow_get_prepare_preview").inputSchema.properties.columns.maxItems, 20);
   assert.deepEqual(toolByName(tools, "tabulaflow_get_node_preview").inputSchema.required, ["nodeId", "columns"]);

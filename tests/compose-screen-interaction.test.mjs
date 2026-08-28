@@ -29,10 +29,11 @@ const vite = await createServer({
   plugins: [react()],
   server: { middlewareMode: true, hmr: false, ws: false },
 });
-const [{ ComposeScreen }, { LanguageProvider }, { StepsPanel }] = await Promise.all([
+const [{ ComposeScreen }, { LanguageProvider }, { StepsPanel }, { FormulaColumnEditor }] = await Promise.all([
   vite.ssrLoadModule("/src/ComposeScreen.jsx"),
   vite.ssrLoadModule("/src/i18n.jsx"),
   vite.ssrLoadModule("/src/StepsPanel.jsx"),
+  vite.ssrLoadModule("/src/FormulaColumnEditor.jsx"),
 ]);
 
 test.after(async () => {
@@ -118,6 +119,74 @@ test("clicking the second node opens the existing binary operation chooser", () 
   view.unmount();
 });
 
+test("clicking outside an operation inspector cancels and hides it", () => {
+  const updates = [];
+  const flow = createFlow();
+  flow.composeNodes = [{
+    id: "aggregate-a",
+    nodeType: "operation",
+    kind: "aggregate",
+    name: "Aggregate A",
+    inputIds: ["prepared-a"],
+    rowCount: 10,
+    schema: [{ name: "count", type: "BIGINT" }],
+    config: {
+      groupBy: [],
+      measures: [{ function: "count", column: "", alias: "count" }],
+      minimumSampleSize: 1,
+      suppressSmallGroups: false,
+    },
+    position: { x: 680, y: 40 },
+  }];
+  const view = renderCompose({
+    flow,
+    async onUpdateNode(...args) { updates.push(args); },
+  });
+
+  fireEvent.click(view.getByRole("button", { name: "Settings" }));
+  const inspector = view.container.querySelector(".compose-operation-builder");
+  assert.ok(inspector);
+
+  fireEvent.pointerDown(inspector.querySelector("select"));
+  assert.ok(view.container.querySelector(".compose-operation-builder"));
+
+  fireEvent.pointerDown(view.container.querySelector(".compose-canvas"));
+  assert.equal(view.container.querySelector(".compose-operation-builder"), null);
+  assert.deepEqual(updates, []);
+  view.unmount();
+});
+
+test("Distinct output mode is an accessible two-option segmented control", () => {
+  const flow = createFlow();
+  flow.composeNodes = [{
+    id: "distinct-a",
+    nodeType: "operation",
+    kind: "distinct-rows",
+    name: "Distinct A",
+    inputIds: ["prepared-a"],
+    rowCount: 10,
+    schema: [{ name: "id", type: "BIGINT" }],
+    config: {
+      columns: ["id"],
+      mode: "representative-rows",
+    },
+    position: { x: 680, y: 40 },
+  }];
+  const view = renderCompose({ flow });
+
+  fireEvent.click(view.getByRole("button", { name: "Settings" }));
+  const modeGroup = view.getByRole("group", { name: "Output mode" });
+  const representative = within(modeGroup).getByRole("button", { name: "Keep representative rows" });
+  const projected = within(modeGroup).getByRole("button", { name: "Return distinct columns only" });
+
+  assert.equal(representative.getAttribute("aria-pressed"), "true");
+  assert.equal(projected.getAttribute("aria-pressed"), "false");
+  fireEvent.click(projected);
+  assert.equal(representative.getAttribute("aria-pressed"), "false");
+  assert.equal(projected.getAttribute("aria-pressed"), "true");
+  view.unmount();
+});
+
 test("a WebMCP delete request opens the existing confirmation without deleting", async () => {
   const calls = [];
   const view = renderCompose({
@@ -181,5 +250,32 @@ test("a WebMCP recipe deletion also waits for visible confirmation", () => {
   assert.deepEqual(calls, [["shown", "request-2"]]);
   fireEvent.click(within(confirmation).getByRole("button", { name: "Delete" }));
   assert.deepEqual(calls, [["shown", "request-2"], ["change", []], ["confirmation", "recipe-step", "step-a", "confirmed"]]);
+  view.unmount();
+});
+
+test("Formula column validates, previews, and submits one create-only recipe step", async () => {
+  const calls = [];
+  const view = render(React.createElement(LanguageProvider, null, React.createElement(FormulaColumnEditor, {
+    schema: [{ name: "amount", type: "DOUBLE" }, { name: "category", type: "VARCHAR" }],
+    title: "Formula column",
+    submitLabel: "Add",
+    onCancel() {},
+    async onPreview(params, references) {
+      calls.push(["preview", params, references]);
+      return { columns: ["amount", "amount_double"], preview: [{ amount: 4, amount_double: 8 }] };
+    },
+    onSubmit(params) { calls.push(["submit", params]); },
+  })));
+
+  fireEvent.change(view.getByLabelText("New column name"), { target: { value: "amount_double" } });
+  fireEvent.change(view.getByLabelText("Formula"), { target: { value: "[amount] * 2" } });
+  assert.match(view.getByText(/Result type:/).textContent, /DOUBLE/);
+
+  await act(async () => { fireEvent.click(view.getByRole("button", { name: "Preview" })); });
+  assert.deepEqual(calls[0], ["preview", { outputColumn: "amount_double", expression: "[amount] * 2", expressionVersion: 1 }, ["amount"]]);
+  assert.equal(view.getByText("8").textContent, "8");
+
+  fireEvent.click(view.getByRole("button", { name: "Add" }));
+  assert.deepEqual(calls[1], ["submit", { outputColumn: "amount_double", expression: "[amount] * 2", expressionVersion: 1 }]);
   view.unmount();
 });
