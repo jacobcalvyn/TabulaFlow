@@ -280,7 +280,7 @@ button { color: inherit; }
 .opened-sources__empty { margin: 0; padding: 28px 16px; color: var(--muted); text-align: center; font-size: 12px; }
 
 .account-screen { min-width: 0; min-height: 0; padding: 42px clamp(20px, 5vw, 70px); overflow-y: auto; background: #f7f9f9; }
-.account-header, .account-content, .account-guest-card, .account-screen > .error-message, .account-screen > .account-state { width: min(880px, 100%); margin-inline: auto; }
+.account-header, .account-content, .account-guest-card, .account-ai-card, .account-screen > .error-message, .account-screen > .account-state { width: min(880px, 100%); margin-inline: auto; }
 .account-header { margin-bottom: 24px; }
 .account-header h1 { margin: 0; font-size: 30px; letter-spacing: -.035em; }
 .account-header p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
@@ -300,6 +300,16 @@ button { color: inherit; }
 .account-card__heading > strong { color: #405056; font-size: 12px; white-space: nowrap; }
 .account-card__heading > a { color: var(--accent-strong); font-size: 11px; font-weight: 700; }
 .account-card__heading .button { display: inline-flex; align-items: center; gap: 6px; }
+.account-ai-card { margin-bottom: 14px; }
+.account-ai-card__title { min-width: 0; display: flex; align-items: center; gap: 11px; }
+.account-ai-card__title > span { width: 38px; height: 38px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 7px; color: var(--accent-strong); background: var(--accent-soft); }
+.account-ai-card__title svg { width: 21px; height: 21px; }
+.account-ai-status { padding: 5px 8px; border-radius: 999px; font-size: 10px !important; }
+.account-ai-status--available { color: #08726d !important; background: #e6f5f3; }
+.account-ai-status--unavailable { color: #6d5b3d !important; background: #f6f0e5; }
+.account-ai-capabilities { margin: 16px 0 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; list-style: none; }
+.account-ai-capabilities li { min-width: 0; padding: 10px 11px; border-radius: 6px; color: #405056; background: #f7f9f9; font-size: 10px; line-height: 1.45; }
+.account-ai-note { margin: 11px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .account-details { margin: 18px 0 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .account-details div { padding: 11px 12px; border-radius: 6px; background: #f7f9f9; }
 .account-details dt { margin-bottom: 4px; color: var(--muted); font-size: 10px; font-weight: 650; }
@@ -762,6 +772,10 @@ button { color: inherit; }
 .step-card__actions button:hover:not(:disabled) { color: var(--accent-strong); background: var(--accent-soft); }
 .step-card__actions button:disabled { opacity: .3; cursor: not-allowed; }
 .step-card__actions svg { width: 13px; height: 13px; }
+.step-card__delete-confirm { grid-column: 1 / -1; display: flex; align-items: center; justify-content: flex-end; gap: 5px; color: #913b35; font-size: 10px; font-weight: 700; }
+.step-card__delete-confirm span { margin-right: auto; }
+.step-card__delete-confirm button { min-height: 25px; padding: 0 8px; border: 1px solid var(--line); border-radius: 4px; background: #fff; cursor: pointer; }
+.step-card__delete-confirm button:last-child { border-color: #dca7a2; color: #fff; background: #b54036; }
 .steps-empty { min-height: 150px; padding: 24px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; color: var(--muted); text-align: center; }
 .steps-empty strong { color: #354247; font-size: 13px; }
 .steps-empty span { font-size: 11px; }
@@ -779,6 +793,7 @@ button { color: inherit; }
 .steps-panel--embedded .step-card__body span { font-size: 9px; }
 .steps-panel--embedded .step-card__body small { font-size: 8px; }
 .steps-panel--embedded .step-card__actions { grid-area: actions; width: 100%; grid-template-columns: repeat(6, minmax(22px, 1fr)); gap: 1px; }
+.steps-panel--embedded .step-card__delete-confirm { grid-area: auto / 1 / auto / -1; font-size: 9px; }
 .steps-panel--embedded .step-card__actions button { width: 100%; height: 23px; }
 .steps-panel--embedded .steps-empty { min-height: 110px; padding: 14px 10px; }
 .steps-panel--embedded .steps-empty strong { font-size: 11px; }
@@ -881,6 +896,7 @@ button { color: inherit; }
   .input-screen { padding: 38px 18px; }
   .account-screen { padding: 28px 18px; }
   .account-details { grid-template-columns: 1fr; }
+  .account-ai-capabilities { grid-template-columns: 1fr; }
   .account-card__heading { align-items: flex-start; flex-direction: column; }
   .account-card__heading > strong { white-space: normal; }
   .dropzone { min-height: 300px; padding-inline: 18px; }

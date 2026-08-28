@@ -326,7 +326,7 @@ function UnaryOperationInspector({ operation, flow, byId, position, onCancel, on
   );
 }
 
-export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNode, onPreviewDraft, onCreateNode, onUpdateNode, onDeleteNode, onDeletePrepared, onMoveNode, onAutoArrange, onDuplicate, onCreatePrepared, onEditPreparation, onExport }) {
+export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNode, onPreviewDraft, onCreateNode, onUpdateNode, onDeleteNode, onDeletePrepared, onMoveNode, onAutoArrange, onDuplicate, onCreatePrepared, onEditPreparation, onExport, deleteRequest, onDeleteRequestShown }) {
   const { formatNumber, t } = useI18n();
   const nodes = useMemo(() => [
     ...flow.preparedInputs.map((node) => ({ ...node, nodeType: "dataset" })),
@@ -348,6 +348,19 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
   const [unarySourceId, setUnarySourceId] = useState(null);
   const [operationError, setOperationError] = useState("");
   const [operation, setOperation] = useState(null);
+
+  useEffect(() => {
+    if (!deleteRequest) return;
+    if (deleteRequest.target === "prepared-dataset" && flow.preparedInputs.some((node) => node.id === deleteRequest.targetId)) {
+      setConfirmingPreparedDeleteId(deleteRequest.targetId);
+      setConfirmingOperationDeleteId(null);
+    } else if (deleteRequest.target === "compose-operation" && flow.composeNodes.some((node) => node.id === deleteRequest.targetId)) {
+      setOperationDeleteError("");
+      setConfirmingOperationDeleteId(deleteRequest.targetId);
+      setConfirmingPreparedDeleteId(null);
+    }
+    onDeleteRequestShown?.(deleteRequest.token);
+  }, [deleteRequest, flow.composeNodes, flow.preparedInputs, onDeleteRequestShown]);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 580px)").matches);
   const [viewScale, setViewScale] = useState(1);

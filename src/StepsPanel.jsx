@@ -217,6 +217,8 @@ export function StepsPanel({
   onRedo,
   onPreview,
   previewedStepId,
+  deleteRequest,
+  onDeleteRequestShown,
 }) {
   const { t, toolLabel } = useI18n();
   const [formOpen, setFormOpen] = useState(false);
@@ -225,6 +227,7 @@ export function StepsPanel({
   const [sheetDragOffset, setSheetDragOffset] = useState(0);
   const [editingId, setEditingId] = useState(null);
   const [draggedId, setDraggedId] = useState(null);
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null);
   const sheetPointerRef = useRef(null);
   const sheetDragOffsetRef = useRef(0);
   const sheetDragMovedRef = useRef(false);
@@ -251,6 +254,12 @@ export function StepsPanel({
   useEffect(() => {
     if (!open && !embedded) setFormExpanded(false);
   }, [embedded, open]);
+
+  useEffect(() => {
+    if (!deleteRequest || deleteRequest.target !== "recipe-step") return;
+    if (recipe.some((step) => step.id === deleteRequest.targetId)) setConfirmingDeleteId(deleteRequest.targetId);
+    onDeleteRequestShown?.(deleteRequest.token);
+  }, [deleteRequest, onDeleteRequestShown, recipe]);
 
   const openEdit = (step) => {
     setEditingId(step.id);
@@ -379,6 +388,7 @@ export function StepsPanel({
                 <button type="button" onClick={() => onPreview(index)} disabled={applying || invalid} aria-label={t("previewStep")}><Eye /></button>
                 <button type="button" onClick={() => onChange(recipe.filter((item) => item.id !== step.id), step.id)} disabled={applying} aria-label={t("deleteStep")}><Trash /></button>
               </div>
+              {confirmingDeleteId === step.id && <div className="step-card__delete-confirm"><span>{t("confirmDeleteStep")}</span><button type="button" onClick={() => setConfirmingDeleteId(null)}>{t("cancel")}</button><button type="button" disabled={applying} onClick={() => { setConfirmingDeleteId(null); onChange(recipe.filter((item) => item.id !== step.id), step.id); }}>{t("delete")}</button></div>}
             </article>
           );
         })}

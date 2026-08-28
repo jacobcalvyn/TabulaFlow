@@ -29,9 +29,10 @@ const vite = await createServer({
   plugins: [react()],
   server: { middlewareMode: true, hmr: false, ws: false },
 });
-const [{ ComposeScreen }, { LanguageProvider }] = await Promise.all([
+const [{ ComposeScreen }, { LanguageProvider }, { StepsPanel }] = await Promise.all([
   vite.ssrLoadModule("/src/ComposeScreen.jsx"),
   vite.ssrLoadModule("/src/i18n.jsx"),
+  vite.ssrLoadModule("/src/StepsPanel.jsx"),
 ]);
 
 test.after(async () => {
@@ -114,5 +115,54 @@ test("clicking the second node opens the existing binary operation chooser", () 
     "Cancel",
   ]);
   assert.equal(view.queryByRole("dialog", { name: "Choose the next operation" }), null);
+  view.unmount();
+});
+
+test("a WebMCP delete request opens the existing confirmation without deleting", async () => {
+  const calls = [];
+  const view = renderCompose({
+    deleteRequest: { target: "prepared-dataset", targetId: "prepared-a", token: "request-1" },
+    onDeleteRequestShown(token) { calls.push(["shown", token]); },
+    async onDeletePrepared(nodeId) { calls.push(["delete", nodeId]); return true; },
+  });
+
+  const confirmation = view.getByText("Delete this dataset?").closest("div");
+  assert.deepEqual(calls, [["shown", "request-1"]]);
+  assert.equal(calls.some(([type]) => type === "delete"), false);
+
+  fireEvent.click(within(confirmation).getByRole("button", { name: "Delete" }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls, [["shown", "request-1"], ["delete", "prepared-a"]]);
+  view.unmount();
+});
+
+test("a WebMCP recipe deletion also waits for visible confirmation", () => {
+  const calls = [];
+  const recipe = [{ id: "step-a", type: "trim", version: 1, enabled: true, params: { column: "name", mode: "both" } }];
+  const view = render(React.createElement(LanguageProvider, null, React.createElement(StepsPanel, {
+    open: true,
+    embedded: true,
+    columns: ["name"],
+    recipe,
+    stepStates: [],
+    invalidStepId: null,
+    error: "",
+    applying: false,
+    canUndo: false,
+    canRedo: false,
+    onClose() {},
+    onChange(nextRecipe) { calls.push(["change", nextRecipe]); },
+    onUndo() {},
+    onRedo() {},
+    onPreview() {},
+    previewedStepId: null,
+    deleteRequest: { target: "recipe-step", targetId: "step-a", token: "request-2" },
+    onDeleteRequestShown(token) { calls.push(["shown", token]); },
+  })));
+
+  const confirmation = view.getByText("Delete this step?").closest("div");
+  assert.deepEqual(calls, [["shown", "request-2"]]);
+  fireEvent.click(within(confirmation).getByRole("button", { name: "Delete" }));
+  assert.deepEqual(calls, [["shown", "request-2"], ["change", []]]);
   view.unmount();
 });
