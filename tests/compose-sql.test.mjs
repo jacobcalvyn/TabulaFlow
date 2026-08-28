@@ -152,7 +152,20 @@ test("unpivot turns selected columns into field and value rows", () => {
   assert.deepEqual(result.schema, [
     { name: "id", type: "VARCHAR" },
     { name: "month", type: "VARCHAR" },
-    { name: "amount", type: "VARCHAR" },
+    { name: "amount", type: "DOUBLE" },
   ]);
+  assert.match(result.sql, /CAST\(u\."jan" AS DOUBLE\)/);
   assert.match(result.sql, /UNION ALL/);
+});
+
+test("unpivot widens compatible numeric columns and rejects incompatible values", () => {
+  const numeric = compileUnpivotSql(relation("metrics", [["id", "VARCHAR"], ["units", "BIGINT"], ["amount", "DECIMAL(18,2)"]]), {
+    idColumns: ["id"],
+    valueColumns: ["units", "amount"],
+  });
+  assert.equal(numeric.schema.at(-1).type, "DOUBLE");
+  assert.throws(() => compileUnpivotSql(relation("metrics", [["id", "VARCHAR"], ["amount", "DOUBLE"], ["status", "VARCHAR"]]), {
+    idColumns: ["id"],
+    valueColumns: ["amount", "status"],
+  }), (error) => error.code === "UNPIVOT_VALUE_TYPE_MISMATCH");
 });

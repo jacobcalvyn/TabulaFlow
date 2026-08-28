@@ -13,6 +13,21 @@ function typeKey(type) {
   return String(type ?? "").toUpperCase().replace(/\s+/g, " ").trim();
 }
 
+const INTEGER_TYPE = /^(?:U?(?:TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT))$/;
+const DECIMAL_TYPE = /^(?:DECIMAL|NUMERIC)(?:\(|$)/;
+const FLOAT_TYPE = /^(?:FLOAT|REAL|DOUBLE)$/;
+
+function commonUnpivotType(valueColumns) {
+  const types = valueColumns.map((column) => typeKey(column.type));
+  const uniqueTypes = [...new Set(types)];
+  if (uniqueTypes.length === 1) return uniqueTypes[0];
+  if (uniqueTypes.every((type) => INTEGER_TYPE.test(type))) return "BIGINT";
+  if (uniqueTypes.every((type) => INTEGER_TYPE.test(type) || DECIMAL_TYPE.test(type) || FLOAT_TYPE.test(type))) return "DOUBLE";
+  const error = new Error(`Unpivot value columns must share a compatible type (${uniqueTypes.join(" ↔ ")}).`);
+  error.code = "UNPIVOT_VALUE_TYPE_MISMATCH";
+  throw error;
+}
+
 function schemaMap(schema) {
   return new Map(schema.map((column) => [column.name, column]));
 }
@@ -277,7 +292,8 @@ export function compilePivotSql(input, config = {}) {
 export function compileUnpivotSql(input, config = {}) {
   const valueColumns = Array.isArray(config.valueColumns) ? [...new Set(config.valueColumns)] : [];
   if (!valueColumns.length) throw new Error("Unpivot memerlukan minimal satu value column.");
-  valueColumns.forEach((name) => requireVisibleColumn(input, name, "Value column"));
+  const valueDefinitions = valueColumns.map((name) => requireVisibleColumn(input, name, "Value column"));
+  const outputValueType = commonUnpivotType(valueDefinitions);
   const requestedIds = Array.isArray(config.idColumns) ? [...new Set(config.idColumns)] : [];
   const idColumns = requestedIds.length ? requestedIds : visibleSchema(input.schema).map((column) => column.name).filter((name) => !valueColumns.includes(name));
   idColumns.forEach((name) => requireVisibleColumn(input, name, "ID column"));
@@ -285,10 +301,10 @@ export function compileUnpivotSql(input, config = {}) {
   const nameColumn = uniqueOutputName(config.nameColumn, used, "field");
   const valueColumn = uniqueOutputName(config.valueColumn, used, "value");
   const selectIds = idColumns.map((name) => `u.${quoteIdentifier(name)}`).join(", ");
-  const union = valueColumns.map((name) => `SELECT ${selectIds ? `${selectIds}, ` : ""}${sqlLiteral(name)} AS ${quoteIdentifier(nameColumn)}, CAST(u.${quoteIdentifier(name)} AS VARCHAR) AS ${quoteIdentifier(valueColumn)} FROM (${input.sql}) AS u`).join(" UNION ALL ");
+  const union = valueColumns.map((name) => `SELECT ${selectIds ? `${selectIds}, ` : ""}${sqlLiteral(name)} AS ${quoteIdentifier(nameColumn)}, CAST(u.${quoteIdentifier(name)} AS ${outputValueType}) AS ${quoteIdentifier(valueColumn)} FROM (${input.sql}) AS u`).join(" UNION ALL ");
   return {
     sql: `SELECT ROW_NUMBER() OVER () AS ${quoteIdentifier(INTERNAL_ROW_ID)}, * FROM (${union}) AS unpivoted`,
-    schema: [...idColumns.map((name) => requireVisibleColumn(input, name)), { name: nameColumn, type: "VARCHAR" }, { name: valueColumn, type: "VARCHAR" }],
+    schema: [...idColumns.map((name) => requireVisibleColumn(input, name)), { name: nameColumn, type: "VARCHAR" }, { name: valueColumn, type: outputValueType }],
   };
 }
 

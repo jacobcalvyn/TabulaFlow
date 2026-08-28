@@ -231,6 +231,8 @@ export function useDataWorker() {
     return result;
   }, [request]);
   const searchAggregate = useCallback((column, query, filters, options = {}) => request("search-aggregate", { column, query, filters, ...options }), [request]);
+  const searchAggregateForAgent = useCallback((column, query, filters, options = {}) => request("search-aggregate-agent", { column, query, filters, ...options }), [request]);
+  const resolveAgentValue = useCallback((column, valueRef) => request("resolve-agent-value", { column, valueRef }), [request]);
   const previewPrepared = useCallback((filters, columns, options = {}) => request("prepare-preview", { filters, columns, ...options }), [request]);
   const profileData = useCallback((columns) => request("data-profile", { columns }), [request]);
   const exportData = useCallback((format, filters, baseName) => request("export", { format, filters, baseName }), [request]);
@@ -284,6 +286,8 @@ export function useDataWorker() {
   const previewCompose = useCallback((graph, nodeId, options = {}) => request("compose-preview", { graph, nodeId, options }), [request]);
   const exportCompose = useCallback((graph, nodeId, format) => request("compose-export", { graph, nodeId, format }), [request]);
   const composeConnectionOptions = useCallback((graph, nodeId) => request("compose-connection-options", { graph, nodeId }), [request]);
+  const validateRules = useCallback((preparedId, rules, semanticModel) => request("validate-rules", { preparedId, rules, semanticModel }), [request]);
+  const runAnalysis = useCallback((preparedId, definition, semanticModel, options = {}) => request("run-analysis", { preparedId, definition, semanticModel, options }), [request]);
 
   return useMemo(() => ({
     ready,
@@ -298,6 +302,8 @@ export function useDataWorker() {
     materializeComposePrepared,
     filter,
     searchAggregate,
+    searchAggregateForAgent,
+    resolveAgentValue,
     previewPrepared,
     profileData,
     exportData,
@@ -306,5 +312,7 @@ export function useDataWorker() {
     previewCompose,
     exportCompose,
     composeConnectionOptions,
-  }), [ready, recovering, progress, loadFile, inspectFile, loadDemo, activatePrepared, registerPreparedCopy, unregisterPrepared, materializeComposePrepared, filter, searchAggregate, previewPrepared, profileData, exportData, applyRecipe, previewRecipe, previewCompose, exportCompose, composeConnectionOptions]);
+    validateRules,
+    runAnalysis,
+  }), [ready, recovering, progress, loadFile, inspectFile, loadDemo, activatePrepared, registerPreparedCopy, unregisterPrepared, materializeComposePrepared, filter, searchAggregate, searchAggregateForAgent, resolveAgentValue, previewPrepared, profileData, exportData, applyRecipe, previewRecipe, previewCompose, exportCompose, composeConnectionOptions, validateRules, runAnalysis]);
 }

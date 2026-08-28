@@ -60,6 +60,10 @@ export function createFlowGraph() {
     sourceAssets: [],
     preparedInputs: [],
     composeNodes: [],
+    semanticModels: {},
+    validationRules: [],
+    validationRuns: [],
+    analyses: [],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -334,6 +338,9 @@ export function duplicatePreparedInput(graph, preparedInputId) {
       revision: graph.revision + 1,
       activeNodeId: copy.id,
       preparedInputs: [...graph.preparedInputs, copy],
+      semanticModels: graph.semanticModels?.[source.id]
+        ? { ...graph.semanticModels, [copy.id]: { ...structuredClone(graph.semanticModels[source.id]), targetId: copy.id, revision: 1, updatedAt: new Date().toISOString() } }
+        : graph.semanticModels ?? {},
       updatedAt: new Date().toISOString(),
     },
     preparedInput: copy,
@@ -445,6 +452,10 @@ export function removeComposeNode(graph, nodeId) {
     revision: graph.revision + 1,
     activeNodeId: graph.activeNodeId === nodeId ? current.inputIds?.[0] ?? graph.preparedInputs[0]?.id ?? null : graph.activeNodeId,
     composeNodes,
+    semanticModels: Object.fromEntries(Object.entries(graph.semanticModels ?? {}).filter(([id]) => id !== nodeId)),
+    validationRules: (graph.validationRules ?? []).filter((rule) => rule.targetId !== nodeId),
+    validationRuns: (graph.validationRuns ?? []).filter((run) => run.targetId !== nodeId),
+    analyses: (graph.analyses ?? []).filter((analysis) => analysis.targetId !== nodeId),
     updatedAt: new Date().toISOString(),
   };
   validateFlowGraph(candidate);
@@ -473,6 +484,10 @@ export function removePreparedInput(graph, preparedInputId) {
       : graph.activeNodeId,
     sourceAssets,
     preparedInputs,
+    semanticModels: Object.fromEntries(Object.entries(graph.semanticModels ?? {}).filter(([id]) => id !== preparedInputId)),
+    validationRules: (graph.validationRules ?? []).filter((rule) => rule.targetId !== preparedInputId),
+    validationRuns: (graph.validationRuns ?? []).filter((run) => run.targetId !== preparedInputId),
+    analyses: (graph.analyses ?? []).filter((analysis) => analysis.targetId !== preparedInputId),
     updatedAt: new Date().toISOString(),
   };
   validateFlowGraph(candidate);

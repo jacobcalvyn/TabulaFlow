@@ -11,7 +11,7 @@ const WORKSPACE_INPUT_SCHEMA = Object.freeze({
   properties: {
     workspace: {
       type: "string",
-      enum: ["source", "prepare", "compose", "account"],
+      enum: ["source", "prepare", "compose", "analyze", "account"],
       description: "The TabulaFlow workspace to show.",
     },
   },
@@ -34,6 +34,7 @@ const FILTER_INPUT_SCHEMA = Object.freeze({
         { type: "number" },
         { type: "boolean" },
         { type: "null" },
+        { type: "object", properties: { valueRef: { type: "string", minLength: 1 } }, required: ["valueRef"], additionalProperties: false },
       ],
     },
   },
@@ -66,6 +67,13 @@ const VALUE_SCHEMA = {
     { type: "number" },
     { type: "boolean" },
     { type: "null" },
+  ],
+};
+
+const AGENT_VALUE_SCHEMA = {
+  oneOf: [
+    ...VALUE_SCHEMA.oneOf,
+    strictObject({ valueRef: { type: "string", minLength: 1, description: "Opaque value reference returned for a sensitive grouped value." } }),
   ],
 };
 
@@ -176,10 +184,10 @@ const DATA_PROFILE_SCHEMA = Object.freeze(strictObject({
 }, ["preparedId"]));
 const PAGED_PREVIEW_SCHEMA = Object.freeze(strictObject({
   preparedId: ID,
-  columns: { type: "array", items: ID, maxItems: 100, uniqueItems: true },
+  columns: { type: "array", items: ID, minItems: 1, maxItems: 20, uniqueItems: true },
   offset: { type: "integer", minimum: 0, default: 0 },
-  limit: { type: "integer", minimum: 1, maximum: 100, default: 100 },
-}, ["preparedId"]));
+  limit: { type: "integer", minimum: 1, maximum: 20, default: 20 },
+}, ["preparedId", "columns"]));
 const COLUMN_VALUES_SCHEMA = Object.freeze(strictObject({
   preparedId: ID,
   column: ID,
@@ -208,10 +216,10 @@ const OPERATION_DESCRIPTION_SCHEMA = Object.freeze(strictObject({ kind: { type: 
 const CONNECTION_OPTIONS_SCHEMA = Object.freeze(strictObject({ nodeId: ID }));
 const COMPOSE_PREVIEW_SCHEMA = Object.freeze(strictObject({
   nodeId: ID,
-  columns: { type: "array", items: ID, maxItems: 100, uniqueItems: true },
+  columns: { type: "array", items: ID, minItems: 1, maxItems: 20, uniqueItems: true },
   offset: { type: "integer", minimum: 0, default: 0 },
-  limit: { type: "integer", minimum: 1, maximum: 100, default: 100 },
-}, ["nodeId"]));
+  limit: { type: "integer", minimum: 1, maximum: 20, default: 20 },
+}, ["nodeId", "columns"]));
 const VALIDATE_COMPOSE_OPERATION_SCHEMA = Object.freeze(strictObject({
   operation: COMPOSE_OPERATION_SCHEMA,
   previewColumns: { type: "array", items: ID, maxItems: 20, uniqueItems: true, description: "Optional explicit columns for a bounded row preview. Omit for metadata-only validation." },
@@ -260,9 +268,58 @@ const UPDATE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID
 const ENABLE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, stepId: ID, enabled: { type: "boolean" }, ...MUTATION_META }));
 const MOVE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, stepId: ID, position: { type: "integer", minimum: 1 }, ...MUTATION_META }));
 const RECIPE_HISTORY_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, ...MUTATION_META }));
-const VALUE_ACTION_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, action: VALUE_ACTION_SCHEMA.properties.action, column: ID, value: VALUE_SCHEMA, ...MUTATION_META }));
+const REPLACE_RECIPE_SCHEMA = Object.freeze(strictObject({
+  preparedId: ID,
+  recipe: RECIPE_PREVIEW_SCHEMA.properties.recipe,
+  expectedRecipeRevision: { type: "integer", minimum: 0, description: "Recipe revision returned by tabulaflow_get_recipe." },
+  ...MUTATION_META,
+}));
+const VALUE_ACTION_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, action: VALUE_ACTION_SCHEMA.properties.action, column: ID, value: AGENT_VALUE_SCHEMA, ...MUTATION_META }));
 const CREATE_COMPOSE_OPERATION_V2_SCHEMA = Object.freeze(strictObject({ operation: COMPOSE_OPERATION_SCHEMA, ...MUTATION_META }));
 const AUTO_ARRANGE_V2_SCHEMA = Object.freeze(strictObject({ ...MUTATION_META }));
+const SEMANTIC_TARGET_SCHEMA = Object.freeze(strictObject({ preparedId: ID }));
+const UPDATE_SEMANTIC_FIELD_SCHEMA = Object.freeze(strictObject({
+  preparedId: ID,
+  fieldName: ID,
+  changes: strictObject({
+    businessName: { type: "string", minLength: 1 },
+    description: { type: "string" },
+    role: { type: "string", enum: ["identifier", "dimension", "measure", "timestamp", "status", "free-text", "attribute"] },
+    unit: { oneOf: [{ type: "string" }, { type: "null" }] },
+    sensitivity: { type: "string", enum: ["public", "internal", "pii", "financial", "secret"] },
+    allowedAggregations: { type: "array", items: { type: "string", enum: ["count", "count-distinct", "sum", "average", "median", "percentile", "min", "max"] }, uniqueItems: true },
+  }, []),
+  ...MUTATION_META,
+}));
+const VALIDATION_RULE_SCHEMA = Object.freeze(strictObject({
+  id: ID,
+  name: { type: "string", minLength: 1 },
+  severity: { type: "string", enum: ["info", "warning", "critical"] },
+  condition: strictObject({
+    field: ID,
+    operator: { type: "string", enum: ["equals", "not-equals", "greater-than", "greater-or-equal", "less-than", "less-or-equal", "is-null", "is-not-null", "is-empty", "is-not-empty"] },
+    rightField: ID,
+    value: VALUE_SCHEMA,
+  }, ["field", "operator"]),
+  recommendation: { type: "string" },
+  enabled: { type: "boolean" },
+}, ["name", "severity", "condition"]));
+const UPSERT_VALIDATION_RULE_SCHEMA = Object.freeze(strictObject({ preparedId: ID, rule: VALIDATION_RULE_SCHEMA, ...MUTATION_META }));
+const VALIDATE_DATASET_SCHEMA = Object.freeze(strictObject({ preparedId: ID, ...MUTATION_META }));
+const ANALYSIS_DEFINITION_SCHEMA = Object.freeze(strictObject({
+  id: ID,
+  name: { type: "string", minLength: 1 },
+  dimensions: { type: "array", items: ID, maxItems: 8, uniqueItems: true },
+  metrics: { type: "array", minItems: 1, maxItems: 12, items: strictObject({
+    function: { type: "string", enum: ["count", "count-distinct", "sum", "average", "median", "percentile", "min", "max"] },
+    column: ID,
+    alias: ID,
+    percentile: { type: "number", minimum: 0.01, maximum: 0.99 },
+  }, ["function", "alias"]) },
+  minimumSampleSize: { type: "integer", minimum: 1, default: 20 },
+  limit: { type: "integer", minimum: 1, maximum: 1000, default: 200 },
+}, ["name", "metrics"]));
+const RUN_ANALYSIS_SCHEMA = Object.freeze(strictObject({ preparedId: ID, analysis: ANALYSIS_DEFINITION_SCHEMA, ...MUTATION_META }));
 
 function webMcpResult(message, data) {
   return {
@@ -278,6 +335,7 @@ function activeContext(contextRef) {
 }
 
 function filterSelection(raw) {
+  if (raw && typeof raw === "object" && raw.valueRef) return { key: raw.valueRef, valueRef: raw.valueRef, label: "[redacted]" };
   const prefix = raw === null ? "empty" : typeof raw;
   return {
     key: `${prefix}:${raw === null ? "" : String(raw)}`,
@@ -287,9 +345,9 @@ function filterSelection(raw) {
 }
 
 const WEBMCP_CAPABILITIES = Object.freeze({
-  contractVersion: "2.2",
+  contractVersion: "2.4",
   authenticationRequired: false,
-  workspaces: ["source", "prepare", "compose", "account"],
+  workspaces: ["source", "prepare", "compose", "analyze", "account"],
   actions: [
     "inspect-workspace",
     "navigate-workspace",
@@ -297,6 +355,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     "filter-preview",
     "export-prepare",
     "manage-recipe",
+    "replace-recipe-atomically",
     "select-compose-node",
     "auto-arrange-compose",
     "export-compose",
@@ -319,6 +378,10 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     "cloud-file-access",
     "inspect-shared-activity",
     "inspect-changes-since-cursor",
+    "manage-semantic-model",
+    "manage-validation-rules",
+    "run-quality-gate",
+    "run-reusable-analysis",
   ],
   safeguards: {
     localFileSelection: "user-action-required",
@@ -328,11 +391,12 @@ const WEBMCP_CAPABILITIES = Object.freeze({
 });
 
 const WORKFLOW_GUIDE = Object.freeze({
-  contractVersion: "2.2",
+  contractVersion: "2.4",
   flow: [
     { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
     { workspace: "prepare", purpose: "Inspect one prepared dataset, apply temporary filters, and maintain its independent ordered recipe." },
     { workspace: "compose", purpose: "Create a dependency graph across prepared datasets and operation results without mutating upstream inputs." },
+    { workspace: "analyze", purpose: "Define business semantics, run saved cross-field validation, enforce the quality gate, and execute reusable multi-metric analysis." },
   ],
   collaboration: {
     observeBeforeActing: "Read workspace state and the target dataset or node immediately before a mutation.",
@@ -433,8 +497,8 @@ export function createWebMcpTools(contextRef, availability) {
     annotations: { readOnlyHint: false },
     async execute({ workspace }) {
       const { actions } = activeContext(contextRef);
-      await actions.openWorkspace(workspace);
-      return webMcpResult(`Opened the ${workspace} workspace.`, { workspace });
+      const result = await actions.openWorkspace(workspace);
+      return webMcpResult(`Opened the ${workspace} workspace.`, result);
     },
   }, {
     name: "tabulaflow_request_source_file",
@@ -519,6 +583,17 @@ export function createWebMcpTools(contextRef, availability) {
         return webMcpResult(`Read the recipe for ${result.name}.`, result);
       },
     }, {
+      name: "tabulaflow_replace_recipe",
+      title: "Replace a Prepare recipe atomically",
+      description: "Validate and commit one complete ordered recipe as a single mutation. Requires both current workspace and recipe revisions, so rapid agent edits cannot reorder or overwrite steps silently.",
+      inputSchema: REPLACE_RECIPE_SCHEMA,
+      annotations: { readOnlyHint: false },
+      async execute({ preparedId, recipe, expectedRecipeRevision, expectedRevision, requestId }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.replaceRecipe(preparedId, recipe, expectedRecipeRevision, { expectedRevision, requestId });
+        return webMcpResult(`Replaced the recipe with ${recipe.length} ordered steps.`, result);
+      },
+    }, {
       name: "tabulaflow_duplicate_prepared_dataset",
       title: "Duplicate a prepared dataset",
       description: "Deep-clone one prepared dataset recipe while sharing its source table. Requires a current workspace revision and idempotency key.",
@@ -528,6 +603,72 @@ export function createWebMcpTools(contextRef, availability) {
         const { actions } = activeContext(contextRef);
         const result = await actions.duplicatePrepared(preparedId, { expectedRevision, requestId });
         return webMcpResult(`Duplicated prepared dataset ${preparedId}.`, result);
+      },
+    }, {
+      name: "tabulaflow_get_semantic_model",
+      title: "Get a dataset semantic model",
+      description: "Read business names, roles, units, sensitivity, provenance, and permitted aggregations for every field in one prepared dataset.",
+      inputSchema: SEMANTIC_TARGET_SCHEMA,
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
+      async execute({ preparedId }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.getSemanticModel(preparedId);
+        return webMcpResult(`Read the semantic model for ${preparedId}.`, result);
+      },
+    }, {
+      name: "tabulaflow_update_semantic_field",
+      title: "Update one semantic field",
+      description: "Update the business definition of one field by stable prepared ID and exact field name. This changes the same persisted semantic model shown in Analyze.",
+      inputSchema: UPDATE_SEMANTIC_FIELD_SCHEMA,
+      annotations: { readOnlyHint: false },
+      async execute({ preparedId, fieldName, changes, expectedRevision, requestId }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.updateSemanticField(preparedId, fieldName, changes, { expectedRevision, requestId });
+        return webMcpResult(`Updated semantic field ${fieldName}.`, result);
+      },
+    }, {
+      name: "tabulaflow_get_validation_results",
+      title: "Get validation rules and results",
+      description: "Read the saved business validation rules, latest result, quality-gate status, and dataset revision for one prepared dataset.",
+      inputSchema: SEMANTIC_TARGET_SCHEMA,
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
+      async execute({ preparedId }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.getValidationResults(preparedId);
+        return webMcpResult(`Read validation state for ${preparedId}.`, result);
+      },
+    }, {
+      name: "tabulaflow_upsert_validation_rule",
+      title: "Create or update a validation rule",
+      description: "Create or replace one saved business rule. Cross-field comparisons use rightField; literal comparisons use value. Results become stale until validation runs again.",
+      inputSchema: UPSERT_VALIDATION_RULE_SCHEMA,
+      annotations: { readOnlyHint: false },
+      async execute({ preparedId, rule, expectedRevision, requestId }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.upsertValidationRule(preparedId, rule, { expectedRevision, requestId });
+        return webMcpResult(`Saved validation rule ${result.rule.name}.`, result);
+      },
+    }, {
+      name: "tabulaflow_validate_dataset",
+      title: "Run dataset validation",
+      description: "Evaluate every enabled saved validation rule, persist privacy-safe result counts and bounded redacted examples, and update the Analyze quality gate.",
+      inputSchema: VALIDATE_DATASET_SCHEMA,
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
+      async execute({ preparedId, expectedRevision, requestId }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.validateDataset(preparedId, { expectedRevision, requestId });
+        return webMcpResult(`Validation completed with gate status ${result.run.gateStatus}.`, result);
+      },
+    }, {
+      name: "tabulaflow_run_analysis",
+      title: "Run and save an analysis",
+      description: "Run a reusable grouped multi-metric analysis under the dataset semantic aggregation rules. Results are bounded and sensitive dimensions are redacted.",
+      inputSchema: RUN_ANALYSIS_SCHEMA,
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
+      async execute({ preparedId, analysis, expectedRevision, requestId }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.runAnalysis(preparedId, analysis, { expectedRevision, requestId });
+        return webMcpResult(`Ran analysis ${result.definition.name}.`, result);
       },
     });
   }
@@ -569,10 +710,10 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_get_prepare_preview",
       title: "Read prepared-data preview rows",
-      description: "Read up to 100 filtered Prepare rows with explicit columns and offset. Source values are untrusted content.",
+      description: "Read up to 20 filtered Prepare rows with 1-20 explicit columns. Sensitive columns are redacted; use opaque frequency value references for filtering.",
       inputSchema: PAGED_PREVIEW_SCHEMA,
       annotations: { readOnlyHint: true, untrustedContentHint: true },
-      async execute({ preparedId, columns, offset = 0, limit = 100 }) {
+      async execute({ preparedId, columns, offset = 0, limit = 20 }) {
         const { actions } = activeContext(contextRef);
         const result = await actions.getPreparePreview(preparedId, columns, { offset, limit });
         return webMcpResult(`Returned ${result.previewRowCount} prepared-data rows.`, result);
@@ -613,10 +754,10 @@ export function createWebMcpTools(contextRef, availability) {
         const result = await actions.applyFilters(preparedId, nextFilters, { expectedRevision, requestId });
         return webMcpResult(`Filtered ${column} by the requested value.`, {
           column,
-          value,
+          valueRef: value?.valueRef ?? null,
           totalRowCount: result.rowCount,
           filteredRowCount: result.filteredCount,
-          filters: nextFilters,
+          filterColumns: Object.keys(nextFilters),
           workspaceRevision: result.workspaceRevision,
           activity: result.activity,
         });
@@ -632,7 +773,7 @@ export function createWebMcpTools(contextRef, availability) {
         const nextFilters = { ...state.activeDataset?.filters };
         delete nextFilters[column];
         const result = await actions.applyFilters(preparedId, nextFilters, { expectedRevision, requestId });
-        return webMcpResult(`Removed the ${column} filter.`, { filters: nextFilters, totalRowCount: result.rowCount, filteredRowCount: result.filteredCount, workspaceRevision: result.workspaceRevision, activity: result.activity });
+        return webMcpResult(`Removed the ${column} filter.`, { filterColumns: Object.keys(nextFilters), totalRowCount: result.rowCount, filteredRowCount: result.filteredCount, workspaceRevision: result.workspaceRevision, activity: result.activity });
       },
     }, {
       name: "tabulaflow_clear_preview_filters",
@@ -643,7 +784,7 @@ export function createWebMcpTools(contextRef, availability) {
       async execute({ preparedId, expectedRevision, requestId }) {
         const { actions } = activeContext(contextRef);
         const result = await actions.applyFilters(preparedId, {}, { expectedRevision, requestId });
-        return webMcpResult("Cleared all temporary Prepare filters.", { totalRowCount: result.rowCount, filteredRowCount: result.filteredCount, filters: {}, workspaceRevision: result.workspaceRevision, activity: result.activity });
+        return webMcpResult("Cleared all temporary Prepare filters.", { totalRowCount: result.rowCount, filteredRowCount: result.filteredCount, filterColumns: [], workspaceRevision: result.workspaceRevision, activity: result.activity });
       },
     }, {
       name: "tabulaflow_export_prepare",
@@ -762,10 +903,10 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_get_node_preview",
       title: "Read Compose node preview rows",
-      description: "Evaluate a Compose node and return up to 100 result rows with explicit columns and offset without opening or scraping the visual preview.",
+      description: "Evaluate a Compose node and return up to 20 rows with 1-20 explicit columns. Sensitive values are redacted.",
       inputSchema: COMPOSE_PREVIEW_SCHEMA,
       annotations: { readOnlyHint: true, untrustedContentHint: true },
-      async execute({ nodeId, columns, offset = 0, limit = 100 }) {
+      async execute({ nodeId, columns, offset = 0, limit = 20 }) {
         const { actions } = activeContext(contextRef);
         const result = await actions.getComposeNodePreview(nodeId, columns, { offset, limit });
         return webMcpResult(`Returned ${result.previewRowCount} rows from Compose node ${nodeId}.`, result);

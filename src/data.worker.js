@@ -2,11 +2,14 @@ import * as duckdb from "@duckdb/duckdb-wasm";
 import { DUCKDB_BUNDLES } from "@duckdb-bundles";
 import { compileComposeOperation } from "./composeSql.js";
 import { DATA_LIMITS, makeDemoRows, normalizeEmptyValues, parseDataFile } from "./data.js";
-import { canExposeProfileRange, classifyColumnSemantics } from "./dataPrivacy.js";
+import { canExposeProfileRange, classifyColumnSemantics, redactAgentRows, shouldRedactAgentValues } from "./dataPrivacy.js";
 import { encodeSpreadsheetExport, sanitizeExportBaseName } from "./dataExport.js";
 import { buildJoinKeyCandidates, rankJoinKeyCandidates } from "./joinRecommendations.js";
 import { recipeForExecution } from "./preparedRecipeState.js";
 import { collectSourceColumns } from "./sourceInspection.js";
+import { qualityCoverage, qualityProfileBatches } from "./qualityProfiling.js";
+import { compileAnalysis } from "./analysisEngine.js";
+import { compileValidationCondition, validationFields } from "./validationEngine.js";
 import { compileRecipe, compileRecipeSafely, INTERNAL_ROW_ID } from "./transformations.js";
 
 const AGGREGATE_LIMIT = 100;
@@ -14,6 +17,10 @@ const WEBMCP_PREVIEW_COLUMN_LIMIT = 100;
 const WEBMCP_PROFILE_COLUMN_LIMIT = 50;
 const WEBMCP_DRY_RUN_PREVIEW_COLUMN_LIMIT = 20;
 const WEBMCP_DRY_RUN_PREVIEW_ROW_LIMIT = 20;
+const WEBMCP_AGENT_PREVIEW_COLUMN_LIMIT = 20;
+const WEBMCP_AGENT_PREVIEW_ROW_LIMIT = 20;
+const QUALITY_PROFILE_BATCH_SIZE = 40;
+const AGENT_MIN_GROUP_COUNT = 3;
 const SOURCE_TABLE = "source_data";
 const WORKING_VIEW = "working_data";
 let databasePromise = null;
@@ -36,6 +43,7 @@ let activeRequestId = null;
 const sourceRegistry = new Map();
 const preparedRegistry = new Map();
 let activePreparedId = null;
+const agentValueRefs = new Map();
 
 function reportProgress(phase, percent) {
   if (activeRequestId === null) return;
@@ -146,6 +154,22 @@ function aggregateItem(row, type) {
   return { key: `${prefix}:${raw === null ? "" : String(raw)}`, label, raw, count: Number(row.count) };
 }
 
+function agentValueReference(column, raw) {
+  const valueRef = createRegistryId("value");
+  agentValueRefs.set(valueRef, { preparedId: activePreparedId, datasetId, column, raw });
+  return valueRef;
+}
+
+function resolveAgentValueReference(valueRef, column = null) {
+  const reference = agentValueRefs.get(valueRef);
+  if (!reference || reference.preparedId !== activePreparedId || reference.datasetId !== datasetId || (column && reference.column !== column)) {
+    const error = new Error("The value reference is stale or does not belong to the active column. Query column values again.");
+    error.code = "STALE_VALUE_REFERENCE";
+    throw error;
+  }
+  return reference.raw;
+}
+
 function filterParameter(value) {
   if (value instanceof Date) return value.toISOString();
   if (typeof value === "object" && value !== null) return JSON.stringify(value);
@@ -158,7 +182,8 @@ function buildWhere(filters = {}, excludedColumn = null) {
   for (const [column, selection] of Object.entries(filters)) {
     if (column === excludedColumn || !columnTypes.has(column) || !selection) continue;
     const identifier = quoteIdentifier(column);
-    if (selection.raw === null || selection.raw === undefined) {
+    const raw = selection.valueRef ? resolveAgentValueReference(selection.valueRef, column) : selection.raw;
+    if (raw === null || raw === undefined) {
       clauses.push(`${identifier} IS NULL`);
     } else {
       const type = String(columnTypes.get(column)).toUpperCase();
@@ -167,10 +192,14 @@ function buildWhere(filters = {}, excludedColumn = null) {
       } else {
         clauses.push(`${identifier} = CAST(? AS ${columnTypes.get(column)})`);
       }
-      parameters.push(filterParameter(selection.raw));
+      parameters.push(filterParameter(raw));
     }
   }
   return { sql: clauses.length ? `WHERE ${clauses.join(" AND ")}` : "", parameters };
+}
+
+function clearAgentValueReferences() {
+  agentValueRefs.clear();
 }
 
 function displayProjection(selectedColumns = columns) {
@@ -204,6 +233,7 @@ function selectedKnownColumns(requestedColumns, maximum = WEBMCP_PREVIEW_COLUMN_
 }
 
 async function refreshMetadata({ requireRows = false } = {}) {
+  clearAgentValueReferences();
   const description = await query(`DESCRIBE ${WORKING_VIEW}`);
   const visibleDescription = description.filter((item) => item.column_name !== INTERNAL_ROW_ID);
   columns = visibleDescription.map((item) => item.column_name);
@@ -317,88 +347,76 @@ async function analyzeQuality() {
   const affectedColumns = [];
   let emptyCells = 0;
   let mixedColumns = 0;
-  const profiledColumns = columns.slice(0, DATA_LIMITS.maxAggregateColumns);
-  const scalarExpressions = [];
-  const jsonProfiles = [];
-
-  profiledColumns.forEach((column, index) => {
-    const identifier = quoteIdentifier(column);
-    const normalizedType = String(columnTypes.get(column)).toUpperCase();
-    scalarExpressions.push(`COUNT(*) FILTER (WHERE ${identifier} IS NULL OR TRIM(CAST(${identifier} AS VARCHAR)) = '') AS quality_${index}_missing`);
-    if (normalizedType.includes("VARCHAR")) {
-      scalarExpressions.push(
-        `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NOT NULL) AS quality_${index}_numeric`,
-        `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) IN ('true', 'false')) AS quality_${index}_boolean`,
-        `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) NOT IN ('true', 'false') AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DATE) IS NOT NULL) AS quality_${index}_date`,
-        `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) NOT IN ('true', 'false') AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DATE) IS NULL) AS quality_${index}_text`,
-      );
-    } else if (normalizedType.includes("JSON")) {
-      jsonProfiles.push({ column, index });
-    }
-  });
-
-  const scalarProfile = scalarExpressions.length
-    ? (await query(`SELECT ${scalarExpressions.join(",\n")} FROM ${WORKING_VIEW}`))[0] ?? {}
-    : {};
-  const jsonProfileRows = jsonProfiles.length
-    ? await query(jsonProfiles.map(({ column, index }) => {
+  for (const batch of qualityProfileBatches(columns, QUALITY_PROFILE_BATCH_SIZE)) {
+    const scalarExpressions = [];
+    const jsonProfiles = [];
+    batch.forEach((column, index) => {
       const identifier = quoteIdentifier(column);
-      return `SELECT ${index} AS column_index, JSON_TYPE(${identifier}) AS source_type
-        FROM ${WORKING_VIEW}
-        WHERE ${identifier} IS NOT NULL
-        GROUP BY source_type`;
-    }).join("\nUNION ALL\n"))
-    : [];
-  const jsonTypesByColumn = new Map();
-  for (const row of jsonProfileRows) {
-    const index = Number(row.column_index);
-    const categories = jsonTypesByColumn.get(index) ?? new Set();
-    const sourceType = String(row.source_type).toUpperCase();
-    if (["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL"].includes(sourceType)) categories.add("angka");
-    else if (sourceType === "BOOLEAN") categories.add("boolean");
-    else categories.add("teks");
-    jsonTypesByColumn.set(index, categories);
-  }
-
-  profiledColumns.forEach((column, index) => {
-    const type = columnTypes.get(column);
-    const missing = Number(scalarProfile[`quality_${index}_missing`] ?? 0);
-    let mixed = false;
-    let types = [typeToUi(type)];
-    const normalizedType = String(type).toUpperCase();
-    if (normalizedType.includes("VARCHAR")) {
-      const categories = [
-        ["angka", Number(scalarProfile[`quality_${index}_numeric`] ?? 0)],
-        ["boolean", Number(scalarProfile[`quality_${index}_boolean`] ?? 0)],
-        ["tanggal", Number(scalarProfile[`quality_${index}_date`] ?? 0)],
-        ["teks", Number(scalarProfile[`quality_${index}_text`] ?? 0)],
-      ].filter(([, count]) => count > 0);
-      mixed = categories.length > 1;
-      types = categories.map(([name]) => name);
-    } else if (normalizedType.includes("JSON")) {
+      const normalizedType = String(columnTypes.get(column)).toUpperCase();
+      scalarExpressions.push(`COUNT(*) FILTER (WHERE ${identifier} IS NULL OR TRIM(CAST(${identifier} AS VARCHAR)) = '') AS quality_${index}_missing`);
+      if (normalizedType.includes("VARCHAR")) {
+        scalarExpressions.push(
+          `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NOT NULL) AS quality_${index}_numeric`,
+          `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) IN ('true', 'false')) AS quality_${index}_boolean`,
+          `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) NOT IN ('true', 'false') AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DATE) IS NOT NULL) AS quality_${index}_date`,
+          `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) NOT IN ('true', 'false') AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DATE) IS NULL) AS quality_${index}_text`,
+        );
+      } else if (normalizedType.includes("JSON")) jsonProfiles.push({ column, index });
+    });
+    const scalarProfile = scalarExpressions.length ? (await query(`SELECT ${scalarExpressions.join(",\n")} FROM ${WORKING_VIEW}`))[0] ?? {} : {};
+    const jsonProfileRows = jsonProfiles.length ? await query(jsonProfiles.map(({ column, index }) => {
+      const identifier = quoteIdentifier(column);
+      return `SELECT ${index} AS column_index, JSON_TYPE(${identifier}) AS source_type FROM ${WORKING_VIEW} WHERE ${identifier} IS NOT NULL GROUP BY source_type`;
+    }).join("\nUNION ALL\n")) : [];
+    const jsonTypesByColumn = new Map();
+    for (const row of jsonProfileRows) {
+      const index = Number(row.column_index);
       const categories = jsonTypesByColumn.get(index) ?? new Set();
-      mixed = categories.size > 1;
-      types = [...categories];
-    } else if (normalizedType.includes("UNION")) {
-      const categories = [
-        /INT|DECIMAL|DOUBLE|FLOAT/.test(normalizedType) && "angka",
-        normalizedType.includes("BOOLEAN") && "boolean",
-        /DATE|TIME/.test(normalizedType) && "tanggal",
-        /VARCHAR|CHAR/.test(normalizedType) && "teks",
-      ].filter(Boolean);
-      types = [...new Set(categories)];
-      mixed = types.length > 1;
+      const sourceType = String(row.source_type).toUpperCase();
+      if (["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL"].includes(sourceType)) categories.add("angka");
+      else if (sourceType === "BOOLEAN") categories.add("boolean");
+      else categories.add("teks");
+      jsonTypesByColumn.set(index, categories);
     }
-    emptyCells += missing;
-    if (mixed) mixedColumns += 1;
-    if (missing > 0 || mixed) affectedColumns.push({ column, missing, mixed, types });
-  });
+    batch.forEach((column, index) => {
+      const type = columnTypes.get(column);
+      const missing = Number(scalarProfile[`quality_${index}_missing`] ?? 0);
+      let mixed = false;
+      let types = [typeToUi(type)];
+      const normalizedType = String(type).toUpperCase();
+      if (normalizedType.includes("VARCHAR")) {
+        const categories = [
+          ["angka", Number(scalarProfile[`quality_${index}_numeric`] ?? 0)],
+          ["boolean", Number(scalarProfile[`quality_${index}_boolean`] ?? 0)],
+          ["tanggal", Number(scalarProfile[`quality_${index}_date`] ?? 0)],
+          ["teks", Number(scalarProfile[`quality_${index}_text`] ?? 0)],
+        ].filter(([, count]) => count > 0);
+        mixed = categories.length > 1;
+        types = categories.map(([name]) => name);
+      } else if (normalizedType.includes("JSON")) {
+        const categories = jsonTypesByColumn.get(index) ?? new Set();
+        mixed = categories.size > 1;
+        types = [...categories];
+      } else if (normalizedType.includes("UNION")) {
+        const categories = [
+          /INT|DECIMAL|DOUBLE|FLOAT/.test(normalizedType) && "angka",
+          normalizedType.includes("BOOLEAN") && "boolean",
+          /DATE|TIME/.test(normalizedType) && "tanggal",
+          /VARCHAR|CHAR/.test(normalizedType) && "teks",
+        ].filter(Boolean);
+        types = [...new Set(categories)];
+        mixed = types.length > 1;
+      }
+      emptyCells += missing;
+      if (mixed) mixedColumns += 1;
+      if (missing > 0 || mixed) affectedColumns.push({ column, missing, mixed, types });
+    });
+  }
   return {
     emptyCells,
     mixedColumns,
     affectedColumns,
-    profiledColumnCount: profiledColumns.length,
-    totalColumnCount: columns.length,
+    ...qualityCoverage(columns.length, columns.length),
   };
 }
 
@@ -522,12 +540,50 @@ async function searchAggregate(column, searchText, filters, offset = 0, limit = 
   };
 }
 
-async function previewPreparedData(filters = {}, requestedColumns, offset = 0, limit = 100) {
-  const page = normalizedPage(offset, limit);
-  const selectedColumns = selectedKnownColumns(requestedColumns);
+async function searchAggregateForAgent(column, searchText, filters, offset = 0, limit = AGGREGATE_LIMIT) {
+  const semantics = classifyColumnSemantics(column, columnTypes.get(column));
+  if (!shouldRedactAgentValues(semantics)) {
+    return { ...(await searchAggregate(column, searchText, filters, offset, Math.min(limit, 100))), semantics, valuesRedacted: false };
+  }
+  if (String(searchText ?? "").trim()) {
+    const error = new Error("Searching raw values is disabled for sensitive columns. Request the grouped value references without a search term.");
+    error.code = "SENSITIVE_VALUE_SEARCH_DISABLED";
+    throw error;
+  }
+  const rawResult = await searchAggregate(column, "", filters, offset, Math.min(limit, 100));
+  const values = rawResult.values
+    .filter((item) => item.raw === null || item.count >= AGENT_MIN_GROUP_COUNT)
+    .map((item) => {
+      if (item.raw === null) return { key: item.key, label: "", raw: null, count: item.count };
+      const valueRef = agentValueReference(column, item.raw);
+      return { key: valueRef, label: "[redacted]", valueRef, count: item.count };
+    });
+  return {
+    column,
+    values,
+    matchCount: values.length,
+    suppressedGroupCount: Math.max(0, rawResult.values.length - values.length),
+    minimumGroupCount: AGENT_MIN_GROUP_COUNT,
+    offset: rawResult.offset,
+    limit: rawResult.limit,
+    semantics,
+    valuesRedacted: true,
+  };
+}
+
+async function previewPreparedData(filters = {}, requestedColumns, offset = 0, limit = 100, { agentMode = false } = {}) {
+  if (agentMode && (!Array.isArray(requestedColumns) || requestedColumns.length === 0)) {
+    const error = new Error("Agent previews require an explicit non-empty columns list.");
+    error.code = "EXPLICIT_COLUMNS_REQUIRED";
+    throw error;
+  }
+  const page = normalizedPage(offset, agentMode ? Math.min(limit, WEBMCP_AGENT_PREVIEW_ROW_LIMIT) : limit);
+  const selectedColumns = selectedKnownColumns(requestedColumns, agentMode ? WEBMCP_AGENT_PREVIEW_COLUMN_LIMIT : WEBMCP_PREVIEW_COLUMN_LIMIT);
   const where = buildWhere(filters);
   const counts = await query(`SELECT COUNT(*) AS filtered_count FROM ${WORKING_VIEW} ${where.sql}`, where.parameters);
   const preview = await query(`SELECT ${displayProjection(selectedColumns)} FROM ${WORKING_VIEW} ${where.sql} LIMIT ${page.limit} OFFSET ${page.offset}`, where.parameters);
+  const schema = selectedColumns.map((column) => ({ name: column, type: columnTypes.get(column) }));
+  const safePreview = agentMode ? redactAgentRows(preview, schema) : { rows: preview, redactedColumns: [] };
   return {
     preparedId: activePreparedId,
     columns: selectedColumns,
@@ -539,7 +595,8 @@ async function previewPreparedData(filters = {}, requestedColumns, offset = 0, l
     previewRowCount: preview.length,
     offset: page.offset,
     limit: page.limit,
-    preview,
+    preview: safePreview.rows,
+    redactedColumns: safePreview.redactedColumns,
   };
 }
 
@@ -744,19 +801,26 @@ async function previewComposeNode(graph, nodeId, options = {}) {
   const schema = relation.schema?.length ? relation.schema : await describeRelation(relation.sql);
   const visibleSchema = schema.filter((column) => column.name !== INTERNAL_ROW_ID);
   const includeRows = options.includeRows !== false;
+  const agentMode = options.agentMode === true;
+  if (agentMode && includeRows && (!Array.isArray(options.columns) || options.columns.length === 0)) {
+    const error = new Error("Agent previews require an explicit non-empty columns list.");
+    error.code = "EXPLICIT_COLUMNS_REQUIRED";
+    throw error;
+  }
   const requestedColumns = includeRows
     ? (Array.isArray(options.columns) && options.columns.length
       ? options.columns.map(String)
       : visibleSchema.slice(0, WEBMCP_PREVIEW_COLUMN_LIMIT).map((column) => column.name))
     : [];
-  if (requestedColumns.length > WEBMCP_PREVIEW_COLUMN_LIMIT) throw new Error(`A maximum of ${WEBMCP_PREVIEW_COLUMN_LIMIT} columns can be returned per request.`);
+  const columnLimit = agentMode ? WEBMCP_AGENT_PREVIEW_COLUMN_LIMIT : WEBMCP_PREVIEW_COLUMN_LIMIT;
+  if (requestedColumns.length > columnLimit) throw new Error(`A maximum of ${columnLimit} columns can be returned per request.`);
   const schemaByName = new Map(visibleSchema.map((column) => [column.name, column]));
   const selectedSchema = requestedColumns.map((column) => {
     const definition = schemaByName.get(column);
     if (!definition) throw new Error(`Column not found on Compose node ${nodeId}: ${column}`);
     return definition;
   });
-  const page = normalizedPage(options.offset, options.limit);
+  const page = normalizedPage(options.offset, agentMode ? Math.min(options.limit ?? WEBMCP_AGENT_PREVIEW_ROW_LIMIT, WEBMCP_AGENT_PREVIEW_ROW_LIMIT) : options.limit);
   const projection = selectedSchema.map((column) => {
     const identifier = quoteIdentifier(column.name);
     return /DATE|TIME/.test(String(column.type).toUpperCase()) ? `CAST(${identifier} AS VARCHAR) AS ${identifier}` : identifier;
@@ -765,6 +829,7 @@ async function previewComposeNode(graph, nodeId, options = {}) {
   const preview = includeRows
     ? await query(`SELECT ${projection} FROM (${relation.sql}) AS compose_preview LIMIT ${page.limit} OFFSET ${page.offset}`)
     : [];
+  const safePreview = agentMode ? redactAgentRows(preview, selectedSchema) : { rows: preview, redactedColumns: [] };
   return {
     nodeId,
     columns: selectedSchema.map((column) => column.name),
@@ -776,7 +841,8 @@ async function previewComposeNode(graph, nodeId, options = {}) {
     previewRowCount: preview.length,
     offset: page.offset,
     limit: page.limit,
-    preview,
+    preview: safePreview.rows,
+    redactedColumns: safePreview.redactedColumns,
   };
 }
 
@@ -945,6 +1011,8 @@ async function previewRecipe(recipe, stepIndex, options = {}) {
     ? 100
     : Math.min(WEBMCP_DRY_RUN_PREVIEW_ROW_LIMIT, Math.max(1, Number(options.limit) || WEBMCP_DRY_RUN_PREVIEW_ROW_LIMIT));
   const preview = includeRows ? await query(`SELECT ${projection} FROM (${compiled.sql}) AS recipe_preview LIMIT ${previewLimit}`) : [];
+  const selectedSchema = requestedColumns.map((name) => ({ name, type: previewTypes.get(name) ?? null }));
+  const safePreview = options.agentMode ? redactAgentRows(preview, selectedSchema) : { rows: preview, redactedColumns: [] };
   return {
     stepIndex: lastIndex,
     stepId: selectedRecipe.at(-1)?.id ?? null,
@@ -952,7 +1020,85 @@ async function previewRecipe(recipe, stepIndex, options = {}) {
     columns: requestedColumns,
     rowCount: Number(countRows[0]?.preview_count ?? 0),
     previewRowCount: preview.length,
-    preview,
+    preview: safePreview.rows,
+    redactedColumns: safePreview.redactedColumns,
+  };
+}
+
+function redactRowsWithSemanticModel(rows, selectedSchema, semanticModel) {
+  const explicit = new Map((semanticModel?.fields ?? []).map((field) => [field.name, field]));
+  const redactedColumns = selectedSchema.filter((column) => {
+    const field = explicit.get(column.name);
+    if (field) return ["pii", "financial", "secret"].includes(field.sensitivity);
+    return shouldRedactAgentValues(classifyColumnSemantics(column.name, column.type));
+  }).map((column) => column.name);
+  const redacted = new Set(redactedColumns);
+  return {
+    redactedColumns,
+    rows: rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, redacted.has(key) && value !== null ? "[redacted]" : value]))),
+  };
+}
+
+async function runValidationRules(preparedId, rules = [], semanticModel = null) {
+  if (preparedId && preparedId !== activePreparedId) await activatePrepared(preparedId);
+  const schema = columns.map((name) => ({ name, type: columnTypes.get(name) ?? null }));
+  const populationRows = await query(`SELECT COUNT(*) AS population_count FROM ${WORKING_VIEW}`);
+  const populationCount = Number(populationRows[0]?.population_count ?? 0);
+  const results = [];
+  for (const rule of rules.filter((item) => item.enabled !== false)) {
+    const predicate = compileValidationCondition(rule.condition, schema);
+    const countResult = await query(`SELECT COUNT(*) AS impacted_count FROM ${WORKING_VIEW} WHERE ${predicate}`);
+    const impactedCount = Number(countResult[0]?.impacted_count ?? 0);
+    const sampleColumns = validationFields(rule.condition).slice(0, 5);
+    const sampleSchema = schema.filter((column) => sampleColumns.includes(column.name));
+    const projection = sampleColumns.map(quoteIdentifier).join(", ");
+    const rawExamples = impactedCount && projection
+      ? await query(`SELECT ${projection} FROM ${WORKING_VIEW} WHERE ${predicate} LIMIT 20`)
+      : [];
+    const safeExamples = redactRowsWithSemanticModel(rawExamples, sampleSchema, semanticModel);
+    results.push({
+      ruleId: rule.id,
+      name: rule.name,
+      severity: rule.severity,
+      impactedCount,
+      populationCount,
+      percentage: populationCount ? impactedCount / populationCount : 0,
+      examples: safeExamples.rows,
+      redactedColumns: safeExamples.redactedColumns,
+      recommendation: rule.recommendation ?? "",
+    });
+  }
+  return { preparedId: activePreparedId, populationCount, results, evaluatedAt: new Date().toISOString() };
+}
+
+async function runAnalysisDefinition(preparedId, definition, semanticModel = null, options = {}) {
+  if (preparedId && preparedId !== activePreparedId) await activatePrepared(preparedId);
+  const schema = columns.map((name) => ({ name, type: columnTypes.get(name) ?? null }));
+  const compiled = compileAnalysis(definition, schema, semanticModel, WORKING_VIEW);
+  const rawRows = await query(compiled.sql);
+  const rawGroupSizes = rawRows.map((row) => Number(row.__tf_group_count ?? 0));
+  const minimumPrivacyGroupSize = options.agentMode ? 3 : 1;
+  const visibleRows = rawRows.filter((row) => Number(row.__tf_group_count ?? 0) >= minimumPrivacyGroupSize);
+  const groupSizes = visibleRows.map((row) => Number(row.__tf_group_count ?? 0));
+  const resultRows = visibleRows.map(({ __tf_group_count, ...row }) => row);
+  const outputSchema = [
+    ...compiled.dimensions.map((name) => schema.find((column) => column.name === name)),
+    ...compiled.metricAliases.map((name) => ({ name, type: "DOUBLE" })),
+  ];
+  const safe = redactRowsWithSemanticModel(resultRows, outputSchema, semanticModel);
+  const minimumSampleSize = Math.max(1, Number(definition.minimumSampleSize) || 20);
+  return {
+    preparedId: activePreparedId,
+    analysisId: definition.id ?? null,
+    columns: outputSchema.map((column) => column.name),
+    rows: safe.rows,
+    groupSizes,
+    redactedColumns: safe.redactedColumns,
+    suppressedGroupCount: rawRows.length - visibleRows.length,
+    warnings: rawGroupSizes.some((count) => count < minimumSampleSize)
+      ? [{ code: "SMALL_SAMPLE", message: `One or more groups contain fewer than ${minimumSampleSize} rows.` }]
+      : [],
+    generatedAt: new Date().toISOString(),
   };
 }
 
@@ -975,7 +1121,9 @@ async function handleRequest(type, payload) {
   if (type === "materialize-compose-prepared") return materializeComposePrepared(payload.graph, payload.nodeId, payload.identifiers);
   if (type === "filter") return buildDataset(payload.filters, payload.aggregateColumns);
   if (type === "search-aggregate") return searchAggregate(payload.column, payload.query, payload.filters, payload.offset, payload.limit);
-  if (type === "prepare-preview") return previewPreparedData(payload.filters, payload.columns, payload.offset, payload.limit);
+  if (type === "search-aggregate-agent") return searchAggregateForAgent(payload.column, payload.query, payload.filters, payload.offset, payload.limit);
+  if (type === "resolve-agent-value") return { raw: resolveAgentValueReference(payload.valueRef, payload.column) };
+  if (type === "prepare-preview") return previewPreparedData(payload.filters, payload.columns, payload.offset, payload.limit, { agentMode: payload.agentMode });
   if (type === "data-profile") return profileDataColumns(payload.columns);
   if (type === "export") return exportRows(payload.format, payload.filters, payload.baseName);
   if (type === "apply-recipe") return applyRecipe(payload.recipe, payload.filters, payload.aggregateColumns, payload.preparedId);
@@ -983,6 +1131,8 @@ async function handleRequest(type, payload) {
   if (type === "compose-preview") return previewComposeNode(payload.graph, payload.nodeId, payload.options);
   if (type === "compose-export") return exportComposeNode(payload.graph, payload.nodeId, payload.format);
   if (type === "compose-connection-options") return composeConnectionOptions(payload.graph, payload.nodeId);
+  if (type === "validate-rules") return runValidationRules(payload.preparedId, payload.rules, payload.semanticModel);
+  if (type === "run-analysis") return runAnalysisDefinition(payload.preparedId, payload.definition, payload.semanticModel, payload.options);
   throw new Error("Operasi worker tidak dikenal.");
 }
 

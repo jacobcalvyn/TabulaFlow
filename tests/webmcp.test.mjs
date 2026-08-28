@@ -12,7 +12,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "2.2", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "2.4", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -35,7 +35,7 @@ function createContext() {
         async getAvailableActions(targetId) { calls.push(["available-actions", targetId]); return { targetId, actions: ["inspect"] }; },
         async getActivityLog(options) { calls.push(["activity", options]); return { events: [{ sequence: 12, actor: "agent" }], cursor: 12, hasMore: false }; },
         async getChangesSince(cursor, options) { calls.push(["changes", cursor, options]); return { events: [], cursor, hasMore: false }; },
-        async openWorkspace(workspace) { calls.push(["workspace", workspace]); },
+        async openWorkspace(workspace) { calls.push(["workspace", workspace]); return { workspace, workspaceRevision: REVISION, activityCursor: 12, activePreparedId: "prepared-a", activeNodeId: "operation-a" }; },
         async requestSourceFileSelection() { calls.push(["file"]); },
         async requestSourceRelink(sourceAssetId) { calls.push(["relink", sourceAssetId]); },
         async listCloudFiles() { calls.push(["cloud-list"]); return { authenticated: true, files: [{ id: "cloud-a" }] }; },
@@ -43,7 +43,14 @@ function createContext() {
         async requestCloudUpload() { calls.push(["cloud-upload"]); },
         async selectPrepared(preparedId, meta) { calls.push(["prepared", preparedId, meta]); },
         async getRecipe(preparedId) { calls.push(["recipe", preparedId]); return { preparedId, name: "Orders", recipe: [] }; },
+        async replaceRecipe(preparedId, recipe, expectedRecipeRevision, meta) { calls.push(["replace-recipe", preparedId, recipe, expectedRecipeRevision, meta]); return result({ recipeRevision: expectedRecipeRevision + 1 }); },
         async duplicatePrepared(preparedId, meta) { calls.push(["duplicate", preparedId, meta]); return result({ preparedInputId: "prepared-b" }); },
+        async getSemanticModel(preparedId) { calls.push(["semantic", preparedId]); return { preparedId, semanticModel: { revision: 1, fields: [] } }; },
+        async updateSemanticField(preparedId, fieldName, changes, meta) { calls.push(["semantic-update", preparedId, fieldName, changes, meta]); return result({ preparedId, semanticRevision: 2 }); },
+        async getValidationResults(preparedId) { calls.push(["validation-results", preparedId]); return { preparedId, rules: [], latestRun: null }; },
+        async upsertValidationRule(preparedId, rule, meta) { calls.push(["validation-upsert", preparedId, rule, meta]); return result({ rule: { ...rule, id: rule.id ?? "rule-a" } }); },
+        async validateDataset(preparedId, meta) { calls.push(["validation-run", preparedId, meta]); return result({ run: { gateStatus: "analysis-ready", results: [] } }); },
+        async runAnalysis(preparedId, analysis, meta) { calls.push(["analysis-run", preparedId, analysis, meta]); return result({ definition: { ...analysis, id: analysis.id ?? "analysis-a" }, result: { columns: ["row_count"], rows: [{ row_count: 10 }] } }); },
         async getPrepareDataset(preparedId) { calls.push(["dataset", preparedId]); return { preparedId, name: "Orders", columns: ["status", "amount"] }; },
         async getDataProfile(preparedId, columns) { calls.push(["profile", preparedId, columns]); return { columns: [{ name: "status" }] }; },
         async queryColumnValues(preparedId, column, search, options) { calls.push(["values", preparedId, column, search, options]); return { column, values: [{ value: "open", count: 4 }], matchCount: 1 }; },
@@ -93,7 +100,9 @@ const GLOBAL_TOOL_NAMES = [
 
 const ALL_TOOL_NAMES = [
   ...GLOBAL_TOOL_NAMES,
-  "tabulaflow_select_prepared_dataset", "tabulaflow_get_recipe", "tabulaflow_duplicate_prepared_dataset",
+  "tabulaflow_select_prepared_dataset", "tabulaflow_get_recipe", "tabulaflow_replace_recipe", "tabulaflow_duplicate_prepared_dataset",
+  "tabulaflow_get_semantic_model", "tabulaflow_update_semantic_field", "tabulaflow_get_validation_results",
+  "tabulaflow_upsert_validation_rule", "tabulaflow_validate_dataset", "tabulaflow_run_analysis",
   "tabulaflow_get_prepare_dataset", "tabulaflow_get_data_profile", "tabulaflow_query_column_values",
   "tabulaflow_get_prepare_preview", "tabulaflow_preview_recipe_change", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter",
   "tabulaflow_remove_preview_filter", "tabulaflow_clear_preview_filters", "tabulaflow_export_prepare",
@@ -111,7 +120,7 @@ test("WebMCP exposes contextual Agent-Ready v2 tools", () => {
   assert.deepEqual(createWebMcpTools(ref, { hasDataset: false, hasPrepared: false, hasComposeNodes: false }).map((tool) => tool.name), GLOBAL_TOOL_NAMES);
   const allTools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   assert.deepEqual(allTools.map((tool) => tool.name), ALL_TOOL_NAMES);
-  assert.equal(new Set(ALL_TOOL_NAMES).size, 46);
+  assert.equal(new Set(ALL_TOOL_NAMES).size, 53);
 });
 
 test("WebMCP read plane observes workflow, Prepare data, and Compose data", async () => {
@@ -125,6 +134,8 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_activity_log").execute({ limit: 20, actor: "agent" });
   await toolByName(tools, "tabulaflow_get_changes_since").execute({ cursor: 12, limit: 20 });
   await toolByName(tools, "tabulaflow_get_recipe").execute({ preparedId: "prepared-a" });
+  await toolByName(tools, "tabulaflow_get_semantic_model").execute({ preparedId: "prepared-a" });
+  await toolByName(tools, "tabulaflow_get_validation_results").execute({ preparedId: "prepared-a" });
   await toolByName(tools, "tabulaflow_get_prepare_dataset").execute({ preparedId: "prepared-a" });
   await toolByName(tools, "tabulaflow_get_data_profile").execute({ preparedId: "prepared-a", columns: ["status"] });
   await toolByName(tools, "tabulaflow_query_column_values").execute({ preparedId: "prepared-a", column: "status", search: "op", offset: 0, limit: 20 });
@@ -138,14 +149,14 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "2.2");
+  assert.equal(capabilities.structuredContent.contractVersion, "2.4");
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");
   assert.equal(capabilities.structuredContent.safeguards.deletion, "visible-user-confirmation-required");
-  assert.equal(guide.structuredContent.flow.length, 3);
+  assert.equal(guide.structuredContent.flow.length, 4);
   assert.equal(operation.structuredContent.inputs, 2);
   assert.ok(tools.filter((tool) => tool.annotations?.untrustedContentHint).length >= 10);
   assert.deepEqual(calls, [
-    ["available-actions", "prepared-a"], ["activity", { limit: 20, targetId: undefined, actor: "agent" }], ["changes", 12, { limit: 20 }], ["recipe", "prepared-a"], ["dataset", "prepared-a"],
+    ["available-actions", "prepared-a"], ["activity", { limit: 20, targetId: undefined, actor: "agent" }], ["changes", 12, { limit: 20 }], ["recipe", "prepared-a"], ["semantic", "prepared-a"], ["validation-results", "prepared-a"], ["dataset", "prepared-a"],
     ["profile", "prepared-a", ["status"]], ["values", "prepared-a", "status", "op", { offset: 0, limit: 20 }],
     ["prepare-preview", "prepared-a", ["status"], { offset: 0, limit: 20 }], ["recipe-preview", "prepared-a", [], 0, { previewColumns: undefined, previewLimit: 10 }],
     ["graph"], ["compose-node", "operation-a"], ["node-preview", "operation-a", ["status"], { offset: 0, limit: 20 }],
@@ -167,12 +178,18 @@ test("WebMCP mutations target stable IDs and carry revision plus idempotency met
   await toolByName(tools, "tabulaflow_request_cloud_upload").execute({});
   await toolByName(tools, "tabulaflow_select_prepared_dataset").execute({ preparedId: "prepared-a", ...mutation("prepared-select-001") });
   await toolByName(tools, "tabulaflow_duplicate_prepared_dataset").execute({ preparedId: "prepared-a", ...mutation("duplicate-001") });
+  await toolByName(tools, "tabulaflow_update_semantic_field").execute({ preparedId: "prepared-a", fieldName: "amount", changes: { businessName: "Order amount", role: "measure" }, ...mutation("semantic-update-001") });
+  const rule = { name: "Amount required", severity: "critical", condition: { field: "amount", operator: "is-null" } };
+  await toolByName(tools, "tabulaflow_upsert_validation_rule").execute({ preparedId: "prepared-a", rule, ...mutation("validation-upsert-001") });
+  await toolByName(tools, "tabulaflow_validate_dataset").execute({ preparedId: "prepared-a", ...mutation("validation-run-001") });
+  await toolByName(tools, "tabulaflow_run_analysis").execute({ preparedId: "prepared-a", analysis: { name: "Orders", metrics: [{ function: "count", alias: "row_count" }] }, ...mutation("analysis-run-001") });
   await toolByName(tools, "tabulaflow_set_aggregate_columns").execute({ preparedId: "prepared-a", columns: ["status"], ...mutation("aggregate-columns-001") });
   const filtered = await toolByName(tools, "tabulaflow_set_preview_filter").execute({ preparedId: "prepared-a", column: "status", value: "open", ...mutation("filter-set-001") });
   await toolByName(tools, "tabulaflow_remove_preview_filter").execute({ preparedId: "prepared-a", column: "status", ...mutation("filter-remove-001") });
   await toolByName(tools, "tabulaflow_clear_preview_filters").execute({ preparedId: "prepared-a", ...mutation("filter-clear-001") });
   await toolByName(tools, "tabulaflow_export_prepare").execute({ preparedId: "prepared-a", format: "csv" });
   await toolByName(tools, "tabulaflow_add_recipe_step").execute({ preparedId: "prepared-a", step: trim, ...mutation("recipe-add-001") });
+  await toolByName(tools, "tabulaflow_replace_recipe").execute({ preparedId: "prepared-a", recipe: [{ id: "step-a", ...trim, enabled: true }], expectedRecipeRevision: 1, ...mutation("recipe-replace-001") });
   await toolByName(tools, "tabulaflow_update_recipe_step").execute({ preparedId: "prepared-a", stepId: "step-a", step: trim, ...mutation("recipe-update-001") });
   await toolByName(tools, "tabulaflow_set_recipe_step_enabled").execute({ preparedId: "prepared-a", stepId: "step-a", enabled: false, ...mutation("recipe-enable-001") });
   await toolByName(tools, "tabulaflow_move_recipe_step").execute({ preparedId: "prepared-a", stepId: "step-a", position: 1, ...mutation("recipe-move-001") });
@@ -212,7 +229,7 @@ test("WebMCP mutation schemas require collaboration metadata and conditional val
   const { ref } = createContext();
   const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   for (const name of [
-    "tabulaflow_open_cloud_file", "tabulaflow_select_prepared_dataset", "tabulaflow_duplicate_prepared_dataset", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter", "tabulaflow_add_recipe_step",
+    "tabulaflow_open_cloud_file", "tabulaflow_select_prepared_dataset", "tabulaflow_duplicate_prepared_dataset", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter", "tabulaflow_add_recipe_step", "tabulaflow_replace_recipe",
     "tabulaflow_select_compose_node", "tabulaflow_auto_arrange_compose", "tabulaflow_create_compose_operation", "tabulaflow_update_compose_operation",
     "tabulaflow_promote_compose_result", "tabulaflow_request_delete",
   ]) {
@@ -232,6 +249,9 @@ test("WebMCP mutation schemas require collaboration metadata and conditional val
   assert.ok(previewStep.required.includes("id"));
   assert.equal(toolByName(tools, "tabulaflow_preview_recipe_change").inputSchema.properties.previewLimit.maximum, 20);
   assert.equal(toolByName(tools, "tabulaflow_validate_compose_operation").inputSchema.properties.previewLimit.maximum, 20);
+  assert.deepEqual(toolByName(tools, "tabulaflow_get_prepare_preview").inputSchema.required, ["preparedId", "columns"]);
+  assert.equal(toolByName(tools, "tabulaflow_get_prepare_preview").inputSchema.properties.columns.maxItems, 20);
+  assert.deepEqual(toolByName(tools, "tabulaflow_get_node_preview").inputSchema.required, ["nodeId", "columns"]);
 });
 
 test("WebMCP registration is sequential, uses one lifecycle signal, and skips unsupported browsers", async () => {

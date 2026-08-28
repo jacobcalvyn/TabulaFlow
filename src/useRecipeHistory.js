@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 
 export const EMPTY_RECIPE_HISTORY = Object.freeze({ past: [], present: [], future: [] });
 
@@ -31,26 +31,37 @@ export function redoRecipeHistory(history) {
 
 export function useRecipeHistory() {
   const [history, setHistory] = useState(EMPTY_RECIPE_HISTORY);
+  const historyRef = useRef(EMPTY_RECIPE_HISTORY);
+
+  const publish = useCallback((next) => {
+    historyRef.current = next;
+    setHistory(next);
+    return next;
+  }, []);
 
   const reset = useCallback((recipe = []) => {
     const next = cloneRecipe(recipe);
-    setHistory(resetRecipeHistory(next));
+    publish(resetRecipeHistory(next));
     return next;
-  }, []);
+  }, [publish]);
 
   const commit = useCallback((recipe) => {
     const next = cloneRecipe(recipe);
-    setHistory((current) => commitRecipeHistory(current, next));
+    publish(commitRecipeHistory(historyRef.current, next));
     return next;
-  }, []);
+  }, [publish]);
 
   const undo = useCallback(() => {
-    setHistory((current) => undoRecipeHistory(current));
-  }, []);
+    publish(undoRecipeHistory(historyRef.current));
+  }, [publish]);
 
   const redo = useCallback(() => {
-    setHistory((current) => redoRecipeHistory(current));
-  }, []);
+    publish(redoRecipeHistory(historyRef.current));
+  }, [publish]);
+
+  const getCurrent = useCallback(() => cloneRecipe(historyRef.current.present), []);
+  const getUndoTarget = useCallback(() => historyRef.current.past.length ? cloneRecipe(historyRef.current.past.at(-1)) : null, []);
+  const getRedoTarget = useCallback(() => historyRef.current.future.length ? cloneRecipe(historyRef.current.future[0]) : null, []);
 
   const undoTarget = history.past.length ? cloneRecipe(history.past.at(-1)) : null;
   const redoTarget = history.future.length ? cloneRecipe(history.future[0]) : null;
@@ -61,9 +72,12 @@ export function useRecipeHistory() {
     canRedo: history.future.length > 0,
     undoTarget,
     redoTarget,
+    getCurrent,
+    getUndoTarget,
+    getRedoTarget,
     reset,
     commit,
     undo,
     redo,
-  }), [history, reset, commit, undo, redo]);
+  }), [history, reset, commit, undo, redo, getCurrent, getUndoTarget, getRedoTarget]);
 }

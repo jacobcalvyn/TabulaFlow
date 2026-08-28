@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canExposeProfileRange, classifyColumnSemantics } from "../src/dataPrivacy.js";
+import { canExposeProfileRange, classifyColumnSemantics, redactAgentRows } from "../src/dataPrivacy.js";
 import { sanitizeExportBaseName } from "../src/dataExport.js";
 import { buildJoinKeyCandidates, rankJoinKeyCandidates } from "../src/joinRecommendations.js";
 import { schemaDelta } from "../src/schemaDelta.js";
 import { nextWorkspaceRevision } from "../src/workspaceRevision.js";
+import { qualityCoverage, qualityProfileBatches } from "../src/qualityProfiling.js";
 
 test("sensitivity heuristics redact profile ranges for identifiers and free text", () => {
   const tracking = classifyColumnSemantics("Nomor Resi", "VARCHAR");
@@ -19,6 +20,21 @@ test("sensitivity heuristics redact profile ranges for identifiers and free text
   assert.equal(canExposeProfileRange(operationalText, "VARCHAR"), false);
   assert.equal(quantity.sensitivity, "non-sensitive");
   assert.equal(canExposeProfileRange(quantity, "BIGINT"), true);
+  assert.equal(classifyColumnSemantics("Status Pengiriman", "VARCHAR").sensitivity, "non-sensitive");
+  assert.equal(classifyColumnSemantics("Biaya Kirim", "VARCHAR").recommendedType, "DOUBLE");
+  assert.equal(classifyColumnSemantics("Tanggal Kirim", "VARCHAR").recommendedType, "TIMESTAMP");
+});
+
+test("agent previews redact sensitive columns while preserving nulls and safe categories", () => {
+  const result = redactAgentRows([
+    { "Nomor Resi": "ABC123", Status: "DELIVERED", Email: null },
+  ], [
+    { name: "Nomor Resi", type: "VARCHAR" },
+    { name: "Status", type: "VARCHAR" },
+    { name: "Email", type: "VARCHAR" },
+  ]);
+  assert.deepEqual(result.redactedColumns, ["Nomor Resi", "Email"]);
+  assert.deepEqual(result.rows, [{ "Nomor Resi": "[redacted]", Status: "DELIVERED", Email: null }]);
 });
 
 test("Join recommendations rank semantic names and data quality instead of returning every type-compatible pair", () => {
@@ -62,4 +78,13 @@ test("derived rebuilds do not advance the semantic workspace revision", () => {
 test("export names use the visible dataset or operation name safely", () => {
   assert.equal(sanitizeExportBaseName("tabulaFlow - lengkap copy.xlsx"), "tabulaFlow - lengkap copy");
   assert.equal(sanitizeExportBaseName("QC Patch / Join updated"), "QC Patch - Join updated");
+});
+
+test("wide data quality profiling covers every column in deterministic batches", () => {
+  const columns = Array.from({ length: 304 }, (_, index) => `column_${index + 1}`);
+  const batches = qualityProfileBatches(columns, 40);
+  assert.deepEqual(batches.map((batch) => batch.length), [40, 40, 40, 40, 40, 40, 40, 24]);
+  assert.deepEqual(batches.flat(), columns);
+  assert.deepEqual(qualityCoverage(304, 304), { profiledColumnCount: 304, totalColumnCount: 304, complete: true, coverage: "full" });
+  assert.equal(qualityCoverage(200, 304).coverage, "partial");
 });
