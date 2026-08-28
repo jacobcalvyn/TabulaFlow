@@ -111,6 +111,56 @@ export function isFlowFileSource(sourceAsset) {
   return sourceAsset?.location === "local-device";
 }
 
+function fileSourceIdentity(sourceAsset) {
+  if (!isFlowFileSource(sourceAsset)) return null;
+  return JSON.stringify([
+    sourceAsset.name ?? null,
+    sourceAsset.size ?? null,
+    sourceAsset.lastModified ?? null,
+    sourceAsset.schemaFingerprint ?? null,
+  ]);
+}
+
+export function findMatchingFileSource(graph, file, sourceColumns) {
+  const fingerprint = schemaFingerprint(sourceColumns);
+  return graph.sourceAssets.find((source) => isFlowFileSource(source)
+    && source.name === file.name
+    && source.size === file.size
+    && source.lastModified === file.lastModified
+    && source.schemaFingerprint === fingerprint) ?? null;
+}
+
+export function consolidateDuplicateFileSources(graph) {
+  const canonicalByIdentity = new Map();
+  const sourceIdMap = new Map();
+  const sourceAssets = [];
+
+  for (const source of graph.sourceAssets) {
+    const identity = fileSourceIdentity(source);
+    const canonical = identity ? canonicalByIdentity.get(identity) : null;
+    if (!canonical) {
+      sourceAssets.push(source);
+      if (identity) canonicalByIdentity.set(identity, source);
+      continue;
+    }
+    sourceIdMap.set(source.id, canonical.id);
+  }
+
+  if (sourceIdMap.size === 0) return { graph, sourceIdMap };
+  return {
+    graph: {
+      ...graph,
+      sourceAssets,
+      preparedInputs: graph.preparedInputs.map((prepared) => {
+        const sourceAssetId = sourceIdMap.get(prepared.sourceAssetId);
+        return sourceAssetId ? { ...prepared, sourceAssetId } : prepared;
+      }),
+      updatedAt: new Date().toISOString(),
+    },
+    sourceIdMap,
+  };
+}
+
 export function createPreparedInput(fileMetadata, dataset, recipe = []) {
   const sourceAssetId = dataset.sourceId ?? createId("source");
   const preparedInputId = dataset.preparedId ?? createId("prepared");
@@ -141,15 +191,19 @@ export function createPreparedInput(fileMetadata, dataset, recipe = []) {
 export function addPreparedInput(graph, sourceAsset, preparedInput) {
   const occupied = [...graph.preparedInputs, ...graph.composeNodes]
     .map((node) => normalizedPosition(node.position));
+  const matchingSource = isFlowFileSource(sourceAsset)
+    ? graph.sourceAssets.find((source) => fileSourceIdentity(source) === fileSourceIdentity(sourceAsset))
+    : null;
   const positionedPreparedInput = {
     ...preparedInput,
+    sourceAssetId: matchingSource?.id ?? preparedInput.sourceAssetId,
     position: nextAvailablePosition(preparedInput.position, occupied),
   };
   return {
     ...graph,
     revision: graph.revision + 1,
     activeNodeId: positionedPreparedInput.id,
-    sourceAssets: [...graph.sourceAssets, sourceAsset],
+    sourceAssets: matchingSource ? graph.sourceAssets : [...graph.sourceAssets, sourceAsset],
     preparedInputs: [...graph.preparedInputs, positionedPreparedInput],
     updatedAt: new Date().toISOString(),
   };

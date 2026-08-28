@@ -804,6 +804,10 @@ button { color: inherit; }
 .transform-tool-picker__groups section button span { min-width: 0; overflow: hidden; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
 .transform-tool-picker__groups section button svg { flex: 0 0 auto; width: 12px; height: 12px; color: #879397; }
 .recipe-preview-loading { position: absolute; z-index: 17; right: 14px; bottom: 14px; padding: 8px 11px; border: 1px solid #b9d9d7; border-radius: 5px; color: var(--accent-strong); background: #f4fbfa; box-shadow: 0 6px 18px rgb(18 67 65 / 12%); font-size: 11px; font-weight: 700; }
+.flow-save-alert { position: fixed; z-index: 40; top: 12px; right: 12px; max-width: min(420px, calc(100vw - 24px)); padding: 9px 10px 9px 12px; display: flex; align-items: center; gap: 12px; border: 1px solid #dfa39f; border-radius: 6px; color: #7f2f2a; background: #fff8f7; box-shadow: 0 8px 24px rgb(66 25 22 / 16%); font-size: 12px; font-weight: 600; }
+.flow-save-alert span { min-width: 0; }
+.flow-save-alert button { flex: 0 0 auto; min-height: 30px; padding: 5px 9px; border: 1px solid #c87973; border-radius: 4px; color: #7f2f2a; background: #fff; font: inherit; cursor: pointer; }
+.flow-save-alert button:disabled { opacity: 0.55; cursor: wait; }
 
 
 

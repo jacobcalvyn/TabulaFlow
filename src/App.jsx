@@ -22,7 +22,7 @@ import { formatValue, isSupportedFile } from "./data.js";
 import { useDataWorker } from "./useDataWorker.js";
 import { StepsPanel, TransformationForm } from "./StepsPanel.jsx";
 import { useRecipeHistory } from "./useRecipeHistory.js";
-import { fileFromDroppedItem, pickSourceFile, restoreFileFromHandle } from "./sourceFileHandles.js";
+import { fileFromDroppedItem, isSameFileEntry, pickSourceFile, restoreFileFromHandle } from "./sourceFileHandles.js";
 import {
   loadStoredFlow,
   loadStoredSourceHandle,
@@ -42,11 +42,13 @@ import {
   addComposeNode,
   addPreparedInput,
   autoArrangeNodePositions,
+  consolidateDuplicateFileSources,
   createFlowGraph,
   createPreparedInput,
   createPreparedFromCompose,
   collectDescendantNodeIds,
   duplicatePreparedInput,
+  findMatchingFileSource,
   hydrateComposeSchemas,
   isFlowFileSource,
   markSourcesUnlinked,
@@ -1569,6 +1571,7 @@ export function App() {
   const [recipeRecovery, setRecipeRecovery] = useState({ error: "", invalidStepId: null });
   const [flowHydrated, setFlowHydrated] = useState(false);
   const [flowDirty, setFlowDirty] = useState(false);
+  const [retryingFlowSave, setRetryingFlowSave] = useState(false);
   const restoreStartedRef = useRef(false);
   const flowHydratedRef = useRef(false);
 
@@ -1588,13 +1591,44 @@ export function App() {
     return nextFlow;
   }, []);
 
+  const retryFlowSave = useCallback(async () => {
+    if (retryingFlowSave) return;
+    setRetryingFlowSave(true);
+    try {
+      await saveStoredFlow(flowRef.current);
+      setFlowDirty(false);
+    } catch {
+      setFlowDirty(true);
+    } finally {
+      setRetryingFlowSave(false);
+    }
+  }, [retryingFlowSave]);
+
+  const migrateConsolidatedSourceHandles = useCallback(async (sourceIdMap) => {
+    for (const [duplicateSourceId, canonicalSourceId] of sourceIdMap) {
+      const canonicalHandle = await loadStoredSourceHandle(canonicalSourceId);
+      const canonicalRestore = await restoreFileFromHandle(canonicalHandle);
+      if (canonicalRestore.status !== "ready") {
+        const duplicateHandle = await loadStoredSourceHandle(duplicateSourceId);
+        const duplicateRestore = await restoreFileFromHandle(duplicateHandle);
+        if (duplicateHandle && (!canonicalHandle || duplicateRestore.status === "ready")) {
+          await saveStoredSourceHandle(canonicalSourceId, duplicateHandle);
+        }
+      }
+      await deleteStoredSourceHandle(duplicateSourceId);
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         const stored = await loadStoredFlow();
         if (cancelled || !stored) return;
-        const restored = markSourcesUnlinked(repairOverlappingNodePositions(removeBuiltInDemoData(validateFlowGraph(stored))));
+        const cleaned = repairOverlappingNodePositions(removeBuiltInDemoData(validateFlowGraph(stored)));
+        const consolidated = consolidateDuplicateFileSources(cleaned);
+        await migrateConsolidatedSourceHandles(consolidated.sourceIdMap);
+        const restored = markSourcesUnlinked(consolidated.graph);
         flowRef.current = restored;
         setFlow(restored);
       } catch {
@@ -1607,7 +1641,7 @@ export function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [t]);
+  }, [migrateConsolidatedSourceHandles, t]);
 
   const openedSources = useMemo(() => flow.sourceAssets.filter(isFlowFileSource).map((source) => {
     const prepared = flow.preparedInputs.find((item) => item.sourceAssetId === source.id);
@@ -1746,6 +1780,16 @@ export function App() {
 
     setLoading(true);
     try {
+      const inspected = await worker.inspectFile(nextFile);
+      const matchingSource = findMatchingFileSource(flowRef.current, nextFile, inspected.sourceColumns);
+      if (matchingSource) {
+        const storedHandle = await loadStoredSourceHandle(matchingSource.id);
+        const sameEntry = !handle || !storedHandle || await isSameFileEntry(storedHandle, handle);
+        if (sameEntry) {
+          await relinkSource(matchingSource.id, nextFile, handle, false);
+          return;
+        }
+      }
       const result = await worker.loadFile(nextFile);
       await activateDataset(result, {
         kind: "local",
@@ -2039,6 +2083,7 @@ export function App() {
           : activePreparedId ?? flowRef.current.preparedInputs[0]?.id;
         if (preparedId) void openPrepared(preparedId);
       }} onCollapse={() => setCollapsed((value) => !value)} />
+      {flowDirty && <div className="flow-save-alert" role="alert"><span>{t("flowSaveFailed")}</span><button type="button" disabled={retryingFlowSave} onClick={retryFlowSave}>{t(retryingFlowSave ? "saving" : "retrySave")}</button></div>}
       {screen === "input" ? (
         <InputScreen
           loading={loading}

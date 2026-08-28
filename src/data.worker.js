@@ -177,14 +177,14 @@ function displayProjection(selectedColumns = columns) {
   }).join(", ");
 }
 
-async function refreshMetadata() {
+async function refreshMetadata({ requireRows = false } = {}) {
   const description = await query(`DESCRIBE ${WORKING_VIEW}`);
   const visibleDescription = description.filter((item) => item.column_name !== INTERNAL_ROW_ID);
   columns = visibleDescription.map((item) => item.column_name);
   columnTypes = new Map(visibleDescription.map((item) => [item.column_name, item.column_type]));
   const counts = await query(`SELECT COUNT(*) AS row_count FROM ${WORKING_VIEW}`);
   rowCount = Number(counts[0]?.row_count ?? 0);
-  if (!rowCount) throw new Error("File tidak memiliki baris data.");
+  if (requireRows && rowCount === 0) throw new Error("File tidak memiliki baris data.");
 }
 
 function normalizeAggregateColumns(requestedColumns) {
@@ -247,7 +247,7 @@ async function loadRows(rows, filename, identifiers = {}) {
       )`);
     await query(`CREATE OR REPLACE TEMP VIEW ${WORKING_VIEW} AS SELECT * FROM ${quoteIdentifier(tableName)}`);
     reportProgress("profile_data", 70);
-    await refreshMetadata();
+    await refreshMetadata({ requireRows: true });
     sourceColumns = [...columns];
     aggregateColumns = normalizeAggregateColumns();
     datasetId = nextDatasetId;
@@ -292,45 +292,65 @@ async function analyzeQuality() {
   let emptyCells = 0;
   let mixedColumns = 0;
   const profiledColumns = columns.slice(0, DATA_LIMITS.maxAggregateColumns);
-  for (const column of profiledColumns) {
+  const scalarExpressions = [];
+  const jsonProfiles = [];
+
+  profiledColumns.forEach((column, index) => {
     const identifier = quoteIdentifier(column);
+    const normalizedType = String(columnTypes.get(column)).toUpperCase();
+    scalarExpressions.push(`COUNT(*) FILTER (WHERE ${identifier} IS NULL OR TRIM(CAST(${identifier} AS VARCHAR)) = '') AS quality_${index}_missing`);
+    if (normalizedType.includes("VARCHAR")) {
+      scalarExpressions.push(
+        `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NOT NULL) AS quality_${index}_numeric`,
+        `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) IN ('true', 'false')) AS quality_${index}_boolean`,
+        `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) NOT IN ('true', 'false') AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DATE) IS NOT NULL) AS quality_${index}_date`,
+        `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) NOT IN ('true', 'false') AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DATE) IS NULL) AS quality_${index}_text`,
+      );
+    } else if (normalizedType.includes("JSON")) {
+      jsonProfiles.push({ column, index });
+    }
+  });
+
+  const scalarProfile = scalarExpressions.length
+    ? (await query(`SELECT ${scalarExpressions.join(",\n")} FROM ${WORKING_VIEW}`))[0] ?? {}
+    : {};
+  const jsonProfileRows = jsonProfiles.length
+    ? await query(jsonProfiles.map(({ column, index }) => {
+      const identifier = quoteIdentifier(column);
+      return `SELECT ${index} AS column_index, JSON_TYPE(${identifier}) AS source_type
+        FROM ${WORKING_VIEW}
+        WHERE ${identifier} IS NOT NULL
+        GROUP BY source_type`;
+    }).join("\nUNION ALL\n"))
+    : [];
+  const jsonTypesByColumn = new Map();
+  for (const row of jsonProfileRows) {
+    const index = Number(row.column_index);
+    const categories = jsonTypesByColumn.get(index) ?? new Set();
+    const sourceType = String(row.source_type).toUpperCase();
+    if (["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL"].includes(sourceType)) categories.add("angka");
+    else if (sourceType === "BOOLEAN") categories.add("boolean");
+    else categories.add("teks");
+    jsonTypesByColumn.set(index, categories);
+  }
+
+  profiledColumns.forEach((column, index) => {
     const type = columnTypes.get(column);
-    const missingResult = await query(`SELECT COUNT(*) FILTER (WHERE ${identifier} IS NULL OR TRIM(CAST(${identifier} AS VARCHAR)) = '') AS missing FROM ${WORKING_VIEW}`);
-    const missing = Number(missingResult[0]?.missing ?? 0);
+    const missing = Number(scalarProfile[`quality_${index}_missing`] ?? 0);
     let mixed = false;
     let types = [typeToUi(type)];
     const normalizedType = String(type).toUpperCase();
     if (normalizedType.includes("VARCHAR")) {
-      const profile = (await query(`
-        WITH values AS (SELECT NULLIF(TRIM(${identifier}), '') AS value FROM ${WORKING_VIEW})
-        SELECT
-          COUNT(*) FILTER (WHERE value IS NOT NULL AND TRY_CAST(value AS DOUBLE) IS NOT NULL) AS numeric_count,
-          COUNT(*) FILTER (WHERE value IS NOT NULL AND LOWER(value) IN ('true', 'false')) AS boolean_count,
-          COUNT(*) FILTER (WHERE value IS NOT NULL AND TRY_CAST(value AS DOUBLE) IS NULL AND LOWER(value) NOT IN ('true', 'false') AND TRY_CAST(value AS DATE) IS NOT NULL) AS date_count,
-          COUNT(*) FILTER (WHERE value IS NOT NULL AND TRY_CAST(value AS DOUBLE) IS NULL AND LOWER(value) NOT IN ('true', 'false') AND TRY_CAST(value AS DATE) IS NULL) AS text_count
-        FROM values
-      `))[0];
       const categories = [
-        ["angka", Number(profile?.numeric_count ?? 0)],
-        ["boolean", Number(profile?.boolean_count ?? 0)],
-        ["tanggal", Number(profile?.date_count ?? 0)],
-        ["teks", Number(profile?.text_count ?? 0)],
+        ["angka", Number(scalarProfile[`quality_${index}_numeric`] ?? 0)],
+        ["boolean", Number(scalarProfile[`quality_${index}_boolean`] ?? 0)],
+        ["tanggal", Number(scalarProfile[`quality_${index}_date`] ?? 0)],
+        ["teks", Number(scalarProfile[`quality_${index}_text`] ?? 0)],
       ].filter(([, count]) => count > 0);
       mixed = categories.length > 1;
       types = categories.map(([name]) => name);
     } else if (normalizedType.includes("JSON")) {
-      const jsonTypes = await query(`
-        SELECT JSON_TYPE(${identifier}) AS source_type, COUNT(*) AS count
-        FROM ${WORKING_VIEW}
-        WHERE ${identifier} IS NOT NULL
-        GROUP BY source_type
-      `);
-      const categories = new Set(jsonTypes.map((item) => {
-        const sourceType = String(item.source_type).toUpperCase();
-        if (["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL"].includes(sourceType)) return "angka";
-        if (sourceType === "BOOLEAN") return "boolean";
-        return "teks";
-      }));
+      const categories = jsonTypesByColumn.get(index) ?? new Set();
       mixed = categories.size > 1;
       types = [...categories];
     } else if (normalizedType.includes("UNION")) {
@@ -346,7 +366,7 @@ async function analyzeQuality() {
     emptyCells += missing;
     if (mixed) mixedColumns += 1;
     if (missing > 0 || mixed) affectedColumns.push({ column, missing, mixed, types });
-  }
+  });
   return {
     emptyCells,
     mixedColumns,
@@ -356,34 +376,60 @@ async function analyzeQuality() {
   };
 }
 
-async function aggregateForColumn(column, filters) {
-  const identifier = quoteIdentifier(column);
-  const type = columnTypes.get(column);
-  const where = buildWhere(filters, column);
-  const rows = await query(`
-    WITH grouped AS (
-      SELECT CAST(${identifier} AS VARCHAR) AS value_text, COUNT(*) AS count
-      FROM ${WORKING_VIEW} ${where.sql}
-      GROUP BY ${identifier}
-    )
-    SELECT value_text, count, COUNT(*) OVER () AS distinct_count
-    FROM grouped
-    ORDER BY count DESC, value_text ASC NULLS FIRST
-    LIMIT ${AGGREGATE_LIMIT}
-  `, where.parameters);
-  const values = rows.map((row) => aggregateItem(row, type));
-  const distinctCount = Number(rows[0]?.distinct_count ?? 0);
-  const selected = filters[column];
-  if (selected && !values.some((item) => item.key === selected.key)) {
-    const selectedWhere = buildWhere(filters);
-    const selectedRows = await query(`
-      SELECT CAST(${identifier} AS VARCHAR) AS value_text, COUNT(*) AS count
-      FROM ${WORKING_VIEW} ${selectedWhere.sql}
-      GROUP BY ${identifier}
-    `, selectedWhere.parameters);
-    if (selectedRows[0]) values.push(aggregateItem(selectedRows[0], type));
-  }
-  return { column, type: typeToUi(type), distinctCount, values };
+async function aggregateForColumns(requestedColumns, filters) {
+  if (!requestedColumns.length) return [];
+  const branches = [];
+  const parameters = [];
+
+  requestedColumns.forEach((column, index) => {
+    const identifier = quoteIdentifier(column);
+    const where = buildWhere(filters, column);
+    branches.push(`SELECT ${index} AS column_index, value_text, count, distinct_count, FALSE AS selected_only
+      FROM (
+        WITH grouped AS (
+          SELECT CAST(${identifier} AS VARCHAR) AS value_text, COUNT(*) AS count
+          FROM ${WORKING_VIEW} ${where.sql}
+          GROUP BY ${identifier}
+        )
+        SELECT value_text, count, COUNT(*) OVER () AS distinct_count
+        FROM grouped
+        ORDER BY count DESC, value_text ASC NULLS FIRST
+        LIMIT ${AGGREGATE_LIMIT}
+      ) AS aggregate_${index}`);
+    parameters.push(...where.parameters);
+
+    if (filters[column]) {
+      const selectedWhere = buildWhere(filters);
+      branches.push(`SELECT ${index} AS column_index, CAST(${identifier} AS VARCHAR) AS value_text, COUNT(*) AS count, 0 AS distinct_count, TRUE AS selected_only
+        FROM ${WORKING_VIEW} ${selectedWhere.sql}
+        GROUP BY ${identifier}`);
+      parameters.push(...selectedWhere.parameters);
+    }
+  });
+
+  const rows = await query(branches.join("\nUNION ALL\n"), parameters);
+  return requestedColumns.map((column, index) => {
+    const type = columnTypes.get(column);
+    const columnRows = rows.filter((row) => Number(row.column_index) === index);
+    const mainRows = columnRows.filter((row) => !row.selected_only);
+    const values = mainRows.map((row) => aggregateItem(row, type)).sort((left, right) => {
+      if (left.count !== right.count) return right.count - left.count;
+      if (left.raw === null) return -1;
+      if (right.raw === null) return 1;
+      return left.label.localeCompare(right.label);
+    });
+    const selectedRow = columnRows.find((row) => row.selected_only);
+    if (selectedRow) {
+      const selectedItem = aggregateItem(selectedRow, type);
+      if (!values.some((item) => item.key === selectedItem.key)) values.push(selectedItem);
+    }
+    return {
+      column,
+      type: typeToUi(type),
+      distinctCount: Number(mainRows[0]?.distinct_count ?? 0),
+      values,
+    };
+  });
 }
 
 async function buildDataset(filters = {}, requestedAggregateColumns) {
@@ -392,8 +438,7 @@ async function buildDataset(filters = {}, requestedAggregateColumns) {
   const where = buildWhere(filters);
   const countRows = await query(`SELECT COUNT(*) AS filtered_count FROM ${WORKING_VIEW} ${where.sql}`, where.parameters);
   const preview = await query(`SELECT ${displayProjection()} FROM ${WORKING_VIEW} ${where.sql} LIMIT 100`, where.parameters);
-  const aggregates = [];
-  for (const column of aggregateColumns) aggregates.push(await aggregateForColumn(column, filters));
+  const aggregates = await aggregateForColumns(aggregateColumns, filters);
   return {
     datasetId,
     filename: sourceName,

@@ -406,6 +406,8 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
   const dismissConnection = () => {
     setConnectingFrom(null);
     setConnectionError("");
+    setUnarySourceId(null);
+    setOperationError("");
   };
 
   const handleCanvasClick = (event) => {
@@ -452,6 +454,7 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
     setCreatingPrepared(false);
     if (result?.ok) {
       setUnarySourceId(null);
+      setConnectingFrom(null);
       return;
     }
     setOperationError(result?.error ?? t("createPreparedFailed"));
@@ -459,16 +462,7 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
 
   const openContinuationMenu = (nodeId) => {
     setUnarySourceId((current) => current === nodeId ? null : nodeId);
-    setConnectingFrom(null);
-    setConnectionError("");
-    setPendingPair(null);
-    setOperationError("");
-  };
-
-  const startConnection = () => {
-    if (!unarySourceId) return;
-    setConnectingFrom(unarySourceId);
-    setUnarySourceId(null);
+    setConnectingFrom(nodeId);
     setConnectionError("");
     setPendingPair(null);
     setOperationError("");
@@ -651,7 +645,7 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
                   <header><span>{isDataset ? t("dataset") : operationLabel(node.kind, t)}</span><strong>{node.name}</strong></header>
                   <p>{Number.isFinite(node.rowCount) ? formatNumber(node.rowCount) : "—"} {t("rows")} · {node.schema?.length ? node.schema.length : "—"} {t("columns")}</p>
                   {isDataset ? <footer>{confirmingPreparedDeleteId === node.id ? <div className="canvas-node__delete-confirm" onClick={(event) => event.stopPropagation()}><span>{t("confirmDeletePreparedDataset")}</span><button type="button" onClick={() => setConfirmingPreparedDeleteId(null)}>{t("cancel")}</button><button className="canvas-node__delete-confirm-action" type="button" onClick={async () => { const removed = await onDeletePrepared(node.id); if (removed) setConfirmingPreparedDeleteId(null); }}>{t("delete")}</button></div> : <><button type="button" onClick={(event) => { event.stopPropagation(); onEditPreparation(node.id); }} title={t("editPreparation")}><PencilSimple />{t("editPreparation")}</button><button type="button" onClick={(event) => { event.stopPropagation(); onDuplicate(node.id); }} title={t("duplicate")}><Copy /></button><button className="canvas-node__delete" type="button" onClick={(event) => { event.stopPropagation(); setConfirmingPreparedDeleteId(node.id); }} aria-label={t("deletePreparedDataset")} title={t("deletePreparedDataset")}><Trash /></button></>}</footer> : <footer>{confirmingOperationDeleteId === node.id ? <div className="canvas-node__delete-confirm" onClick={(event) => event.stopPropagation()}><span>{operationDeleteError || t("confirmDeleteOperation")}</span><button type="button" onClick={() => { setConfirmingOperationDeleteId(null); setOperationDeleteError(""); }}>{t("cancel")}</button><button className="canvas-node__delete-confirm-action" type="button" disabled={deletingOperationId === node.id} onClick={() => deleteOperation(node.id)}>{deletingOperationId === node.id ? t("loading") : t("delete")}</button></div> : <>{node.kind !== "append" && <button className="canvas-node__settings" type="button" onClick={(event) => { event.stopPropagation(); openOperation(node); }} aria-label={t("settings")} title={t("settings")}><SlidersHorizontal weight="bold" /></button>}<button className="canvas-node__delete" type="button" onClick={(event) => { event.stopPropagation(); setOperationDeleteError(""); setConfirmingOperationDeleteId(node.id); }} aria-label={t("deleteOperation")} title={t("deleteOperation")}><Trash /></button></>}</footer>}
-                  <button className="canvas-node__port" type="button" onClick={(event) => { event.stopPropagation(); if (connectingFrom) connect(node.id); else openContinuationMenu(node.id); }} aria-label={t("continueFromDataset", { dataset: node.name })} title={t("continueFromDataset", { dataset: node.name })}><LinkSimple weight="bold" /></button>
+                  <button className="canvas-node__port" type="button" onClick={(event) => { event.stopPropagation(); if (connectingFrom === node.id) dismissConnection(); else if (connectingFrom) connect(node.id); else openContinuationMenu(node.id); }} aria-label={t("continueFromDataset", { dataset: node.name })} title={t("continueFromDataset", { dataset: node.name })}><LinkSimple weight="bold" /></button>
                 </article>
               );
             })}
@@ -672,8 +666,6 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
               {operationError && <span className="compose-operation-picker__error" role="alert">{operationError}</span>}
               <button type="button" disabled={creatingPrepared} onClick={createPreparedDataset}><strong>{creatingPrepared ? t("loading") : t("createPreparedDataset")}</strong><small>{t(byId.get(unarySourceId)?.nodeType === "dataset" ? "duplicatePreparedDatasetHint" : "createPreparedDatasetHint")}</small></button>
               {["aggregate", "filter-rows", "distinct-rows", "pivot", "unpivot"].map((kind) => <button key={kind} type="button" onClick={() => chooseUnaryOperation(kind)}><strong>{operationLabel(kind, t)}</strong><small>{t(`${OPERATION_LABEL_KEYS[kind]}Hint`)}</small></button>)}
-              <button type="button" onClick={startConnection}><strong>{t("connectAnotherNode")}</strong><small>{t("connectAnotherNodeHint")}</small></button>
-              <button className="compose-operation-picker__cancel" type="button" onClick={() => setUnarySourceId(null)}>{t("cancel")}</button>
             </div>}
 
             {showInspector && inspectorPosition && (UNARY_OPERATION_KINDS.has(operation.kind)

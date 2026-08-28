@@ -53,3 +53,14 @@ export async function restoreFileFromHandle(handle) {
     return { status: "unavailable", file: null, error };
   }
 }
+
+export async function isSameFileEntry(leftHandle, rightHandle) {
+  if (!leftHandle || !rightHandle) return false;
+  if (leftHandle === rightHandle) return true;
+  if (typeof leftHandle.isSameEntry !== "function") return false;
+  try {
+    return await leftHandle.isSameEntry(rightHandle);
+  } catch {
+    return false;
+  }
+}

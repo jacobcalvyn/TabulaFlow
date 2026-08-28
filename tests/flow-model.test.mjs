@@ -5,10 +5,12 @@ import {
   addPreparedInput,
   autoArrangeNodePositions,
   collectDescendantNodeIds,
+  consolidateDuplicateFileSources,
   createFlowGraph,
   createPreparedInput,
   createPreparedFromCompose,
   duplicatePreparedInput,
+  findMatchingFileSource,
   getAncestors,
   getDescendants,
   hydrateComposeSchemas,
@@ -100,6 +102,33 @@ test("places newly opened prepared inputs in non-overlapping vertical slots", ()
 
   assert.deepEqual(graph.preparedInputs[0].position, { x: 40, y: 52 });
   assert.deepEqual(graph.preparedInputs[1].position, { x: 40, y: 188 });
+});
+
+test("reuses one source asset when the same local file is opened again", () => {
+  const first = prepared("orders");
+  const second = prepared("orders");
+  let graph = addPreparedInput(createFlowGraph(), first.sourceAsset, first.preparedInput);
+  graph = addPreparedInput(graph, second.sourceAsset, second.preparedInput);
+
+  assert.equal(graph.sourceAssets.length, 1);
+  assert.equal(graph.preparedInputs.length, 2);
+  assert.equal(graph.preparedInputs[1].sourceAssetId, first.sourceAsset.id);
+  assert.equal(findMatchingFileSource(graph, { name: "orders.csv", size: 10, lastModified: 20 }, ["id"])?.id, first.sourceAsset.id);
+});
+
+test("consolidates duplicate persisted file sources without removing prepared branches", () => {
+  const first = prepared("orders");
+  const second = prepared("orders");
+  const graph = {
+    ...createFlowGraph(),
+    sourceAssets: [first.sourceAsset, second.sourceAsset],
+    preparedInputs: [first.preparedInput, second.preparedInput],
+  };
+
+  const consolidated = consolidateDuplicateFileSources(graph);
+  assert.equal(consolidated.graph.sourceAssets.length, 1);
+  assert.deepEqual(consolidated.graph.preparedInputs.map((item) => item.sourceAssetId), [first.sourceAsset.id, first.sourceAsset.id]);
+  assert.equal(consolidated.sourceIdMap.get(second.sourceAsset.id), first.sourceAsset.id);
 });
 
 test("repairs overlapping prepared input positions restored from older flows", () => {

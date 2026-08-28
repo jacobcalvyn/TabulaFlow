@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { restoreFileFromHandle } from "../src/sourceFileHandles.js";
+import { isSameFileEntry, restoreFileFromHandle } from "../src/sourceFileHandles.js";
 
 test("restores a file when a persisted handle still has read permission", async () => {
   const file = { name: "orders.csv", size: 10, lastModified: 20 };
@@ -33,4 +33,15 @@ test("treats missing or inaccessible handles as unavailable", async () => {
   });
   assert.equal(result.status, "unavailable");
   assert.equal(result.file, null);
+});
+
+test("compares persisted file handles by filesystem entry", async () => {
+  const right = { kind: "file" };
+  const left = {
+    kind: "file",
+    isSameEntry: async (candidate) => candidate === right,
+  };
+  assert.equal(await isSameFileEntry(left, right), true);
+  assert.equal(await isSameFileEntry(left, { kind: "file" }), false);
+  assert.equal(await isSameFileEntry(null, right), false);
 });
