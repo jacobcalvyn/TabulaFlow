@@ -12,7 +12,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "2.0", workspaceRevision: REVISION, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "2.1", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         activeDataset: {
@@ -32,6 +32,8 @@ function createContext() {
       },
       actions: {
         async getAvailableActions(targetId) { calls.push(["available-actions", targetId]); return { targetId, actions: ["inspect"] }; },
+        async getActivityLog(options) { calls.push(["activity", options]); return { events: [{ sequence: 12, actor: "agent" }], cursor: 12, hasMore: false }; },
+        async getChangesSince(cursor, options) { calls.push(["changes", cursor, options]); return { events: [], cursor, hasMore: false }; },
         async openWorkspace(workspace) { calls.push(["workspace", workspace]); },
         async requestSourceFileSelection() { calls.push(["file"]); },
         async requestSourceRelink(sourceAssetId) { calls.push(["relink", sourceAssetId]); },
@@ -82,7 +84,8 @@ function toolByName(tools, name) {
 
 const GLOBAL_TOOL_NAMES = [
   "tabulaflow_get_workspace_state", "tabulaflow_get_capabilities", "tabulaflow_get_workflow_guide",
-  "tabulaflow_describe_operation", "tabulaflow_get_available_actions", "tabulaflow_open_workspace",
+  "tabulaflow_describe_operation", "tabulaflow_get_available_actions", "tabulaflow_get_activity_log",
+  "tabulaflow_get_changes_since", "tabulaflow_open_workspace",
   "tabulaflow_request_source_file", "tabulaflow_request_source_relink", "tabulaflow_list_cloud_files",
   "tabulaflow_open_cloud_file", "tabulaflow_request_cloud_upload",
 ];
@@ -107,7 +110,7 @@ test("WebMCP exposes contextual Agent-Ready v2 tools", () => {
   assert.deepEqual(createWebMcpTools(ref, { hasDataset: false, hasPrepared: false, hasComposeNodes: false }).map((tool) => tool.name), GLOBAL_TOOL_NAMES);
   const allTools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   assert.deepEqual(allTools.map((tool) => tool.name), ALL_TOOL_NAMES);
-  assert.equal(new Set(ALL_TOOL_NAMES).size, 44);
+  assert.equal(new Set(ALL_TOOL_NAMES).size, 46);
 });
 
 test("WebMCP read plane observes workflow, Prepare data, and Compose data", async () => {
@@ -118,6 +121,8 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   const guide = await toolByName(tools, "tabulaflow_get_workflow_guide").execute({});
   const operation = await toolByName(tools, "tabulaflow_describe_operation").execute({ kind: "join" });
   await toolByName(tools, "tabulaflow_get_available_actions").execute({ targetId: "prepared-a" });
+  await toolByName(tools, "tabulaflow_get_activity_log").execute({ limit: 20, actor: "agent" });
+  await toolByName(tools, "tabulaflow_get_changes_since").execute({ cursor: 12, limit: 20 });
   await toolByName(tools, "tabulaflow_get_recipe").execute({ preparedId: "prepared-a" });
   await toolByName(tools, "tabulaflow_get_prepare_dataset").execute({ preparedId: "prepared-a" });
   await toolByName(tools, "tabulaflow_get_data_profile").execute({ preparedId: "prepared-a", columns: ["status"] });
@@ -132,13 +137,13 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "2.0");
+  assert.equal(capabilities.structuredContent.contractVersion, "2.1");
   assert.equal(capabilities.structuredContent.safeguards.deletion, "visible-user-confirmation-required");
   assert.equal(guide.structuredContent.flow.length, 3);
   assert.equal(operation.structuredContent.inputs, 2);
   assert.ok(tools.filter((tool) => tool.annotations?.untrustedContentHint).length >= 10);
   assert.deepEqual(calls, [
-    ["available-actions", "prepared-a"], ["recipe", "prepared-a"], ["dataset", "prepared-a"],
+    ["available-actions", "prepared-a"], ["activity", { limit: 20, targetId: undefined, actor: "agent" }], ["changes", 12, { limit: 20 }], ["recipe", "prepared-a"], ["dataset", "prepared-a"],
     ["profile", "prepared-a", ["status"]], ["values", "prepared-a", "status", "op", { offset: 0, limit: 20 }],
     ["prepare-preview", "prepared-a", ["status"], { offset: 0, limit: 20 }], ["recipe-preview", "prepared-a", [], 0],
     ["graph"], ["compose-node", "operation-a"], ["node-preview", "operation-a", ["status"], { offset: 0, limit: 20 }],

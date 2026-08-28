@@ -2,8 +2,9 @@ const DATABASE_NAME = "tabulaflow-recipes";
 const STORE_NAME = "recipes";
 const FLOW_STORE_NAME = "flows";
 const SOURCE_HANDLE_STORE_NAME = "source-handles";
+const ACTIVITY_STORE_NAME = "activity-events";
 const ACTIVE_FLOW_KEY = "active-flow";
-const DATABASE_VERSION = 3;
+const DATABASE_VERSION = 4;
 const saveQueues = new Map();
 
 function openDatabase() {
@@ -19,10 +20,59 @@ function openDatabase() {
       if (!request.result.objectStoreNames.contains(SOURCE_HANDLE_STORE_NAME)) {
         request.result.createObjectStore(SOURCE_HANDLE_STORE_NAME);
       }
+      if (!request.result.objectStoreNames.contains(ACTIVITY_STORE_NAME)) {
+        const activityStore = request.result.createObjectStore(ACTIVITY_STORE_NAME, { keyPath: "sequence", autoIncrement: true });
+        activityStore.createIndex("flowId", "flowId", { unique: false });
+        activityStore.createIndex("targetId", "targetId", { unique: false });
+      }
     });
     request.addEventListener("success", () => resolve(request.result));
     request.addEventListener("error", () => reject(request.error ?? new Error("Recipe database gagal dibuka.")));
   });
+}
+
+export async function appendStoredActivity(event, retention = 2000) {
+  const database = await openDatabase();
+  try {
+    const sequence = await new Promise((resolve, reject) => {
+      const request = database.transaction(ACTIVITY_STORE_NAME, "readwrite").objectStore(ACTIVITY_STORE_NAME).add(event);
+      request.addEventListener("success", () => resolve(Number(request.result)));
+      request.addEventListener("error", () => reject(request.error ?? new Error("Activity event could not be saved.")));
+    });
+    const stored = { ...event, sequence };
+    const flowEvents = await new Promise((resolve, reject) => {
+      const request = database.transaction(ACTIVITY_STORE_NAME, "readonly").objectStore(ACTIVITY_STORE_NAME).index("flowId").getAll(event.flowId);
+      request.addEventListener("success", () => resolve(request.result ?? []));
+      request.addEventListener("error", () => reject(request.error ?? new Error("Activity events could not be read.")));
+    });
+    const expired = flowEvents.sort((left, right) => right.sequence - left.sequence).slice(retention);
+    if (expired.length) {
+      await new Promise((resolve, reject) => {
+        const transaction = database.transaction(ACTIVITY_STORE_NAME, "readwrite");
+        const store = transaction.objectStore(ACTIVITY_STORE_NAME);
+        for (const item of expired) store.delete(item.sequence);
+        transaction.addEventListener("complete", () => resolve());
+        transaction.addEventListener("error", () => reject(transaction.error ?? new Error("Old activity events could not be pruned.")));
+      });
+    }
+    return stored;
+  } finally {
+    database.close();
+  }
+}
+
+export async function loadStoredActivity(flowId) {
+  if (!flowId) return [];
+  const database = await openDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = database.transaction(ACTIVITY_STORE_NAME, "readonly").objectStore(ACTIVITY_STORE_NAME).index("flowId").getAll(flowId);
+      request.addEventListener("success", () => resolve((request.result ?? []).sort((left, right) => right.sequence - left.sequence)));
+      request.addEventListener("error", () => reject(request.error ?? new Error("Activity events could not be read.")));
+    });
+  } finally {
+    database.close();
+  }
 }
 
 export function preparedRecipeStorageKey(preparedId) {

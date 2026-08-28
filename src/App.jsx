@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Check,
+  ClockCounterClockwise,
   CaretDown,
   CaretLeft,
   CaretRight,
@@ -35,7 +36,10 @@ import {
   deleteStoredSourceHandle,
   saveStoredFlow,
   saveStoredSourceHandle,
+  appendStoredActivity,
+  loadStoredActivity,
 } from "./recipeStorage.js";
+import { createActivityEvent, findSupersededActivity, pageActivityEvents } from "./activityModel.js";
 import { useI18n } from "./i18n.jsx";
 import { ComposeScreen } from "./ComposeScreen.jsx";
 import { activatePreparedForFlow } from "./preparedActivation.js";
@@ -210,7 +214,28 @@ function downloadExport(result) {
   return result.filename;
 }
 
-function AccountScreen({ onOpenFile, uploadRequestToken, onUploadRequestShown }) {
+const ACTIVITY_LABEL_KEYS = Object.freeze({
+  source_imported: "activitySourceImported",
+  source_relinked: "activitySourceRelinked",
+  preview_filters_changed: "activityFiltersChanged",
+  aggregate_columns_changed: "activityColumnsChanged",
+  recipe_changed: "activityRecipeChanged",
+  recipe_undone: "activityRecipeUndone",
+  recipe_redone: "activityRecipeRedone",
+  prepared_duplicated: "activityPreparedDuplicated",
+  compose_result_promoted: "activityResultPromoted",
+  compose_operation_created: "activityOperationCreated",
+  compose_operation_updated: "activityOperationUpdated",
+  compose_node_moved: "activityNodeMoved",
+  compose_auto_arranged: "activityAutoArranged",
+  prepared_exported: "activityPreparedExported",
+  compose_exported: "activityComposeExported",
+  delete_requested: "activityDeleteRequested",
+  prepared_deleted: "activityPreparedDeleted",
+  compose_operation_deleted: "activityOperationDeleted",
+});
+
+function AccountScreen({ onOpenFile, uploadRequestToken, onUploadRequestShown, activityEvents, activityLoading, activityError }) {
   const { language, t } = useI18n();
   const locale = language === "id" ? "id-ID" : "en-US";
   const inputRef = useRef(null);
@@ -308,6 +333,23 @@ function AccountScreen({ onOpenFile, uploadRequestToken, onUploadRequestShown })
           <li>{t("aiCapabilityControls")}</li>
         </ul>
         <p className="account-ai-note">{t(webMcpAvailable ? "aiNoLoginRequired" : "aiBrowserUnsupported")}</p>
+      </section>
+
+      <section className="account-card account-activity-card" aria-labelledby="activity-title">
+        <div className="account-card__heading">
+          <div className="account-ai-card__title"><span><ClockCounterClockwise weight="duotone" /></span><div><h2 id="activity-title">{t("activity")}</h2><p>{t("activityDescription")}</p></div></div>
+          <strong>{t("activityEventCount", { count: activityEvents.length })}</strong>
+        </div>
+        {activityLoading ? <p className="account-state">{t("loading")}</p> : activityEvents.length ? (
+          <ol className="activity-list">{activityEvents.slice(0, 20).map((event) => (
+            <li key={event.eventId}>
+              <span className={`activity-actor activity-actor--${event.actor}`}>{t(event.actor === "agent" ? "activityActorAgent" : event.actor === "system" ? "activityActorSystem" : "activityActorUser")}</span>
+              <div><strong>{t(ACTIVITY_LABEL_KEYS[event.action] ?? "activityChanged")}</strong><span>{event.targetType} · {new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(event.createdAt))}</span>{event.supersedesEventId && <small>{t("activityOverride")}</small>}</div>
+            </li>
+          ))}</ol>
+        ) : <p className="account-empty">{t("noActivity")}</p>}
+        <p className="account-ai-note">{t("activityPrivacy")}</p>
+        {activityError && <p className="activity-error" role="status">{t("activityUnavailable")}</p>}
       </section>
 
       {loading ? <p className="account-state">{t("loading")}</p> : !account?.authenticated ? (
@@ -1782,6 +1824,10 @@ export function App() {
   const [flowDirty, setFlowDirty] = useState(false);
   const [retryingFlowSave, setRetryingFlowSave] = useState(false);
   const [workspaceRevision, setWorkspaceRevision] = useState(0);
+  const [activityEvents, setActivityEvents] = useState([]);
+  const [activityLoading, setActivityLoading] = useState(true);
+  const [activityError, setActivityError] = useState("");
+  const [activityOverrideNotice, setActivityOverrideNotice] = useState("");
   const [webMcpFileRequestToken, setWebMcpFileRequestToken] = useState(0);
   const [webMcpRelinkRequest, setWebMcpRelinkRequest] = useState(null);
   const [webMcpCloudUploadToken, setWebMcpCloudUploadToken] = useState(0);
@@ -1789,12 +1835,30 @@ export function App() {
   const restoreStartedRef = useRef(false);
   const flowHydratedRef = useRef(false);
   const workspaceRevisionRef = useRef(0);
+  const activityEventsRef = useRef([]);
   const webMcpMutationRunnerRef = useRef(null);
   if (!webMcpMutationRunnerRef.current) {
     webMcpMutationRunnerRef.current = createWebMcpMutationRunner({ getRevision: () => workspaceRevisionRef.current });
   }
 
   useEffect(() => { flowRef.current = flow; }, [flow]);
+
+  useEffect(() => {
+    if (!flowHydrated) return undefined;
+    let cancelled = false;
+    setActivityLoading(true);
+    loadStoredActivity(flow.id).then((events) => {
+      if (cancelled) return;
+      activityEventsRef.current = events;
+      setActivityEvents(events);
+      setActivityError("");
+    }).catch(() => {
+      if (!cancelled) setActivityError("ACTIVITY_STORAGE_UNAVAILABLE");
+    }).finally(() => {
+      if (!cancelled) setActivityLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [flow.id, flowHydrated]);
 
   const bumpWorkspaceRevision = useCallback(() => {
     workspaceRevisionRef.current += 1;
@@ -1821,6 +1885,43 @@ export function App() {
     (meta, execute, fingerprint) => webMcpMutationRunnerRef.current(meta, execute, fingerprint),
     [],
   );
+
+  const recordActivity = useCallback(async ({ action, targetType, targetId, summary = {}, status = "committed" }, context = {}) => {
+    const candidate = createActivityEvent({
+      flowId: flowRef.current.id,
+      actor: context.actor ?? "user",
+      origin: context.origin ?? "ui",
+      action,
+      targetType,
+      targetId,
+      requestId: context.requestId ?? null,
+      status,
+      workspaceRevision: workspaceRevisionRef.current,
+      summary,
+    });
+    const superseded = findSupersededActivity(activityEventsRef.current, candidate);
+    const event = superseded ? { ...candidate, supersedesEventId: superseded.eventId } : candidate;
+    try {
+      const stored = await appendStoredActivity(event);
+      const next = [stored, ...activityEventsRef.current].slice(0, 2000);
+      activityEventsRef.current = next;
+      setActivityEvents(next);
+      setActivityError("");
+      if (superseded && stored.actor === "user") setActivityOverrideNotice(stored.eventId);
+      return stored;
+    } catch {
+      setActivityError("ACTIVITY_STORAGE_UNAVAILABLE");
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!activityOverrideNotice) return undefined;
+    const timer = window.setTimeout(() => setActivityOverrideNotice(""), 7000);
+    return () => window.clearTimeout(timer);
+  }, [activityOverrideNotice]);
+
+  const webMcpActivity = (meta, extra = {}) => ({ actor: "agent", origin: "webmcp", requestId: meta.requestId, ...extra });
 
   const retryFlowSave = useCallback(async () => {
     if (retryingFlowSave) return;
@@ -1887,7 +1988,7 @@ export function App() {
     };
   }), [flow.preparedInputs, flow.sourceAssets]);
 
-  const relinkSource = useCallback(async (sourceAssetId, nextFile, handle = null, automatic = false, beforeCommit = null) => {
+  const relinkSource = useCallback(async (sourceAssetId, nextFile, handle = null, automatic = false, beforeCommit = null, activityContext = null) => {
     const source = flowRef.current.sourceAssets.find((item) => item.id === sourceAssetId);
     const preparedInputs = flowRef.current.preparedInputs.filter((item) => item.sourceAssetId === sourceAssetId);
     const primaryPrepared = preparedInputs[0];
@@ -1911,8 +2012,9 @@ export function App() {
     await commitFlow(linkedFlow);
     if (handle) await saveStoredSourceHandle(source.id, handle);
     if (!automatic) setError("");
+    if (!automatic) await recordActivity({ action: "source_relinked", targetType: "source", targetId: source.id }, activityContext ?? undefined);
     return true;
-  }, [commitFlow, t, worker]);
+  }, [commitFlow, recordActivity, t, worker]);
 
   const relinkSourceFromPicker = useCallback(async (sourceAssetId, nextFile, handle) => {
     setLoading(true);
@@ -2002,7 +2104,7 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [error, screen]);
 
-  const loadFile = async (nextFile, handle = null, throwOnError = false, beforeCommit = null) => {
+  const loadFile = async (nextFile, handle = null, throwOnError = false, beforeCommit = null, activityContext = null) => {
     let transientPreparedId = null;
     setError("");
     if (!isSupportedFile(nextFile.name)) {
@@ -2020,7 +2122,7 @@ export function App() {
         const storedHandle = await loadStoredSourceHandle(matchingSource.id);
         const sameEntry = !handle || !storedHandle || await isSameFileEntry(storedHandle, handle);
         if (sameEntry) {
-          await relinkSource(matchingSource.id, nextFile, handle, false, beforeCommit);
+          await relinkSource(matchingSource.id, nextFile, handle, false, beforeCommit, activityContext);
           return { ok: true, relinked: true };
         }
       }
@@ -2034,7 +2136,8 @@ export function App() {
       }, []);
       transientPreparedId = null;
       if (handle && result.sourceId) await saveStoredSourceHandle(result.sourceId, handle);
-      return { ok: true, sourceId: result.sourceId, preparedId: result.preparedId };
+      const activity = await recordActivity({ action: "source_imported", targetType: "source", targetId: result.sourceId, summary: { rowCount: result.rowCount, columnCount: result.columns.length } }, activityContext ?? undefined);
+      return { ok: true, sourceId: result.sourceId, preparedId: result.preparedId, activity };
     } catch (cause) {
       if (transientPreparedId) await worker.unregisterPrepared(transientPreparedId);
       if (!dataset) setDataset(null);
@@ -2046,14 +2149,20 @@ export function App() {
     }
   };
 
-  const applyFilters = useCallback(async (filters, aggregateColumns, beforeCommit = null) => {
+  const applyFilters = useCallback(async (filters, aggregateColumns, beforeCommit = null, activityContext = null) => {
     const result = await worker.filter(filters, aggregateColumns);
     beforeCommit?.();
     setDataset(result);
     setFilters(filters);
     bumpWorkspaceRevision();
-    return result;
-  }, [bumpWorkspaceRevision, worker]);
+    const activity = await recordActivity({
+      action: activityContext?.action ?? "preview_filters_changed",
+      targetType: "prepared",
+      targetId: activePreparedId,
+      summary: activityContext?.action === "aggregate_columns_changed" ? { aggregateColumnCount: aggregateColumns.length } : { filterCount: Object.keys(filters).length, rowCount: result.filteredCount },
+    }, activityContext ?? undefined);
+    return { ...result, activity };
+  }, [activePreparedId, bumpWorkspaceRevision, recordActivity, worker]);
 
   const searchAggregate = useCallback(
     (column, query, filters) => worker.searchAggregate(column, query, filters),
@@ -2089,17 +2198,22 @@ export function App() {
     setComposeError("");
   };
 
-  const applyRecipeChange = async (recipe, beforeCommit = null) => {
+  const applyRecipeChange = async (recipe, beforeCommit = null, activityContext = null) => {
+    const toggledStep = recipe.find((step) => {
+      const previous = recipeHistory.recipe.find((item) => item.id === step.id);
+      return previous && (previous.enabled !== false) !== (step.enabled !== false);
+    });
     const result = await worker.applyRecipe(recipe, filters, dataset?.aggregateColumns ?? [], activePreparedId);
     beforeCommit?.();
     const next = recipeHistory.commit(recipe);
     setDataset(result);
     setFilters(result.appliedFilters ?? filters);
     await persistPreparedRecipe(next, result);
-    return result;
+    const activity = await recordActivity({ action: activityContext?.action ?? "recipe_changed", targetType: "prepared", targetId: activePreparedId, summary: { recipeStepCount: next.length, rowCount: result.rowCount, columnCount: result.columns.length, ...(toggledStep ? { enabled: toggledStep.enabled !== false, recipeStepType: toggledStep.type } : {}), ...(activityContext?.summary ?? {}) } }, activityContext ?? undefined);
+    return { ...result, activity };
   };
 
-  const undoRecipe = async (beforeCommit = null) => {
+  const undoRecipe = async (beforeCommit = null, activityContext = null) => {
     const next = recipeHistory.undoTarget;
     if (!next) return null;
     const result = await worker.applyRecipe(next, filters, dataset?.aggregateColumns ?? [], activePreparedId);
@@ -2108,10 +2222,11 @@ export function App() {
     setDataset(result);
     setFilters(result.appliedFilters ?? filters);
     await persistPreparedRecipe(next, result);
-    return result;
+    const activity = await recordActivity({ action: "recipe_undone", targetType: "prepared", targetId: activePreparedId, summary: { recipeStepCount: next.length, rowCount: result.rowCount, columnCount: result.columns.length } }, activityContext ?? undefined);
+    return { ...result, activity };
   };
 
-  const redoRecipe = async (beforeCommit = null) => {
+  const redoRecipe = async (beforeCommit = null, activityContext = null) => {
     const next = recipeHistory.redoTarget;
     if (!next) return null;
     const result = await worker.applyRecipe(next, filters, dataset?.aggregateColumns ?? [], activePreparedId);
@@ -2120,7 +2235,8 @@ export function App() {
     setDataset(result);
     setFilters(result.appliedFilters ?? filters);
     await persistPreparedRecipe(next, result);
-    return result;
+    const activity = await recordActivity({ action: "recipe_redone", targetType: "prepared", targetId: activePreparedId, summary: { recipeStepCount: next.length, rowCount: result.rowCount, columnCount: result.columns.length } }, activityContext ?? undefined);
+    return { ...result, activity };
   };
 
   const openPrepared = async (preparedId, beforeCommit = null, throwOnError = false) => {
@@ -2168,7 +2284,7 @@ export function App() {
     }
   };
 
-  const duplicatePreparation = async (preparedId, beforeCommit = null) => {
+  const duplicatePreparation = async (preparedId, beforeCommit = null, activityContext = null) => {
     setComposeError("");
     try {
       const duplicated = duplicatePreparedInput(flowRef.current, preparedId);
@@ -2181,12 +2297,14 @@ export function App() {
       }
       await commitFlow(duplicated.graph);
       setComposePreview(null);
+      const activity = await recordActivity({ action: "prepared_duplicated", targetType: "prepared", targetId: duplicated.preparedInput.id, summary: { rowCount: duplicated.preparedInput.rowCount, columnCount: duplicated.preparedInput.schema.length } }, activityContext ?? undefined);
       return {
         ok: true,
         preparedInputId: duplicated.preparedInput.id,
         name: duplicated.preparedInput.name,
         rowCount: duplicated.preparedInput.rowCount,
         columnCount: duplicated.preparedInput.schema.length,
+        activity,
       };
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : t("duplicateFailed");
@@ -2195,7 +2313,7 @@ export function App() {
     }
   };
 
-  const createPreparationFromCompose = async (nodeId, beforeCommit = null) => {
+  const createPreparationFromCompose = async (nodeId, beforeCommit = null, activityContext = null) => {
     setComposeError("");
     try {
       const candidate = createPreparedFromCompose(flowRef.current, nodeId);
@@ -2221,12 +2339,14 @@ export function App() {
       };
       await commitFlow(nextGraph);
       setComposePreview(null);
+      const activity = await recordActivity({ action: "compose_result_promoted", targetType: "prepared", targetId: candidate.preparedInput.id, summary: { rowCount: materialized.rowCount, columnCount: materialized.schema.length } }, activityContext ?? undefined);
       return {
         ok: true,
         preparedInputId: candidate.preparedInput.id,
         name: candidate.preparedInput.name,
         rowCount: materialized.rowCount,
         columnCount: materialized.schema.length,
+        activity,
       };
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : t("createPreparedFailed");
@@ -2249,6 +2369,7 @@ export function App() {
         recipeHistory.reset([]);
       }
       setComposePreview(null);
+      await recordActivity({ action: "prepared_deleted", targetType: "prepared", targetId: preparedId });
       return true;
     } catch (cause) {
       const message = cause?.code === "PREPARED_INPUT_HAS_DESCENDANTS"
@@ -2285,7 +2406,7 @@ export function App() {
     }
   };
 
-  const createComposeNode = async (draft, beforeCommit = null) => {
+  const createComposeNode = async (draft, beforeCommit = null, activityContext = null) => {
     const candidate = addComposeNode(flowRef.current, draft);
     const preview = await worker.previewCompose(candidate.graph, candidate.node.id);
     beforeCommit?.();
@@ -2296,16 +2417,18 @@ export function App() {
     await commitFlow(committed);
     setComposePreview(preview);
     setComposeError("");
+    const activity = await recordActivity({ action: "compose_operation_created", targetType: "compose-node", targetId: candidate.node.id, summary: { operationKind: candidate.node.kind, rowCount: preview.rowCount, columnCount: preview.schema.length } }, activityContext ?? undefined);
     return {
       nodeId: candidate.node.id,
       name: candidate.node.name,
       rowCount: preview.rowCount,
       columnCount: preview.schema.length,
       schema: preview.schema,
+      activity,
     };
   };
 
-  const updateComposeOperation = async (nodeId, draft, beforeCommit = null) => {
+  const updateComposeOperation = async (nodeId, draft, beforeCommit = null, activityContext = null) => {
     const candidate = updateComposeNode(flowRef.current, nodeId, draft);
     const preview = await worker.previewCompose(candidate.graph, nodeId);
     beforeCommit?.();
@@ -2318,12 +2441,14 @@ export function App() {
     await commitFlow(committed);
     setComposePreview(preview);
     setComposeError("");
+    const activity = await recordActivity({ action: "compose_operation_updated", targetType: "compose-node", targetId: nodeId, summary: { operationKind: candidate.node.kind, rowCount: preview.rowCount, columnCount: preview.schema.length } }, activityContext ?? undefined);
     return {
       nodeId,
       name: candidate.node.name,
       rowCount: preview.rowCount,
       columnCount: preview.schema.length,
       schema: preview.schema,
+      activity,
     };
   };
 
@@ -2332,6 +2457,7 @@ export function App() {
     await commitFlow(candidate.graph);
     setComposePreview(null);
     setComposeError("");
+    await recordActivity({ action: "compose_operation_deleted", targetType: "compose-node", targetId: nodeId });
   };
 
   const previewComposeDraft = async (draft, nodeId = null) => {
@@ -2341,42 +2467,48 @@ export function App() {
     return worker.previewCompose(candidate.graph, candidate.node.id);
   };
 
-  const moveComposeNode = async (nodeId, position, beforeCommit = null) => {
+  const moveComposeNode = async (nodeId, position, beforeCommit = null, activityContext = null) => {
     try {
       const candidate = updateNodePosition(flowRef.current, nodeId, position);
       beforeCommit?.();
       const graph = await commitFlow(candidate);
-      return { nodeId, position: graph.preparedInputs.find((node) => node.id === nodeId)?.position ?? graph.composeNodes.find((node) => node.id === nodeId)?.position };
+      const committedPosition = graph.preparedInputs.find((node) => node.id === nodeId)?.position ?? graph.composeNodes.find((node) => node.id === nodeId)?.position;
+      const activity = await recordActivity({ action: "compose_node_moved", targetType: "compose-node", targetId: nodeId, summary: { position: committedPosition } }, activityContext ?? undefined);
+      return { nodeId, position: committedPosition, activity };
     } catch (cause) {
       setComposeError(cause instanceof Error ? cause.message : t("composeUpdateFailed"));
       throw cause;
     }
   };
 
-  const autoArrangeComposeNodes = async (beforeCommit = null) => {
+  const autoArrangeComposeNodes = async (beforeCommit = null, activityContext = null) => {
     try {
       const candidate = autoArrangeNodePositions(flowRef.current);
       beforeCommit?.();
-      return await commitFlow(candidate);
+      const graph = await commitFlow(candidate);
+      const activity = await recordActivity({ action: "compose_auto_arranged", targetType: "flow", targetId: graph.id }, activityContext ?? undefined);
+      return { ...graph, activity };
     } catch (cause) {
       setComposeError(cause instanceof Error ? cause.message : t("composeUpdateFailed"));
       return null;
     }
   };
 
-  const exportComposeNode = async (format, nodeId = flowRef.current.activeNodeId) => {
+  const exportComposeNode = async (format, nodeId = flowRef.current.activeNodeId, activityContext = null) => {
     if (!nodeId) throw new Error("Select a Compose node before exporting.");
     const result = await worker.exportCompose(flowRef.current, nodeId, format);
     downloadExport(result);
-    return { nodeId, filename: result.filename, format };
+    const activity = await recordActivity({ action: "compose_exported", targetType: "compose-node", targetId: nodeId, summary: { format } }, activityContext ?? undefined);
+    return { nodeId, filename: result.filename, format, activity };
   };
 
-  const exportPreparedData = async (format, preparedId = activePreparedId) => {
+  const exportPreparedData = async (format, preparedId = activePreparedId, activityContext = null) => {
     if (!dataset || preparedId !== activePreparedId) throw new Error(`Prepared dataset is not active: ${preparedId}`);
     setScreen("data");
     const result = await worker.exportData(format, filters);
     downloadExport(result);
-    return { filename: result.filename, format, totalRowCount: dataset.rowCount, filteredRowCount: dataset.filteredCount };
+    const activity = await recordActivity({ action: "prepared_exported", targetType: "prepared", targetId: preparedId, summary: { format, rowCount: dataset.filteredCount, columnCount: dataset.columns.length } }, activityContext ?? undefined);
+    return { filename: result.filename, format, totalRowCount: dataset.rowCount, filteredRowCount: dataset.filteredCount, activity };
   };
 
   const previewRecipe = (recipe, stepIndex) => worker.previewRecipe(recipe, stepIndex);
@@ -2432,9 +2564,9 @@ export function App() {
 
   const autoArrangeComposeFromTool = async (meta) => runWebMcpMutation(meta, async (assertCurrent) => {
     setScreen("compose");
-    const graph = await autoArrangeComposeNodes(assertCurrent);
+    const graph = await autoArrangeComposeNodes(assertCurrent, webMcpActivity(meta));
     if (!graph) throw new Error("The Compose graph could not be arranged.");
-    return { revision: graph.revision };
+    return { revision: graph.revision, activity: graph.activity };
   }, "compose:auto-arrange");
 
   const requestSourceFileSelection = async () => {
@@ -2465,7 +2597,7 @@ export function App() {
     if (!metadata) throw new Error(`Cloud file not found: ${fileId}`);
     const file = await openCloudFile(metadata);
     setScreen("input");
-    await loadFile(file, null, true, assertCurrent);
+    await loadFile(file, null, true, assertCurrent, webMcpActivity(meta));
     return { fileId, name: metadata.name, size: metadata.size };
   }, `cloud:open:${fileId}`);
 
@@ -2615,7 +2747,7 @@ export function App() {
     if (!targetId) return {
       workspace: screen === "input" ? "source" : screen === "data" ? "prepare" : screen,
       workspaceRevision: workspaceRevisionRef.current,
-      actions: screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "export"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload"] : ["request-source-file", "request-source-relink"],
+      actions: screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", "inspect-activity"],
     };
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === targetId);
     if (prepared) return { targetId, kind: "dataset", actions: ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "export", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
@@ -2628,11 +2760,12 @@ export function App() {
     stepId,
     rowCount: result.rowCount,
     columnCount: result.columns.length,
+    activity: result.activity,
   });
 
   const applyFiltersFromTool = async (preparedId, nextFilters, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
     assertActivePreparedForTool(preparedId);
-    const result = await applyFilters(nextFilters, dataset.aggregateColumns, assertCurrent);
+    const result = await applyFilters(nextFilters, dataset.aggregateColumns, assertCurrent, webMcpActivity(meta));
     return result;
   }, `prepare:filters:${preparedId}:${JSON.stringify(nextFilters)}`);
 
@@ -2640,12 +2773,12 @@ export function App() {
     assertActivePreparedForTool(preparedId);
     const missing = columns.filter((column) => !dataset.columns.includes(column));
     if (missing.length) throw new Error(`Columns are not available: ${missing.join(", ")}`);
-    const result = await applyFilters(filters, columns, assertCurrent);
-    return { aggregateColumns: result.aggregateColumns, hiddenAggregateColumnCount: result.hiddenAggregateColumnCount };
+    const result = await applyFilters(filters, columns, assertCurrent, webMcpActivity(meta, { action: "aggregate_columns_changed" }));
+    return { aggregateColumns: result.aggregateColumns, hiddenAggregateColumnCount: result.hiddenAggregateColumnCount, activity: result.activity };
   }, `prepare:aggregate-columns:${preparedId}:${JSON.stringify(columns)}`);
 
   const duplicatePreparedFromTool = async (preparedId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
-    const result = await duplicatePreparation(preparedId, assertCurrent);
+    const result = await duplicatePreparation(preparedId, assertCurrent, webMcpActivity(meta));
     if (!result.ok) throw new Error(result.error || "Prepared dataset could not be duplicated.");
     return result;
   }, `prepare:duplicate:${preparedId}`);
@@ -2654,7 +2787,7 @@ export function App() {
     assertActivePreparedForTool(preparedId);
     setScreen("data");
     const step = createStep(definition.type, { ...definition.params });
-    const result = await applyRecipeChange([...recipeHistory.recipe, step], assertCurrent);
+    const result = await applyRecipeChange([...recipeHistory.recipe, step], assertCurrent, webMcpActivity(meta, { summary: { recipeStepType: step.type } }));
     return recipeResultSummary(result, step.id);
   }, `prepare:recipe:add:${preparedId}:${JSON.stringify(definition)}`);
 
@@ -2666,7 +2799,7 @@ export function App() {
     const nextRecipe = recipeHistory.recipe.map((step) => step.id === stepId
       ? { ...step, type: definition.type, params: { ...definition.params } }
       : step);
-    const result = await applyRecipeChange(nextRecipe, assertCurrent);
+    const result = await applyRecipeChange(nextRecipe, assertCurrent, webMcpActivity(meta, { summary: { recipeStepType: definition.type } }));
     return recipeResultSummary(result, stepId);
   }, `prepare:recipe:update:${preparedId}:${stepId}:${JSON.stringify(definition)}`);
 
@@ -2675,7 +2808,7 @@ export function App() {
     if (!recipeHistory.recipe.some((step) => step.id === stepId)) throw new Error(`Recipe step not found: ${stepId}`);
     setScreen("data");
     const nextRecipe = recipeHistory.recipe.map((step) => step.id === stepId ? { ...step, enabled } : step);
-    const result = await applyRecipeChange(nextRecipe, assertCurrent);
+    const result = await applyRecipeChange(nextRecipe, assertCurrent, webMcpActivity(meta, { summary: { enabled } }));
     return { ...recipeResultSummary(result, stepId), enabled };
   }, `prepare:recipe:enable:${preparedId}:${stepId}:${enabled}`);
 
@@ -2688,14 +2821,14 @@ export function App() {
     const [step] = nextRecipe.splice(sourceIndex, 1);
     nextRecipe.splice(position - 1, 0, step);
     setScreen("data");
-    const result = await applyRecipeChange(nextRecipe, assertCurrent);
+    const result = await applyRecipeChange(nextRecipe, assertCurrent, webMcpActivity(meta));
     return { ...recipeResultSummary(result, stepId), position };
   }, `prepare:recipe:move:${preparedId}:${stepId}:${position}`);
 
   const undoRecipeFromTool = async (preparedId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
     assertActivePreparedForTool(preparedId);
     setScreen("data");
-    const result = await undoRecipe(assertCurrent);
+    const result = await undoRecipe(assertCurrent, webMcpActivity(meta));
     if (!result) throw new Error("There is no recipe change to undo.");
     return recipeResultSummary(result);
   }, `prepare:recipe:undo:${preparedId}`);
@@ -2703,7 +2836,7 @@ export function App() {
   const redoRecipeFromTool = async (preparedId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
     assertActivePreparedForTool(preparedId);
     setScreen("data");
-    const result = await redoRecipe(assertCurrent);
+    const result = await redoRecipe(assertCurrent, webMcpActivity(meta));
     if (!result) throw new Error("There is no recipe change to redo.");
     return recipeResultSummary(result);
   }, `prepare:recipe:redo:${preparedId}`);
@@ -2713,7 +2846,7 @@ export function App() {
     if (!dataset.columns.includes(column)) throw new Error(`Column not found: ${column}`);
     const step = createStep("delete-rows", valueRowActionParams(action, column, value));
     setScreen("data");
-    const result = await applyRecipeChange([...recipeHistory.recipe, step], assertCurrent);
+    const result = await applyRecipeChange([...recipeHistory.recipe, step], assertCurrent, webMcpActivity(meta, { summary: { recipeStepType: step.type } }));
     return { ...recipeResultSummary(result, step.id), action, column, value };
   }, `prepare:value:${preparedId}:${action}:${column}:${JSON.stringify(value)}`);
 
@@ -2749,7 +2882,7 @@ export function App() {
 
   const createComposeOperationFromTool = async (operation, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
     setScreen("compose");
-    return createComposeNode(composeOperationDraftFromTool(operation), assertCurrent);
+    return createComposeNode(composeOperationDraftFromTool(operation), assertCurrent, webMcpActivity(meta));
   }, `compose:create:${JSON.stringify(operation)}`);
 
   const updateComposeOperationFromTool = async (nodeId, operation, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
@@ -2757,7 +2890,7 @@ export function App() {
     if (!existing) throw new Error(`Compose operation not found: ${nodeId}`);
     if (operation.kind !== existing.kind) throw new Error("Changing the operation kind is not supported. Create a new operation instead.");
     setScreen("compose");
-    return updateComposeOperation(nodeId, composeOperationDraftFromTool(operation, existing), assertCurrent);
+    return updateComposeOperation(nodeId, composeOperationDraftFromTool(operation, existing), assertCurrent, webMcpActivity(meta));
   }, `compose:update:${nodeId}:${JSON.stringify(operation)}`);
 
   const validateComposeOperationFromTool = async (operation) => {
@@ -2774,16 +2907,16 @@ export function App() {
 
   const exportComposeFromTool = async (nodeId, format) => {
     setScreen("compose");
-    return exportComposeNode(format, nodeId);
+    return exportComposeNode(format, nodeId, { actor: "agent", origin: "webmcp" });
   };
 
   const moveComposeNodeFromTool = async (nodeId, position, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
     setScreen("compose");
-    return moveComposeNode(nodeId, position, assertCurrent);
+    return moveComposeNode(nodeId, position, assertCurrent, webMcpActivity(meta));
   }, `compose:move:${nodeId}:${JSON.stringify(position)}`);
 
   const promoteComposeResultFromTool = async (nodeId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
-    const result = await createPreparationFromCompose(nodeId, assertCurrent);
+    const result = await createPreparationFromCompose(nodeId, assertCurrent, webMcpActivity(meta));
     if (!result.ok) throw new Error(result.error || "Compose result could not be promoted.");
     return result;
   }, `compose:promote:${nodeId}`);
@@ -2791,9 +2924,20 @@ export function App() {
   const requestDeleteFromTool = async (target, targetId, meta) => runWebMcpMutation(meta, async () => {
     setScreen(target === "recipe-step" ? "data" : "compose");
     const token = `${Date.now()}-${Math.random()}`;
-    setWebMcpDeleteRequest({ target, targetId, token });
-    return { target, targetId, confirmationToken: token, pendingConfirmation: true };
+    setWebMcpDeleteRequest({ target, targetId, token, requestId: meta.requestId });
+    const activity = await recordActivity({ action: "delete_requested", targetType: target, targetId, status: "pending-confirmation", summary: { targetKind: target } }, webMcpActivity(meta));
+    return { target, targetId, confirmationToken: token, pendingConfirmation: true, activity };
   }, `delete:request:${target}:${targetId}`);
+
+  const getActivityLogFromTool = async ({ limit = 50, targetId = null, actor = null } = {}) => {
+    const filtered = activityEventsRef.current
+      .filter((event) => !targetId || event.targetId === targetId)
+      .filter((event) => !actor || event.actor === actor)
+      .slice(0, Math.min(100, Math.max(1, limit)));
+    return { events: filtered, cursor: activityEventsRef.current[0]?.sequence ?? 0, hasMore: activityEventsRef.current.length > filtered.length };
+  };
+
+  const getChangesSinceFromTool = async (cursor, { limit = 100 } = {}) => pageActivityEvents(activityEventsRef.current, { cursor, limit });
 
   const acknowledgeDeleteRequest = useCallback((token) => {
     setWebMcpDeleteRequest((current) => current?.token === token ? null : current);
@@ -2801,10 +2945,11 @@ export function App() {
 
   useWebMcpTools({
     state: {
-      contractVersion: "2.0",
+      contractVersion: "2.1",
       workspaceRevision,
       flowId: flow.id,
       flowRevision: flow.revision,
+      activityCursor: activityEvents[0]?.sequence ?? 0,
       workspace: screen === "input" ? "source" : screen === "data" ? "prepare" : screen,
       worker: { ready: worker.ready, recovering: worker.recovering },
       flowDirty,
@@ -2812,6 +2957,7 @@ export function App() {
         ...(error ? [{ scope: "source-or-prepare", level: "error", message: error }] : []),
         ...(composeError ? [{ scope: "compose", level: "error", message: composeError }] : []),
         ...(recipeRecovery.error ? [{ scope: "recipe", level: "error", message: recipeRecovery.error, stepId: recipeRecovery.invalidStepId }] : []),
+        ...(activityError ? [{ scope: "activity", level: "warning", message: "Shared activity history is unavailable." }] : []),
       ],
       activePreparedId,
       activeNodeId: flow.activeNodeId,
@@ -2852,6 +2998,8 @@ export function App() {
     actions: {
       openWorkspace,
       getAvailableActions: getAvailableActionsFromTool,
+      getActivityLog: getActivityLogFromTool,
+      getChangesSince: getChangesSinceFromTool,
       selectPrepared: selectPreparedFromTool,
       getRecipe: getRecipeFromTool,
       duplicatePrepared: duplicatePreparedFromTool,
@@ -2875,7 +3023,7 @@ export function App() {
       listCloudFiles: listCloudFilesFromTool,
       openCloudFile: openCloudFileFromTool,
       requestCloudUpload: requestCloudUploadFromTool,
-      exportPrepare: (preparedId, format) => exportPreparedData(format, preparedId),
+      exportPrepare: (preparedId, format) => exportPreparedData(format, preparedId, { actor: "agent", origin: "webmcp" }),
       addRecipeStep: addRecipeStepFromTool,
       updateRecipeStep: updateRecipeStepFromTool,
       setRecipeStepEnabled: setRecipeStepEnabledFromTool,
@@ -2898,11 +3046,15 @@ export function App() {
         void openWorkspace(workspace);
       }} onCollapse={() => setCollapsed((value) => !value)} />
       {flowDirty && <div className="flow-save-alert" role="alert"><span>{t("flowSaveFailed")}</span><button type="button" disabled={retryingFlowSave} onClick={retryFlowSave}>{t(retryingFlowSave ? "saving" : "retrySave")}</button></div>}
+      {activityOverrideNotice && <div className="activity-override-notice" role="status"><ClockCounterClockwise weight="bold" /><span>{t("activityOverrideNotice")}</span><button type="button" aria-label={t("closeForm")} onClick={() => setActivityOverrideNotice("")}><X weight="bold" /></button></div>}
       {screen === "account" ? (
         <AccountScreen
           onOpenFile={async (file) => { setScreen("input"); await loadFile(file, null); }}
           uploadRequestToken={webMcpCloudUploadToken}
           onUploadRequestShown={(token) => setWebMcpCloudUploadToken((current) => current === token ? 0 : current)}
+          activityEvents={activityEvents}
+          activityLoading={activityLoading}
+          activityError={activityError}
         />
       ) : screen === "input" ? (
         <InputScreen

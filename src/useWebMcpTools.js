@@ -231,6 +231,15 @@ const AGGREGATE_COLUMNS_SCHEMA = Object.freeze(strictObject({
   ...MUTATION_META,
 }));
 const PREPARE_EXPORT_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, format: EXPORT_FORMAT_SCHEMA.properties.format }, ["preparedId", "format"]));
+const ACTIVITY_LOG_SCHEMA = Object.freeze(strictObject({
+  limit: { type: "integer", minimum: 1, maximum: 100, default: 50 },
+  targetId: ID,
+  actor: { type: "string", enum: ["user", "agent", "system"] },
+}, []));
+const CHANGES_SINCE_SCHEMA = Object.freeze(strictObject({
+  cursor: { type: "integer", minimum: 0, description: "The last activity cursor already observed." },
+  limit: { type: "integer", minimum: 1, maximum: 100, default: 100 },
+}, ["cursor"]));
 const ADD_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, step: RECIPE_STEP_DEFINITION_SCHEMA, ...MUTATION_META }));
 const UPDATE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, stepId: ID, step: RECIPE_STEP_DEFINITION_SCHEMA, ...MUTATION_META }));
 const ENABLE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, stepId: ID, enabled: { type: "boolean" }, ...MUTATION_META }));
@@ -263,7 +272,7 @@ function filterSelection(raw) {
 }
 
 const WEBMCP_CAPABILITIES = Object.freeze({
-  contractVersion: "2.0",
+  contractVersion: "2.1",
   authenticationRequired: false,
   workspaces: ["source", "prepare", "compose", "account"],
   actions: [
@@ -293,6 +302,8 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     "promote-compose-result",
     "request-source-relink",
     "cloud-file-access",
+    "inspect-shared-activity",
+    "inspect-changes-since-cursor",
   ],
   safeguards: {
     localFileSelection: "user-action-required",
@@ -302,7 +313,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
 });
 
 const WORKFLOW_GUIDE = Object.freeze({
-  contractVersion: "2.0",
+  contractVersion: "2.1",
   flow: [
     { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
     { workspace: "prepare", purpose: "Inspect one prepared dataset, apply temporary filters, and maintain its independent ordered recipe." },
@@ -312,6 +323,7 @@ const WORKFLOW_GUIDE = Object.freeze({
     observeBeforeActing: "Read workspace state and the target dataset or node immediately before a mutation.",
     concurrency: "Pass the latest workspaceRevision as expectedRevision and a unique requestId with every persistent or filter mutation.",
     visibility: "Every successful action updates the same visible state used by the user.",
+    activity: "UI and WebMCP changes share one privacy-safe persistent ledger. Read it before continuing after user interaction.",
     userControlled: ["local file selection", "source relinking", "cloud upload file selection", "deletion confirmation"],
   },
 });
@@ -375,6 +387,28 @@ export function createWebMcpTools(contextRef, availability) {
       const { actions } = activeContext(contextRef);
       const result = await actions.getAvailableActions(targetId);
       return webMcpResult("Returned the actions available in the current context.", result);
+    },
+  }, {
+    name: "tabulaflow_get_activity_log",
+    title: "Get shared TabulaFlow activity",
+    description: "Read the newest privacy-safe activity entries produced by both the user UI and AI agents. Use targetId or actor to narrow the result.",
+    inputSchema: ACTIVITY_LOG_SCHEMA,
+    annotations: { readOnlyHint: true, untrustedContentHint: true },
+    async execute({ limit = 50, targetId, actor }) {
+      const { actions } = activeContext(contextRef);
+      const result = await actions.getActivityLog({ limit, targetId, actor });
+      return webMcpResult(`Returned ${result.events.length} shared activity events.`, result);
+    },
+  }, {
+    name: "tabulaflow_get_changes_since",
+    title: "Get TabulaFlow changes since a cursor",
+    description: "Read ordered activity changes newer than a cursor. Use this before another mutation when the user may have changed the workspace.",
+    inputSchema: CHANGES_SINCE_SCHEMA,
+    annotations: { readOnlyHint: true, untrustedContentHint: true },
+    async execute({ cursor, limit = 100 }) {
+      const { actions } = activeContext(contextRef);
+      const result = await actions.getChangesSince(cursor, { limit });
+      return webMcpResult(`Returned ${result.events.length} changes after cursor ${cursor}.`, result);
     },
   }, {
     name: "tabulaflow_open_workspace",
@@ -569,6 +603,7 @@ export function createWebMcpTools(contextRef, availability) {
           filteredRowCount: result.filteredCount,
           filters: nextFilters,
           workspaceRevision: result.workspaceRevision,
+          activity: result.activity,
         });
       },
     }, {
@@ -582,7 +617,7 @@ export function createWebMcpTools(contextRef, availability) {
         const nextFilters = { ...state.activeDataset?.filters };
         delete nextFilters[column];
         const result = await actions.applyFilters(preparedId, nextFilters, { expectedRevision, requestId });
-        return webMcpResult(`Removed the ${column} filter.`, { filters: nextFilters, totalRowCount: result.rowCount, filteredRowCount: result.filteredCount, workspaceRevision: result.workspaceRevision });
+        return webMcpResult(`Removed the ${column} filter.`, { filters: nextFilters, totalRowCount: result.rowCount, filteredRowCount: result.filteredCount, workspaceRevision: result.workspaceRevision, activity: result.activity });
       },
     }, {
       name: "tabulaflow_clear_preview_filters",
@@ -593,7 +628,7 @@ export function createWebMcpTools(contextRef, availability) {
       async execute({ preparedId, expectedRevision, requestId }) {
         const { actions } = activeContext(contextRef);
         const result = await actions.applyFilters(preparedId, {}, { expectedRevision, requestId });
-        return webMcpResult("Cleared all temporary Prepare filters.", { totalRowCount: result.rowCount, filteredRowCount: result.filteredCount, filters: {}, workspaceRevision: result.workspaceRevision });
+        return webMcpResult("Cleared all temporary Prepare filters.", { totalRowCount: result.rowCount, filteredRowCount: result.filteredCount, filters: {}, workspaceRevision: result.workspaceRevision, activity: result.activity });
       },
     }, {
       name: "tabulaflow_export_prepare",
