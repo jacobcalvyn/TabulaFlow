@@ -12,7 +12,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "2.5", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "2.6", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -25,6 +25,7 @@ function createContext() {
         recipeSteps: [{ id: "step-a", type: "trim", enabled: true, params: { column: "status", mode: "both" } }],
         recipeHistory: { canUndo: true, canRedo: false },
         preparedInputs: [{ id: "prepared-a", name: "Orders", rowCount: 10, columnCount: 2 }],
+        metricDefinitions: [{ id: "metric-a", name: "Revenue", targetId: "prepared-a" }],
         composeNodes: [
           { id: "prepared-a", name: "Orders", kind: "dataset", rowCount: 10, columnCount: 2 },
           { id: "operation-a", name: "Filtered orders", kind: "filter-rows", rowCount: 4, columnCount: 2 },
@@ -48,7 +49,6 @@ function createContext() {
         async updateSemanticField(targetId, fieldName, changes, meta) { calls.push(["semantic-update", targetId, fieldName, changes, meta]); return result({ targetId, fieldName }); },
         async listMetricDefinitions(targetId) { calls.push(["metric-list", targetId]); return { targetId, metrics: [] }; },
         async upsertMetricDefinition(definition, meta) { calls.push(["metric-upsert", definition, meta]); return result({ metric: definition }); },
-        async deleteMetricDefinition(id, meta) { calls.push(["metric-delete", id, meta]); return result({ id, deleted: true }); },
         async replaceRecipe(preparedId, recipe, expectedRecipeRevision, meta) { calls.push(["replace-recipe", preparedId, recipe, expectedRecipeRevision, meta]); return result({ recipeRevision: expectedRecipeRevision + 1 }); },
         async duplicatePrepared(preparedId, meta) { calls.push(["duplicate", preparedId, meta]); return result({ preparedInputId: "prepared-b" }); },
         async getPrepareDataset(preparedId) { calls.push(["dataset", preparedId]); return { preparedId, name: "Orders", columns: ["status", "amount"] }; },
@@ -58,7 +58,7 @@ function createContext() {
         async previewRecipeChange(preparedId, recipe, stepIndex, options) { calls.push(["recipe-preview", preparedId, recipe, stepIndex, options]); return { valid: true, output: { rowCount: 4, columnCount: 2 }, schemaDelta: {}, diagnostics: [], saved: false }; },
         async applyFilters(preparedId, filters, meta) { calls.push(["filters", preparedId, filters, meta]); return result({ rowCount: 10, filteredCount: Object.keys(filters).length ? 4 : 10 }); },
         async setAggregateColumns(preparedId, columns, meta) { calls.push(["aggregate-columns", preparedId, columns, meta]); return result({ aggregateColumns: columns, hiddenAggregateColumnCount: 2 - columns.length }); },
-        async exportPrepare(preparedId, format) { calls.push(["export-prepare", preparedId, format]); return { filename: `orders.${format}`, format, totalRowCount: 10, filteredRowCount: 4 }; },
+        async exportPrepare(preparedId, format, meta) { calls.push(["export-prepare", preparedId, format, meta]); return result({ filename: `orders.${format}`, format, totalRowCount: 10, filteredRowCount: 4 }); },
         async addRecipeStep(preparedId, step, meta) { calls.push(["add-step", preparedId, step, meta]); return result({ stepId: "step-b" }); },
         async updateRecipeStep(preparedId, stepId, step, meta) { calls.push(["update-step", preparedId, stepId, step, meta]); return result({ stepId }); },
         async setRecipeStepEnabled(preparedId, stepId, enabled, meta) { calls.push(["enable-step", preparedId, stepId, enabled, meta]); return result({ stepId, enabled }); },
@@ -75,7 +75,7 @@ function createContext() {
         async selectComposeNode(nodeId, meta) { calls.push(["node", nodeId, meta]); },
         async autoArrangeCompose(meta) { calls.push(["arrange", meta]); return result({ revision: 5 }); },
         async moveComposeNode(nodeId, position, meta) { calls.push(["move-node", nodeId, position, meta]); return result({ nodeId, position }); },
-        async exportCompose(nodeId, format) { calls.push(["export-compose", nodeId, format]); return { nodeId, filename: `node.${format}`, format }; },
+        async exportCompose(nodeId, format, meta) { calls.push(["export-compose", nodeId, format, meta]); return result({ nodeId, filename: `node.${format}`, format }); },
         async createComposeOperation(operation, meta) { calls.push(["create-operation", operation, meta]); return result({ nodeId: "operation-b", name: operation.name ?? "Filter rows 2" }); },
         async updateComposeOperation(nodeId, operation, meta) { calls.push(["update-operation", nodeId, operation, meta]); return result({ nodeId, name: "Filtered orders" }); },
         async promoteComposeResult(nodeId, meta) { calls.push(["promote", nodeId, meta]); return result({ preparedInputId: "prepared-b" }); },
@@ -151,11 +151,13 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "2.5");
+  assert.equal(capabilities.structuredContent.contractVersion, "2.6");
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");
   assert.equal(capabilities.structuredContent.safeguards.deletion, "visible-user-confirmation-required");
+  assert.equal(capabilities.structuredContent.safeguards.semanticDeclassification, "visible-user-action-required");
+  assert.equal(capabilities.structuredContent.safeguards.exports, "revision-and-idempotency-required");
   assert.equal(guide.structuredContent.flow.length, 3);
   assert.equal(operation.structuredContent.inputs, 2);
   assert.ok(tools.filter((tool) => tool.annotations?.untrustedContentHint).length >= 10);
@@ -186,7 +188,7 @@ test("WebMCP mutations target stable IDs and carry revision plus idempotency met
   const filtered = await toolByName(tools, "tabulaflow_set_preview_filter").execute({ preparedId: "prepared-a", column: "status", value: "open", ...mutation("filter-set-001") });
   await toolByName(tools, "tabulaflow_remove_preview_filter").execute({ preparedId: "prepared-a", column: "status", ...mutation("filter-remove-001") });
   await toolByName(tools, "tabulaflow_clear_preview_filters").execute({ preparedId: "prepared-a", ...mutation("filter-clear-001") });
-  await toolByName(tools, "tabulaflow_export_prepare").execute({ preparedId: "prepared-a", format: "csv" });
+  await toolByName(tools, "tabulaflow_export_prepare").execute({ preparedId: "prepared-a", format: "csv", ...mutation("prepare-export-001") });
   await toolByName(tools, "tabulaflow_add_recipe_step").execute({ preparedId: "prepared-a", step: trim, ...mutation("recipe-add-001") });
   await toolByName(tools, "tabulaflow_replace_recipe").execute({ preparedId: "prepared-a", recipe: [{ id: "step-a", ...trim, enabled: true }], expectedRecipeRevision: 1, ...mutation("recipe-replace-001") });
   await toolByName(tools, "tabulaflow_update_recipe_step").execute({ preparedId: "prepared-a", stepId: "step-a", step: trim, ...mutation("recipe-update-001") });
@@ -198,18 +200,23 @@ test("WebMCP mutations target stable IDs and carry revision plus idempotency met
   await toolByName(tools, "tabulaflow_select_compose_node").execute({ nodeId: "operation-a", ...mutation("compose-select-001") });
   await toolByName(tools, "tabulaflow_auto_arrange_compose").execute(mutation("arrange-001"));
   await toolByName(tools, "tabulaflow_move_compose_node").execute({ nodeId: "operation-a", position: { x: 200, y: 300 }, ...mutation("move-node-001") });
-  await toolByName(tools, "tabulaflow_export_compose").execute({ nodeId: "operation-a", format: "xlsx" });
+  await toolByName(tools, "tabulaflow_export_compose").execute({ nodeId: "operation-a", format: "xlsx", ...mutation("compose-export-001") });
   await toolByName(tools, "tabulaflow_create_compose_operation").execute({ operation: filter, ...mutation("operation-create-001") });
   await toolByName(tools, "tabulaflow_update_compose_operation").execute({ nodeId: "operation-a", operation: filter, ...mutation("operation-update-001") });
   await toolByName(tools, "tabulaflow_promote_compose_result").execute({ nodeId: "operation-a", ...mutation("promote-001") });
   const deletion = await toolByName(tools, "tabulaflow_request_delete").execute({ target: "recipe-step", targetId: "step-a", ...mutation("delete-001") });
+  const metricDeletion = await toolByName(tools, "tabulaflow_delete_metric_definition").execute({ id: "metric-a", ...mutation("metric-delete-001") });
 
   assert.equal(filtered.structuredContent.totalRowCount, 10);
   assert.equal(filtered.structuredContent.filteredRowCount, 4);
   assert.equal(deletion.structuredContent.pendingConfirmation, true);
+  assert.equal(metricDeletion.structuredContent.pendingConfirmation, true);
   assert.ok(calls.some((call) => call[0] === "duplicate" && call[2].expectedRevision === REVISION));
   assert.ok(calls.some((call) => call[0] === "create-operation" && call[2].requestId === "operation-create-001"));
   assert.ok(calls.some((call) => call[0] === "delete-request" && call[3].requestId === "delete-001"));
+  assert.ok(calls.some((call) => call[0] === "delete-request" && call[1] === "metric-definition" && call[2] === "metric-a"));
+  assert.ok(calls.some((call) => call[0] === "export-prepare" && call[3].requestId === "prepare-export-001"));
+  assert.ok(calls.some((call) => call[0] === "export-compose" && call[3].requestId === "compose-export-001"));
 });
 
 test("WebMCP rejects stale target identifiers before invoking visible actions", async () => {
@@ -219,7 +226,7 @@ test("WebMCP rejects stale target identifiers before invoking visible actions", 
   await assert.rejects(() => toolByName(tools, "tabulaflow_set_preview_filter").execute({ preparedId: "missing", column: "status", value: "x", ...mutation("missing-prepared-001") }), /not active/);
   await assert.rejects(() => toolByName(tools, "tabulaflow_select_prepared_dataset").execute({ preparedId: "missing", ...mutation("missing-prepared-select") }), /not found/);
   await assert.rejects(() => toolByName(tools, "tabulaflow_select_compose_node").execute({ nodeId: "missing", ...mutation("missing-compose-select") }), /not found/);
-  await assert.rejects(() => toolByName(tools, "tabulaflow_export_compose").execute({ nodeId: "missing", format: "csv" }), /not found/);
+  await assert.rejects(() => toolByName(tools, "tabulaflow_export_compose").execute({ nodeId: "missing", format: "csv", ...mutation("missing-export-001") }), /not found/);
   await assert.rejects(() => toolByName(tools, "tabulaflow_request_delete").execute({ target: "recipe-step", targetId: "missing", ...mutation("missing-delete-001") }), /not found/);
   assert.equal(calls.length, 0);
 });
@@ -228,9 +235,9 @@ test("WebMCP mutation schemas require collaboration metadata and conditional val
   const { ref } = createContext();
   const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   for (const name of [
-    "tabulaflow_open_cloud_file", "tabulaflow_select_prepared_dataset", "tabulaflow_duplicate_prepared_dataset", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter", "tabulaflow_add_recipe_step", "tabulaflow_replace_recipe",
+    "tabulaflow_open_cloud_file", "tabulaflow_select_prepared_dataset", "tabulaflow_duplicate_prepared_dataset", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter", "tabulaflow_export_prepare", "tabulaflow_add_recipe_step", "tabulaflow_replace_recipe",
     "tabulaflow_select_compose_node", "tabulaflow_auto_arrange_compose", "tabulaflow_create_compose_operation", "tabulaflow_update_compose_operation",
-    "tabulaflow_promote_compose_result", "tabulaflow_request_delete",
+    "tabulaflow_export_compose", "tabulaflow_promote_compose_result", "tabulaflow_request_delete",
   ]) {
     const required = toolByName(tools, name).inputSchema.required;
     assert.ok(required.includes("expectedRevision"), `${name} must require expectedRevision`);
@@ -257,6 +264,29 @@ test("WebMCP mutation schemas require collaboration metadata and conditional val
   assert.deepEqual(toolByName(tools, "tabulaflow_get_prepare_preview").inputSchema.required, ["preparedId", "columns"]);
   assert.equal(toolByName(tools, "tabulaflow_get_prepare_preview").inputSchema.properties.columns.maxItems, 20);
   assert.deepEqual(toolByName(tools, "tabulaflow_get_node_preview").inputSchema.required, ["nodeId", "columns"]);
+  assert.equal(toolByName(tools, "tabulaflow_update_semantic_field").inputSchema.properties.changes.properties.sensitivity.enum.includes("public"), false);
+});
+
+test("registered WebMCP export tools execute through the modelContext registry with collaboration guards", async () => {
+  const { calls, ref } = createContext();
+  const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
+  const registry = new Map();
+  const controller = new AbortController();
+  await registerWebMcpTools({
+    async registerTool(tool, options) {
+      assert.equal(options.signal, controller.signal);
+      registry.set(tool.name, tool);
+    },
+  }, tools, controller.signal);
+
+  const prepareResult = await registry.get("tabulaflow_export_prepare").execute({ preparedId: "prepared-a", format: "csv", ...mutation("registered-prepare-export") });
+  const composeResult = await registry.get("tabulaflow_export_compose").execute({ nodeId: "operation-a", format: "xlsx", ...mutation("registered-compose-export") });
+
+  assert.equal(prepareResult.structuredContent.workspaceRevision, REVISION + 1);
+  assert.equal(composeResult.structuredContent.workspaceRevision, REVISION + 1);
+  assert.ok(calls.some((call) => call[0] === "export-prepare" && call[3].requestId === "registered-prepare-export"));
+  assert.ok(calls.some((call) => call[0] === "export-compose" && call[3].requestId === "registered-compose-export"));
+  controller.abort();
 });
 
 test("WebMCP registration is sequential, uses one lifecycle signal, and skips unsupported browsers", async () => {

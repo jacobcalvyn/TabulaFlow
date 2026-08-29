@@ -72,6 +72,14 @@ const VALUE_SCHEMA = {
   ],
 };
 
+const PROTECTED_AGENT_VALUE_SCHEMA = strictObject({
+  __tabulaflowProtectedValue: { const: true, description: "Protected value returned by a Compose read. Preserve it unchanged when updating the existing operation." },
+}, ["__tabulaflowProtectedValue"]);
+
+const COMPOSE_VALUE_SCHEMA = {
+  oneOf: [...VALUE_SCHEMA.oneOf, PROTECTED_AGENT_VALUE_SCHEMA],
+};
+
 const AGENT_VALUE_SCHEMA = {
   oneOf: [
     ...VALUE_SCHEMA.oneOf,
@@ -88,15 +96,11 @@ const EXPORT_FORMAT_SCHEMA = Object.freeze({
   additionalProperties: false,
 });
 
-const COMPOSE_EXPORT_SCHEMA = Object.freeze({
-  type: "object",
-  properties: {
-    nodeId: { type: "string", minLength: 1, description: "The dataset or operation node to export." },
-    format: { type: "string", enum: ["csv", "xlsx"], description: "The download file format." },
-  },
-  required: ["nodeId", "format"],
-  additionalProperties: false,
-});
+const COMPOSE_EXPORT_SCHEMA = Object.freeze(strictObject({
+  nodeId: { type: "string", minLength: 1, description: "The dataset or operation node to export." },
+  format: { type: "string", enum: ["csv", "xlsx"], description: "The download file format." },
+  ...MUTATION_META,
+}));
 
 function strictObject(properties, required = Object.keys(properties)) {
   return { type: "object", properties, required, additionalProperties: false };
@@ -170,7 +174,7 @@ const COMPOSE_OPERATION_SCHEMA = Object.freeze({
     strictObject({ kind: { const: "append" }, inputIds: { type: "array", items: ID, minItems: 2, maxItems: 2, uniqueItems: true }, name: OPTIONAL_NAME }, ["kind", "inputIds"]),
     strictObject({ kind: { const: "join" }, leftId: ID, rightId: ID, leftKey: ID, rightKey: ID, joinType: { type: "string", enum: ["inner", "left", "right", "full"] }, name: OPTIONAL_NAME }, ["kind", "leftId", "rightId", "leftKey", "rightKey", "joinType"]),
     strictObject({ kind: { const: "difference" }, leftId: ID, rightId: ID, leftKey: ID, rightKey: ID, mode: { type: "string", enum: ["left-only", "right-only"] }, name: OPTIONAL_NAME }, ["kind", "leftId", "rightId", "leftKey", "rightKey", "mode"]),
-    strictObject({ kind: { const: "filter-rows" }, inputId: ID, column: ID, operator: { type: "string", enum: FILTER_VALUE_OPERATORS }, value: VALUE_SCHEMA, name: OPTIONAL_NAME }, ["kind", "inputId", "column", "operator", "value"]),
+    strictObject({ kind: { const: "filter-rows" }, inputId: ID, column: ID, operator: { type: "string", enum: FILTER_VALUE_OPERATORS }, value: COMPOSE_VALUE_SCHEMA, name: OPTIONAL_NAME }, ["kind", "inputId", "column", "operator", "value"]),
     strictObject({ kind: { const: "filter-rows" }, inputId: ID, column: ID, operator: { type: "string", enum: FILTER_VALUELESS_OPERATORS }, name: OPTIONAL_NAME }, ["kind", "inputId", "column", "operator"]),
     strictObject({ kind: { const: "distinct-rows" }, inputId: ID, columns: COLUMN_NAMES, mode: { type: "string", enum: ["representative-rows", "project-columns"], default: "representative-rows" }, name: OPTIONAL_NAME }, ["kind", "inputId", "columns"]),
     strictObject({
@@ -194,14 +198,14 @@ const COMPOSE_OPERATION_SCHEMA = Object.freeze({
     }, ["kind", "inputId", "metrics"]),
     strictObject({ kind: { const: "aggregate" }, inputId: ID, groupBy: { type: "array", items: ID, uniqueItems: true }, function: { const: "count" }, measureColumn: ID, alias: ID, name: OPTIONAL_NAME }, ["kind", "inputId", "function", "alias"]),
     strictObject({ kind: { const: "aggregate" }, inputId: ID, groupBy: { type: "array", items: ID, uniqueItems: true }, function: { type: "string", enum: ["sum", "average", "min", "max", "count-distinct"] }, measureColumn: ID, alias: ID, name: OPTIONAL_NAME }, ["kind", "inputId", "function", "measureColumn", "alias"]),
-    strictObject({ kind: { const: "pivot" }, inputId: ID, groupBy: { type: "array", items: ID, uniqueItems: true }, pivotColumn: ID, valueColumn: ID, aggregate: { type: "string", enum: ["sum", "count", "average", "min", "max"] }, values: { type: "array", items: VALUE_SCHEMA, minItems: 1 }, name: OPTIONAL_NAME }, ["kind", "inputId", "pivotColumn", "valueColumn", "aggregate", "values"]),
+    strictObject({ kind: { const: "pivot" }, inputId: ID, groupBy: { type: "array", items: ID, uniqueItems: true }, pivotColumn: ID, valueColumn: ID, aggregate: { type: "string", enum: ["sum", "count", "average", "min", "max"] }, values: { type: "array", items: COMPOSE_VALUE_SCHEMA, minItems: 1 }, name: OPTIONAL_NAME }, ["kind", "inputId", "pivotColumn", "valueColumn", "aggregate", "values"]),
     strictObject({ kind: { const: "unpivot" }, inputId: ID, idColumns: { type: "array", items: ID, uniqueItems: true }, valueColumns: COLUMN_NAMES, fieldColumn: ID, valueColumn: ID, name: OPTIONAL_NAME }, ["kind", "inputId", "valueColumns", "fieldColumn", "valueColumn"]),
   ],
 });
 
 const CREATE_COMPOSE_OPERATION_SCHEMA = Object.freeze(strictObject({ operation: COMPOSE_OPERATION_SCHEMA }));
 const DELETE_REQUEST_SCHEMA = Object.freeze(strictObject({
-  target: { type: "string", enum: ["recipe-step", "prepared-dataset", "compose-operation"] },
+  target: { type: "string", enum: ["recipe-step", "prepared-dataset", "compose-operation", "metric-definition"] },
   targetId: { type: "string", minLength: 1 },
   ...MUTATION_META,
 }));
@@ -259,7 +263,7 @@ const UPDATE_SEMANTIC_FIELD_SCHEMA = Object.freeze(strictObject({
     businessName: { type: "string", minLength: 1 },
     role: { type: "string", enum: ["identifier", "dimension", "measure", "timestamp", "status", "free-text", "attribute"] },
     unit: { type: ["string", "null"] },
-    sensitivity: { type: "string", enum: ["public", "internal", "pii", "financial", "secret"] },
+    sensitivity: { type: "string", enum: ["internal", "pii", "financial", "secret"], description: "A sensitivity level that is at least as strict as the current value. Declassification is user-controlled." },
     allowedAggregations: { type: "array", items: { type: "string", enum: ["count", "count-distinct", "sum", "average", "min", "max", "median", "percentile"] }, uniqueItems: true },
   }, []),
   ...MUTATION_META,
@@ -311,7 +315,7 @@ const AGGREGATE_COLUMNS_SCHEMA = Object.freeze(strictObject({
   columns: { type: "array", items: ID, maxItems: 200, uniqueItems: true },
   ...MUTATION_META,
 }));
-const PREPARE_EXPORT_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, format: EXPORT_FORMAT_SCHEMA.properties.format }, ["preparedId", "format"]));
+const PREPARE_EXPORT_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, format: EXPORT_FORMAT_SCHEMA.properties.format, ...MUTATION_META }));
 const ACTIVITY_LOG_SCHEMA = Object.freeze(strictObject({
   limit: { type: "integer", minimum: 1, maximum: 100, default: 50 },
   targetId: ID,
@@ -360,7 +364,7 @@ function filterSelection(raw) {
 }
 
 const WEBMCP_CAPABILITIES = Object.freeze({
-  contractVersion: "2.5",
+  contractVersion: "2.6",
   authenticationRequired: false,
   workspaces: ["source", "prepare", "compose", "account"],
   actions: [
@@ -403,11 +407,15 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     localFileSelection: "user-action-required",
     deletion: "visible-user-confirmation-required",
     cloudFiles: "chatgpt-sign-in-required",
+    dataExposure: "conservative-redaction-floor",
+    semanticDeclassification: "visible-user-action-required",
+    recipeLiterals: "opaque-preserve-only",
+    exports: "revision-and-idempotency-required",
   },
 });
 
 const WORKFLOW_GUIDE = Object.freeze({
-  contractVersion: "2.5",
+  contractVersion: "2.6",
   flow: [
     { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
     { workspace: "prepare", purpose: "Inspect one prepared dataset, apply temporary filters, and maintain its independent ordered recipe." },
@@ -415,7 +423,7 @@ const WORKFLOW_GUIDE = Object.freeze({
   ],
   collaboration: {
     observeBeforeActing: "Read workspace state and the target dataset or node immediately before a mutation.",
-    concurrency: "Pass the latest workspaceRevision as expectedRevision and a unique requestId with every persistent or filter mutation.",
+    concurrency: "Pass the latest workspaceRevision as expectedRevision and a unique requestId with every mutation or export side effect.",
     visibility: "Every successful action updates the same visible state used by the user.",
     activity: "UI and WebMCP changes share one privacy-safe persistent ledger. Read it before continuing after user interaction.",
     userControlled: ["local file selection", "source relinking", "cloud upload file selection", "deletion confirmation"],
@@ -516,7 +524,7 @@ export function createWebMcpTools(contextRef, availability) {
   }, {
     name: "tabulaflow_get_operation_status",
     title: "Get mutation operation status",
-    description: "Poll a long-running WebMCP mutation accepted with executionMode async. Returns accepted, running, committed, or failed with its final result or diagnostic.",
+    description: "Poll a long-running WebMCP mutation accepted with executionMode async. Returns accepted, running, committed, cancelled, or failed with its final result or diagnostic.",
     inputSchema: OPERATION_STATUS_SCHEMA,
     annotations: { readOnlyHint: true },
     async execute({ operationId }) {
@@ -631,7 +639,7 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_update_semantic_field",
       title: "Update semantic field metadata",
-      description: "Override one field's business role, unit, sensitivity, or allowed aggregations. Derived Compose nodes inherit the override through schema lineage.",
+      description: "Update one field's business role, unit, sensitivity, or allowed aggregations. WebMCP may only keep or tighten sensitivity; declassification remains a visible user action. Derived Compose nodes inherit the override through schema lineage.",
       inputSchema: UPDATE_SEMANTIC_FIELD_SCHEMA,
       annotations: { readOnlyHint: false },
       async execute({ targetId, fieldName, changes, expectedRevision, requestId }) {
@@ -664,13 +672,13 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_delete_metric_definition",
       title: "Delete a reusable metric definition",
-      description: "Delete only the reusable metric definition. Existing Compose nodes keep their copied metric configuration.",
+      description: "Open a visible confirmation before deleting a reusable metric definition. Existing Compose nodes keep their copied metric configuration.",
       inputSchema: DELETE_METRIC_DEFINITION_SCHEMA,
       annotations: { readOnlyHint: false },
       async execute({ id, expectedRevision, requestId }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.deleteMetricDefinition(id, { expectedRevision, requestId });
-        return webMcpResult(`Deleted reusable metric ${id}.`, result);
+        const result = await actions.requestDelete("metric-definition", id, { expectedRevision, requestId });
+        return webMcpResult(`Deletion confirmation opened for reusable metric ${id}.`, result);
       },
     }, {
       name: "tabulaflow_replace_recipe",
@@ -813,12 +821,12 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_export_prepare",
       title: "Export the prepared dataset",
-      description: "Download the active Prepare result, including its current temporary filters, as CSV or Excel.",
+      description: "Download the active Prepare result, including its current temporary filters, as CSV or Excel. Requires the latest workspace revision and an idempotency key so retries do not trigger duplicate downloads.",
       inputSchema: PREPARE_EXPORT_V2_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ preparedId, format }) {
+      async execute({ preparedId, format, expectedRevision, requestId }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.exportPrepare(preparedId, format);
+        const result = await actions.exportPrepare(preparedId, format, { expectedRevision, requestId });
         return webMcpResult(`Downloaded ${result.filename}.`, result);
       },
     }, {
@@ -1007,13 +1015,13 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_export_compose",
       title: "Export a Compose node",
-      description: "Select and download one existing Compose dataset or operation result as CSV or Excel.",
+      description: "Select and download one existing Compose dataset or operation result as CSV or Excel. Requires the latest workspace revision and an idempotency key so retries do not trigger duplicate downloads.",
       inputSchema: COMPOSE_EXPORT_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ nodeId, format }) {
+      async execute({ nodeId, format, expectedRevision, requestId }) {
         const { state, actions } = activeContext(contextRef);
         if (!state.composeNodes.some((item) => item.id === nodeId)) throw new Error(`Compose node not found: ${nodeId}`);
-        const result = await actions.exportCompose(nodeId, format);
+        const result = await actions.exportCompose(nodeId, format, { expectedRevision, requestId });
         return webMcpResult(`Downloaded ${result.filename}.`, result);
       },
     }, {
@@ -1056,7 +1064,7 @@ export function createWebMcpTools(contextRef, availability) {
     tools.push({
       name: "tabulaflow_request_delete",
       title: "Request deletion in TabulaFlow",
-      description: "Open the visible confirmation control for a recipe step, prepared dataset, or Compose operation. This tool never confirms or performs the deletion itself.",
+      description: "Open the visible confirmation control for a recipe step, prepared dataset, Compose operation, or reusable metric definition. This tool never confirms or performs the deletion itself.",
       inputSchema: DELETE_REQUEST_SCHEMA,
       annotations: { readOnlyHint: false, destructiveHint: true },
       async execute({ target, targetId, expectedRevision, requestId }) {
@@ -1065,7 +1073,9 @@ export function createWebMcpTools(contextRef, availability) {
           ? state.recipeSteps.some((item) => item.id === targetId)
           : target === "prepared-dataset"
             ? state.preparedInputs.some((item) => item.id === targetId)
-            : state.composeNodes.some((item) => item.id === targetId && item.kind !== "dataset");
+            : target === "compose-operation"
+              ? state.composeNodes.some((item) => item.id === targetId && item.kind !== "dataset")
+              : state.metricDefinitions.some((item) => item.id === targetId);
         if (!exists) throw new Error(`${target} not found: ${targetId}`);
         const result = await actions.requestDelete(target, targetId, { expectedRevision, requestId });
         return webMcpResult(`Deletion confirmation opened for ${targetId}.`, result);

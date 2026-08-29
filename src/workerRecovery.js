@@ -28,6 +28,7 @@ export function createWorkerRegistry() {
 
 export function rememberLoadedSource(registry, entry) {
   const next = cloneRegistry(registry);
+  const existingPrimary = next.preparedInputs.get(entry.primaryPreparedId);
   next.sources.set(entry.sourceId, {
     sourceId: entry.sourceId,
     origin: entry.origin,
@@ -38,13 +39,9 @@ export function rememberLoadedSource(registry, entry) {
     preparedId: entry.primaryPreparedId,
     sourceId: entry.sourceId,
     sourcePreparedId: entry.primaryPreparedId,
-    recipe: [],
+    recipe: cloneRecipe(existingPrimary?.recipe),
     kind: entry.origin === "compose" ? "compose" : "primary",
   });
-  for (const [preparedId, prepared] of next.preparedInputs) {
-    if (prepared.sourceId !== entry.sourceId || preparedId === entry.primaryPreparedId) continue;
-    next.preparedInputs.set(preparedId, { ...prepared, recipe: [] });
-  }
   next.activePreparedId = entry.primaryPreparedId;
   next.activeFilters = {};
   next.aggregateColumns = [...(entry.aggregateColumns ?? [])];
@@ -95,10 +92,30 @@ export function forgetPrepared(registry, preparedId) {
   if (!current) return registry;
   const next = cloneRegistry(registry);
   next.preparedInputs.delete(preparedId);
-  const sourceStillUsed = [...next.preparedInputs.values()].some((item) => item.sourceId === current.sourceId);
-  if (!sourceStillUsed) next.sources.delete(current.sourceId);
+  const siblings = [...next.preparedInputs.values()].filter((item) => item.sourceId === current.sourceId);
+  const sourceStillUsed = siblings.length > 0;
+  if (!sourceStillUsed) {
+    next.sources.delete(current.sourceId);
+  } else {
+    const source = next.sources.get(current.sourceId);
+    if (source?.primaryPreparedId === preparedId) {
+      const replacement = siblings[0];
+      next.sources.set(current.sourceId, {
+        ...source,
+        primaryPreparedId: replacement.preparedId,
+        payload: { ...source.payload, preparedId: replacement.preparedId },
+      });
+      for (const sibling of siblings) {
+        next.preparedInputs.set(sibling.preparedId, {
+          ...sibling,
+          sourcePreparedId: replacement.preparedId,
+          kind: sibling.preparedId === replacement.preparedId ? "primary" : "copy",
+        });
+      }
+    }
+  }
   if (next.activePreparedId === preparedId) {
-    next.activePreparedId = next.preparedInputs.keys().next().value ?? null;
+    next.activePreparedId = siblings[0]?.preparedId ?? next.preparedInputs.keys().next().value ?? null;
     next.activeFilters = {};
     next.aggregateColumns = [];
   }

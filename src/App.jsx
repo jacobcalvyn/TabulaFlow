@@ -45,11 +45,20 @@ import { schemaDelta } from "./schemaDelta.js";
 import { nextWorkspaceRevision } from "./workspaceRevision.js";
 import { resolveColumnSemantics, shouldRedactAgentValues } from "./dataPrivacy.js";
 import {
+  assertAgentSemanticFieldChange,
+  protectComposeConfigForAgent,
+  protectRecipeForAgent,
+  restoreProtectedComposeOperation,
+  restoreProtectedRecipeValues,
+} from "./agentDataProtection.js";
+import {
   applySemanticModelToSchema,
   createSemanticModel,
   normalizeMetricDefinition,
   reconcileSemanticModel,
+  deriveRecipeSemanticSchema,
   mergeFieldSemantics,
+  strictestSensitivity,
   updateSemanticField,
 } from "./semanticModel.js";
 import { useI18n } from "./i18n.jsx";
@@ -60,8 +69,8 @@ import {
   PREPARED_RECIPE_STATUS,
   recipeForExecution,
 } from "./preparedRecipeState.js";
-import { createStep, CREATABLE_TRANSFORMATION_TYPES, valueRowActionParams } from "./transformations.js";
-import { getFormulaColumnReferences, validateFormula } from "./formulaEngine.js";
+import { assertAgentRecipeContract, createStep, CREATABLE_TRANSFORMATION_TYPES, includeNewFormulaAggregateColumns, isAgentCreatableTransformation, miniTableToolTouchesColumn, valueRowActionParams } from "./transformations.js";
+import { getFormulaColumnReferences } from "./formulaEngine.js";
 import {
   addComposeNode,
   addPreparedInput,
@@ -87,36 +96,6 @@ import {
   updatePreparedInput,
   validateFlowGraph,
 } from "./flowModel.js";
-
-const PROTECTED_RECIPE_VALUE = "__tabulaflowProtectedValue";
-
-function protectRecipeForAgent(recipe = [], schema = []) {
-  const columns = new Map(schema.map((column) => [column.name, column]));
-  return recipe.map((step) => {
-    const column = step.params?.column;
-    if (!column || !shouldRedactAgentValues(resolveColumnSemantics(columns.get(column) ?? { name: column, type: "VARCHAR" }))) return structuredClone(step);
-    const params = { ...step.params };
-    for (const key of ["value", "from", "to"]) {
-      if (Object.hasOwn(params, key)) params[key] = { [PROTECTED_RECIPE_VALUE]: true };
-    }
-    return { ...step, params };
-  });
-}
-
-function restoreProtectedRecipeValues(recipe = [], currentRecipe = []) {
-  const currentById = new Map(currentRecipe.map((step) => [step.id, step]));
-  return recipe.map((step) => {
-    const params = { ...step.params };
-    const previous = currentById.get(step.id);
-    for (const key of ["value", "from", "to"]) {
-      if (params[key]?.[PROTECTED_RECIPE_VALUE] === true) {
-        if (!previous || !Object.hasOwn(previous.params ?? {}, key)) throw new Error(`Protected recipe value cannot be restored for step ${step.id}.`);
-        params[key] = previous.params[key];
-      }
-    }
-    return { ...step, params };
-  });
-}
 
 function protectFiltersForAgent(filters = {}, schema = []) {
   const columns = new Map(schema.map((column) => [column.name, column]));
@@ -164,21 +143,6 @@ const COLUMN_TYPE_OPTIONS = Object.freeze([
   { value: "DATE", labelKey: "dateType" },
   { value: "TIMESTAMP", labelKey: "timestampType" },
 ]);
-
-function stepTouchesColumn(step, column, availableColumns = []) {
-  const params = step.params ?? {};
-  const directFields = ["column", "leftColumn", "rightColumn", "valueColumn", "newName", "outputColumn"];
-  if (directFields.some((field) => params[field] === column)) return true;
-  if (step.type === "calculated-field") {
-    const validation = validateFormula(params.expression, availableColumns.map((name) => ({ name, type: "UNKNOWN" })));
-    if (validation.valid && validation.referencedColumns.includes(column)) return true;
-  }
-  return ["columns", "groupColumns"].some((field) => {
-    const value = params[field];
-    const columns = Array.isArray(value) ? value : String(value ?? "").split(",");
-    return columns.some((item) => String(item).trim() === column);
-  });
-}
 
 function FileTypeIcons() {
   const { t } = useI18n();
@@ -1894,7 +1858,7 @@ function DataScreen({
                 onReplaceValue={replaceValueInline}
                 onValueAction={applyValueRowAction}
                 transformOpen={transformPopover?.column === aggregate.column}
-                transformUsed={recipe.some((step) => step.enabled !== false && stepTouchesColumn(step, aggregate.column, dataset.columns))}
+                transformUsed={recipe.some((step) => step.enabled !== false && miniTableToolTouchesColumn(step, aggregate.column))}
                 filterSignature={filterSignature}
               />
             )}
@@ -1963,6 +1927,7 @@ export function App() {
   const [screen, setScreen] = useState(() => new URLSearchParams(window.location.search).get("account") === "1" ? "account" : "input");
   const [dataset, setDataset] = useState(null);
   const [filters, setFilters] = useState({});
+  const filtersRef = useRef(filters);
   const [flow, setFlow] = useState(createFlowGraph);
   const flowRef = useRef(flow);
   const [activePreparedId, setActivePreparedId] = useState(null);
@@ -2001,6 +1966,7 @@ export function App() {
   }
 
   useEffect(() => { flowRef.current = flow; }, [flow]);
+  useEffect(() => { filtersRef.current = filters; }, [filters]);
 
   useEffect(() => {
     if (!flowHydrated) return undefined;
@@ -2163,6 +2129,7 @@ export function App() {
   }), [flow.preparedInputs, flow.sourceAssets]);
 
   const relinkSource = useCallback(async (sourceAssetId, nextFile, handle = null, automatic = false, beforeCommit = null, activityContext = null) => {
+    beforeCommit?.();
     const source = flowRef.current.sourceAssets.find((item) => item.id === sourceAssetId);
     const preparedInputs = flowRef.current.preparedInputs.filter((item) => item.sourceAssetId === sourceAssetId);
     const primaryPrepared = preparedInputs[0];
@@ -2179,11 +2146,16 @@ export function App() {
     }
     await worker.activatePrepared(primaryPrepared.id, {}, primaryPrepared.schema.map((column) => column.name));
     beforeCommit?.();
+    const descendantIds = collectDescendantNodeIds(flowRef.current, preparedInputs.map((prepared) => prepared.id));
     const linkedFlow = {
       ...flowRef.current,
       sourceAssets: flowRef.current.sourceAssets.map((item) => item.id === source.id ? { ...item, status: "linked" } : item),
+      composeNodes: flowRef.current.composeNodes.map((node) => descendantIds.has(node.id)
+        ? { ...node, validationStatus: "needs-validation", dataStatus: "stale", validationError: null }
+        : node),
     };
     await commitFlow(linkedFlow);
+    if (descendantIds.size) setComposePreview(null);
     if (handle) await saveStoredSourceHandle(source.id, handle);
     if (!automatic) setError("");
     if (!automatic) await recordActivity({ action: "source_relinked", targetType: "source", targetId: source.id }, activityContext ?? undefined);
@@ -2324,8 +2296,16 @@ export function App() {
   };
 
   const applyFilters = useCallback(async (filters, aggregateColumns, beforeCommit = null, activityContext = null) => {
-    const result = await worker.filter(filters, aggregateColumns);
     beforeCommit?.();
+    const previousFilters = filtersRef.current;
+    const previousAggregateColumns = dataset?.aggregateColumns ?? [];
+    const result = await worker.filter(filters, aggregateColumns);
+    try {
+      beforeCommit?.();
+    } catch (cause) {
+      await worker.filter(previousFilters, previousAggregateColumns);
+      throw cause;
+    }
     setDataset(result);
     setFilters(filters);
     bumpWorkspaceRevision();
@@ -2336,7 +2316,7 @@ export function App() {
       summary: activityContext?.action === "aggregate_columns_changed" ? { aggregateColumnCount: aggregateColumns.length } : { filterCount: Object.keys(filters).length, rowCount: result.filteredCount },
     }, activityContext ?? undefined);
     return { ...result, activity };
-  }, [activePreparedId, bumpWorkspaceRevision, recordActivity, worker]);
+  }, [activePreparedId, bumpWorkspaceRevision, dataset?.aggregateColumns, recordActivity, worker]);
 
   const searchAggregate = useCallback(
     (column, query, filters) => worker.searchAggregate(column, query, filters),
@@ -2348,12 +2328,18 @@ export function App() {
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === preparedId);
     const recipeVersion = (prepared?.recipeVersion ?? 0) + 1;
     const descendantIds = collectDescendantNodeIds(flowRef.current, [preparedId]);
+    const sourceAsset = flowRef.current.sourceAssets.find((item) => item.id === prepared?.sourceAssetId);
+    const previousSchema = prepared?.schema ?? [];
+    const previousByName = new Map(previousSchema.map((column) => [column.name, column]));
+    const sourceSchema = (sourceAsset?.sourceColumns ?? previousSchema.map((column) => column.name)).map((name) => previousByName.get(name) ?? { name, type: null });
+    const outputSchema = result.columns.map((name) => ({ name, type: result.columnTypes?.[name] ?? null }));
+    const semanticSchema = deriveRecipeSemanticSchema(sourceSchema, recipe, outputSchema, previousSchema);
     let updated = updatePreparedInput(flowRef.current, preparedId, {
       recipe,
       recipeStatus: PREPARED_RECIPE_STATUS.APPLIED,
       recipeVersion,
       rowCount: result.rowCount,
-      schema: result.columns.map((name) => ({ name, type: result.columnTypes?.[name] ?? null })),
+      schema: semanticSchema,
     });
     const previousFields = flowRef.current.semanticModels?.[preparedId]?.fields ?? {};
     const currentModel = updated.semanticModels?.[preparedId];
@@ -2363,7 +2349,6 @@ export function App() {
       const outputColumn = String(step.params?.outputColumn ?? "").trim();
       if (!outputColumn || !currentModel?.fields?.[outputColumn]) continue;
       const existing = currentModel.fields[outputColumn];
-      if (existing.source === "override") continue;
       let references = [];
       try {
         references = getFormulaColumnReferences(step.params?.expression);
@@ -2374,14 +2359,17 @@ export function App() {
         const column = preparedSchema.find((item) => item.name === name) ?? { name, type: null };
         return { ...column, semantic: currentModel.fields[name] ?? previousFields[name] };
       });
-      currentModel.fields[outputColumn] = {
-        ...mergeFieldSemantics(dependencyFields, {
+      const derived = mergeFieldSemantics(dependencyFields, {
           kind: "calculated-field",
           targetId: preparedId,
           stepId: step.id,
           column: outputColumn,
           dependencies: references,
-        }),
+        });
+      currentModel.fields[outputColumn] = {
+        ...existing,
+        ...derived,
+        sensitivity: strictestSensitivity([existing, derived]),
         businessName: outputColumn,
       };
     }
@@ -2418,14 +2406,35 @@ export function App() {
       ?? recipeHistory.getCurrent(),
   );
 
+  const applyRecipeInWorker = async (nextRecipe, beforeCommit = null) => {
+    const preparedId = activePreparedIdRef.current;
+    const previousRecipe = currentPreparedRecipe(preparedId);
+    const previousFilters = filtersRef.current;
+    const previousAggregateColumns = dataset?.aggregateColumns ?? [];
+    const nextAggregateColumns = includeNewFormulaAggregateColumns(
+      previousAggregateColumns,
+      previousRecipe,
+      nextRecipe,
+      dataset?.aggregateColumnLimit ?? 200,
+    );
+    beforeCommit?.();
+    const result = await worker.applyRecipe(nextRecipe, filtersRef.current, nextAggregateColumns, preparedId);
+    try {
+      beforeCommit?.();
+    } catch (cause) {
+      await worker.applyRecipe(previousRecipe, previousFilters, previousAggregateColumns, preparedId);
+      throw cause;
+    }
+    return result;
+  };
+
   const applyRecipeChange = async (recipe, beforeCommit = null, activityContext = null) => {
     const preparedId = activePreparedIdRef.current;
     const toggledStep = recipe.find((step) => {
       const previous = currentPreparedRecipe().find((item) => item.id === step.id);
       return previous && (previous.enabled !== false) !== (step.enabled !== false);
     });
-    const result = await worker.applyRecipe(recipe, filters, dataset?.aggregateColumns ?? [], preparedId);
-    beforeCommit?.();
+    const result = await applyRecipeInWorker(recipe, beforeCommit);
     const next = recipeHistory.commit(recipe);
     setDataset(result);
     setFilters(result.appliedFilters ?? filters);
@@ -2438,8 +2447,7 @@ export function App() {
     const preparedId = activePreparedIdRef.current;
     const next = recipeHistory.getUndoTarget();
     if (!next) return null;
-    const result = await worker.applyRecipe(next, filters, dataset?.aggregateColumns ?? [], preparedId);
-    beforeCommit?.();
+    const result = await applyRecipeInWorker(next, beforeCommit);
     recipeHistory.undo();
     setDataset(result);
     setFilters(result.appliedFilters ?? filters);
@@ -2452,8 +2460,7 @@ export function App() {
     const preparedId = activePreparedIdRef.current;
     const next = recipeHistory.getRedoTarget();
     if (!next) return null;
-    const result = await worker.applyRecipe(next, filters, dataset?.aggregateColumns ?? [], preparedId);
-    beforeCommit?.();
+    const result = await applyRecipeInWorker(next, beforeCommit);
     recipeHistory.redo();
     setDataset(result);
     setFilters(result.appliedFilters ?? filters);
@@ -2511,6 +2518,7 @@ export function App() {
   const duplicatePreparation = async (preparedId, beforeCommit = null, activityContext = null) => {
     setComposeError("");
     try {
+      beforeCommit?.();
       const duplicated = duplicatePreparedInput(flowRef.current, preparedId);
       await worker.registerPreparedCopy(duplicated.preparedInput.id, preparedId, duplicated.preparedInput.recipe);
       try {
@@ -2540,6 +2548,7 @@ export function App() {
   const createPreparationFromCompose = async (nodeId, beforeCommit = null, activityContext = null) => {
     setComposeError("");
     try {
+      beforeCommit?.();
       const candidate = createPreparedFromCompose(flowRef.current, nodeId);
       const materialized = await worker.materializeComposePrepared(flowRef.current, nodeId, {
         sourceId: candidate.sourceAsset.id,
@@ -2605,6 +2614,7 @@ export function App() {
   };
 
   const selectComposeNode = async (nodeId, beforeCommit = null, throwOnError = false) => {
+    beforeCommit?.();
     const nextFlow = { ...flowRef.current, activeNodeId: nodeId };
     setComposeLoading(true);
     setComposeError("");
@@ -2631,6 +2641,7 @@ export function App() {
   };
 
   const createComposeNode = async (draft, beforeCommit = null, activityContext = null) => {
+    beforeCommit?.();
     const candidate = addComposeNode(flowRef.current, draft);
     const preview = await worker.previewCompose(candidate.graph, candidate.node.id);
     beforeCommit?.();
@@ -2653,14 +2664,18 @@ export function App() {
   };
 
   const updateComposeOperation = async (nodeId, draft, beforeCommit = null, activityContext = null) => {
+    beforeCommit?.();
     const candidate = updateComposeNode(flowRef.current, nodeId, draft);
     const preview = await worker.previewCompose(candidate.graph, nodeId);
     beforeCommit?.();
+    const descendantIds = collectDescendantNodeIds(candidate.graph, [nodeId]);
     const committed = {
       ...candidate.graph,
       composeNodes: candidate.graph.composeNodes.map((node) => node.id === nodeId
         ? { ...node, rowCount: preview.rowCount, lastValidRowCount: preview.rowCount, schema: preview.schema, lastValidSchema: preview.schema, validationStatus: "valid", dataStatus: "ready", validationError: null }
-        : node),
+        : descendantIds.has(node.id)
+          ? { ...node, validationStatus: "needs-validation", dataStatus: "stale", validationError: null }
+          : node),
     };
     await commitFlow(committed);
     setComposePreview(preview);
@@ -2718,19 +2733,21 @@ export function App() {
     }
   };
 
-  const exportComposeNode = async (format, nodeId = flowRef.current.activeNodeId, activityContext = null) => {
+  const exportComposeNode = async (format, nodeId = flowRef.current.activeNodeId, activityContext = null, beforeDownload = null) => {
     if (!nodeId) throw new Error("Select a Compose node before exporting.");
     const result = await worker.exportCompose(flowRef.current, nodeId, format);
+    beforeDownload?.();
     downloadExport(result);
     const activity = await recordActivity({ action: "compose_exported", targetType: "compose-node", targetId: nodeId, summary: { format } }, activityContext ?? undefined);
     return { nodeId, filename: result.filename, format, activity };
   };
 
-  const exportPreparedData = async (format, preparedId = activePreparedId, activityContext = null) => {
+  const exportPreparedData = async (format, preparedId = activePreparedId, activityContext = null, beforeDownload = null) => {
     if (!dataset || preparedId !== activePreparedId) throw new Error(`Prepared dataset is not active: ${preparedId}`);
     setScreen("data");
     const preparedName = flowRef.current.preparedInputs.find((item) => item.id === preparedId)?.name;
     const result = await worker.exportData(format, filters, preparedName ?? dataset.filename);
+    beforeDownload?.();
     downloadExport(result);
     const activity = await recordActivity({ action: "prepared_exported", targetType: "prepared", targetId: preparedId, summary: { format, rowCount: dataset.filteredCount, columnCount: dataset.columns.length } }, activityContext ?? undefined);
     return { filename: result.filename, format, totalRowCount: dataset.rowCount, filteredRowCount: dataset.filteredCount, activity };
@@ -2902,6 +2919,7 @@ export function App() {
     const target = [...graph.preparedInputs, ...graph.composeNodes].find((item) => item.id === targetId);
     if (!target) throw new Error(`Semantic target not found: ${targetId}`);
     const currentModel = reconcileSemanticModel(graph.semanticModels?.[targetId], targetId, target.schema ?? []);
+    assertAgentSemanticFieldChange(fieldName, currentModel.fields[fieldName], changes);
     const nextModel = updateSemanticField(currentModel, fieldName, changes);
     const withModel = {
       ...graph,
@@ -2938,26 +2956,34 @@ export function App() {
     return { metric };
   }, `metric:upsert:${definition.id ?? "new"}:${JSON.stringify(definition)}`);
 
-  const deleteMetricDefinitionFromTool = async (id, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+  const deleteMetricDefinition = async (id) => {
     const graph = flowRef.current;
     const metric = (graph.metricDefinitions ?? []).find((item) => item.id === id);
-    if (!metric) throw new Error(`Metric definition not found: ${id}`);
-    assertCurrent();
-    await commitFlow({ ...graph, metricDefinitions: graph.metricDefinitions.filter((item) => item.id !== id), revision: graph.revision + 1, updatedAt: new Date().toISOString() });
-    await recordActivity({ action: "metric_definition_deleted", targetType: "metric", targetId: id, summary: { targetId: metric.targetId } }, webMcpActivity(meta));
-    return { id, deleted: true };
-  }, `metric:delete:${id}`);
+    if (!metric) return false;
+    try {
+      await commitFlow({ ...graph, metricDefinitions: graph.metricDefinitions.filter((item) => item.id !== id), revision: graph.revision + 1, updatedAt: new Date().toISOString() });
+      await recordActivity({ action: "metric_definition_deleted", targetType: "metric", targetId: id, summary: { targetId: metric.targetId } });
+      return true;
+    } catch (metricDeleteError) {
+      setComposeError(metricDeleteError instanceof Error ? metricDeleteError.message : t("composeUpdateFailed"));
+      return false;
+    }
+  };
 
   const previewRecipeChangeFromTool = async (preparedId, recipe, stepIndex, { previewColumns, previewLimit = 10 } = {}) => {
     assertActivePreparedForTool(preparedId);
     try {
+      const prepared = flowRef.current.preparedInputs.find((item) => item.id === preparedId);
+      const currentRecipe = currentPreparedRecipe(preparedId);
+      const restoredRecipe = restoreProtectedRecipeValues(recipe, currentRecipe);
+      assertAgentRecipeContract(restoredRecipe, currentRecipe);
       const includeRows = Array.isArray(previewColumns) && previewColumns.length > 0;
       const result = await runWebMcpRead(() => worker.previewRecipe(
-        recipe,
-        Number.isInteger(stepIndex) ? stepIndex : Math.max(0, recipe.length - 1),
-        { includeRows, agentMode: true, ...(includeRows ? { columns: previewColumns, limit: previewLimit } : {}) },
+        restoredRecipe,
+        Number.isInteger(stepIndex) ? stepIndex : Math.max(0, restoredRecipe.length - 1),
+        { includeRows, agentMode: true, semanticSchema: prepared?.schema ?? [], ...(includeRows ? { columns: previewColumns, limit: previewLimit } : {}) },
       ));
-      const currentSchema = dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] ?? null }));
+      const currentSchema = prepared?.schema ?? dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] ?? null }));
       return {
         valid: true,
         saved: false,
@@ -2979,10 +3005,18 @@ export function App() {
     }
   };
 
-  const composeNodesForTool = () => [
-    ...flowRef.current.preparedInputs.map((item) => ({ ...structuredClone(item), nodeType: "dataset", kind: "dataset", config: null, inputIds: [] })),
-    ...flowRef.current.composeNodes.map((item) => ({ ...structuredClone(item), nodeType: "operation" })),
-  ];
+  const composeNodesForTool = () => {
+    const graph = flowRef.current;
+    const byId = new Map([...graph.preparedInputs, ...graph.composeNodes].map((item) => [item.id, item]));
+    return [
+      ...graph.preparedInputs.map((item) => ({ ...structuredClone(item), nodeType: "dataset", kind: "dataset", config: null, inputIds: [] })),
+      ...graph.composeNodes.map((item) => ({
+        ...structuredClone(item),
+        nodeType: "operation",
+        config: protectComposeConfigForAgent(item, byId.get(item.inputIds?.[0])?.schema ?? []),
+      })),
+    ];
+  };
 
   const getComposeGraphFromTool = async () => {
     const nodes = composeNodesForTool();
@@ -3067,7 +3101,9 @@ export function App() {
       stale.code = "STALE_RECIPE";
       throw stale;
     }
-    const restoredRecipe = restoreProtectedRecipeValues(recipe, currentPreparedRecipe(preparedId));
+    const currentRecipe = currentPreparedRecipe(preparedId);
+    const restoredRecipe = restoreProtectedRecipeValues(recipe, currentRecipe);
+    assertAgentRecipeContract(restoredRecipe, currentRecipe);
     const ids = restoredRecipe.map((step) => step.id);
     if (new Set(ids).size !== ids.length) throw new Error("Recipe step IDs must be unique.");
     setScreen("data");
@@ -3077,6 +3113,7 @@ export function App() {
 
   const addRecipeStepFromTool = async (preparedId, definition, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
     assertActivePreparedForTool(preparedId);
+    if (!isAgentCreatableTransformation(definition.type)) throw new Error(`WebMCP cannot create recipe step type: ${definition.type}`);
     setScreen("data");
     const step = createStep(definition.type, { ...definition.params });
     const result = await applyRecipeChange([...currentPreparedRecipe(preparedId), step], assertCurrent, webMcpActivity(meta, { summary: { recipeStepType: step.type } }));
@@ -3088,6 +3125,7 @@ export function App() {
     const recipe = currentPreparedRecipe(preparedId);
     const current = recipe.find((step) => step.id === stepId);
     if (!current) throw new Error(`Recipe step not found: ${stepId}`);
+    if (definition.type !== current.type) throw new Error(`WebMCP cannot change recipe step ${stepId} from ${current.type} to ${definition.type}.`);
     setScreen("data");
     const nextRecipe = recipe.map((step) => step.id === stepId
       ? { ...step, type: definition.type, params: { ...definition.params } }
@@ -3149,6 +3187,7 @@ export function App() {
   }, `prepare:value:${preparedId}:${action}:${column}:${JSON.stringify(value)}`);
 
   const composeOperationDraftFromTool = (operation, existing = null) => {
+    operation = restoreProtectedComposeOperation(operation, existing);
     const defaultName = existing?.name ?? `${t(operation.kind === "filter-rows" ? "filterRows" : operation.kind === "distinct-rows" ? "distinctRows" : operation.kind)} ${flowRef.current.composeNodes.length + 1}`;
     let inputIds;
     let config;
@@ -3226,10 +3265,18 @@ export function App() {
     }
   };
 
-  const exportComposeFromTool = async (nodeId, format) => {
+  const exportPrepareFromTool = async (preparedId, format, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    assertActivePreparedForTool(preparedId);
+    return exportPreparedData(format, preparedId, webMcpActivity(meta), assertCurrent);
+  }, `prepare:export:${preparedId}:${format}`);
+
+  const exportComposeFromTool = async (nodeId, format, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    if (!flowRef.current.composeNodes.some((item) => item.id === nodeId) && !flowRef.current.preparedInputs.some((item) => item.id === nodeId)) {
+      throw new Error(`Compose node not found: ${nodeId}`);
+    }
     setScreen("compose");
-    return exportComposeNode(format, nodeId, { actor: "agent", origin: "webmcp" });
-  };
+    return exportComposeNode(format, nodeId, webMcpActivity(meta), assertCurrent);
+  }, `compose:export:${nodeId}:${format}`);
 
   const moveComposeNodeFromTool = async (nodeId, position, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
     setScreen("compose");
@@ -3270,6 +3317,11 @@ export function App() {
     const pending = pendingDeleteConfirmationsRef.current.get(key);
     if (!pending) return null;
     pendingDeleteConfirmationsRef.current.delete(key);
+    webMcpMutationRunnerRef.current?.setRequestTerminalStatus?.(
+      pending.requestId,
+      outcome === "cancelled" ? "cancelled" : "committed",
+      { target, targetId, pendingConfirmation: false, confirmed: outcome !== "cancelled" },
+    );
     return recordActivity({
       action: outcome === "cancelled" ? "delete_cancelled" : "delete_confirmed",
       targetType: target,
@@ -3280,9 +3332,13 @@ export function App() {
     }, { actor: "user", origin: "ui", requestId: pending.requestId });
   }, [recordActivity]);
 
+  const activeAgentSchema = flow.preparedInputs.find((item) => item.id === activePreparedId)?.schema
+    ?? dataset?.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] }))
+    ?? [];
+
   useWebMcpTools({
     state: {
-      contractVersion: "2.5",
+      contractVersion: "2.6",
       workspaceRevision,
       flowId: flow.id,
       flowRevision: flow.revision,
@@ -3313,10 +3369,10 @@ export function App() {
         schema: dataset.columns.map((name) => flow.preparedInputs.find((item) => item.id === activePreparedId)?.schema?.find((column) => column.name === name) ?? ({ name, type: dataset.columnTypes?.[name] ?? null })),
         filterableColumns: [...dataset.aggregateColumns],
         filterableColumnsTruncated: dataset.aggregateColumns.length < dataset.columns.length,
-        filters: protectFiltersForAgent(filters, dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] }))),
+        filters: protectFiltersForAgent(filters, activeAgentSchema),
         quality: structuredClone(dataset.quality),
       } : null,
-      recipeSteps: protectRecipeForAgent(recipeHistory.recipe, dataset?.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] })) ?? []).map((step) => ({
+      recipeSteps: protectRecipeForAgent(recipeHistory.recipe, activeAgentSchema).map((step) => ({
         id: step.id,
         type: step.type,
         enabled: step.enabled !== false,
@@ -3335,6 +3391,7 @@ export function App() {
         ...flow.preparedInputs.map((item) => ({ id: item.id, name: item.name, kind: "dataset", totalRowCount: item.rowCount, columnCount: item.schema?.length ?? null, dataStatus: "ready" })),
         ...flow.composeNodes.map((item) => ({ id: item.id, name: item.name, kind: item.kind, inputIds: [...item.inputIds], totalRowCount: item.rowCount, columnCount: item.schema?.length ?? null, validationStatus: item.validationStatus ?? null, dataStatus: item.dataStatus ?? "ready" })),
       ],
+      metricDefinitions: (flow.metricDefinitions ?? []).map((item) => ({ id: item.id, name: item.name, targetId: item.targetId })),
       sourceAssets: flow.sourceAssets.map((item) => ({ id: item.id, name: item.name, location: item.location, status: item.status, size: item.size ?? null })),
     },
     actions: {
@@ -3349,7 +3406,6 @@ export function App() {
       updateSemanticField: updateSemanticFieldFromTool,
       listMetricDefinitions: listMetricDefinitionsFromTool,
       upsertMetricDefinition: upsertMetricDefinitionFromTool,
-      deleteMetricDefinition: deleteMetricDefinitionFromTool,
       duplicatePrepared: duplicatePreparedFromTool,
       replaceRecipe: replaceRecipeFromTool,
       getPrepareDataset: getPrepareDatasetFromTool,
@@ -3373,7 +3429,7 @@ export function App() {
       listCloudFiles: listCloudFilesFromTool,
       openCloudFile: openCloudFileFromTool,
       requestCloudUpload: requestCloudUploadFromTool,
-      exportPrepare: (preparedId, format) => exportPreparedData(format, preparedId, { actor: "agent", origin: "webmcp" }),
+      exportPrepare: exportPrepareFromTool,
       addRecipeStep: addRecipeStepFromTool,
       updateRecipeStep: updateRecipeStepFromTool,
       setRecipeStepEnabled: setRecipeStepEnabledFromTool,
@@ -3433,6 +3489,7 @@ export function App() {
           onUpdateNode={updateComposeOperation}
           onDeleteNode={deleteComposeOperation}
           onDeletePrepared={deletePreparedDataset}
+          onDeleteMetricDefinition={deleteMetricDefinition}
           onMoveNode={moveComposeNode}
           onAutoArrange={autoArrangeComposeNodes}
           onDuplicate={duplicatePreparation}

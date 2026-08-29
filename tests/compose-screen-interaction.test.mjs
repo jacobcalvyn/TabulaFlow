@@ -53,6 +53,7 @@ function createFlow() {
       { id: "prepared-b", sourceAssetId: "source-b", name: "Dataset B", rowCount: 20, schema: [{ name: "id", type: "BIGINT" }], position: { x: 360, y: 40 } },
     ],
     composeNodes: [],
+    metricDefinitions: [{ id: "metric-a", name: "Revenue", targetId: "prepared-a" }],
     activeNodeId: "prepared-a",
   };
 }
@@ -221,6 +222,24 @@ test("cancelling a WebMCP delete request reports a terminal cancellation", () =>
   view.unmount();
 });
 
+test("a reusable metric deletion waits for visible user confirmation", async () => {
+  const calls = [];
+  const view = renderCompose({
+    deleteRequest: { target: "metric-definition", targetId: "metric-a", token: "metric-request" },
+    onDeleteRequestShown(token) { calls.push(["shown", token]); },
+    onDeleteConfirmation(target, targetId, outcome) { calls.push(["confirmation", target, targetId, outcome]); },
+    async onDeleteMetricDefinition(id) { calls.push(["delete-metric", id]); return true; },
+  });
+  const confirmation = view.getByText("Delete this reusable metric definition?").closest("div");
+  assert.deepEqual(calls, [["shown", "metric-request"]]);
+  await act(async () => {
+    fireEvent.click(within(confirmation).getByRole("button", { name: "Delete" }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  assert.deepEqual(calls, [["shown", "metric-request"], ["delete-metric", "metric-a"], ["confirmation", "metric-definition", "metric-a", "confirmed"]]);
+  view.unmount();
+});
+
 test("a WebMCP recipe deletion also waits for visible confirmation", () => {
   const calls = [];
   const recipe = [{ id: "step-a", type: "trim", version: 1, enabled: true, params: { column: "name", mode: "both" } }];
@@ -267,8 +286,17 @@ test("Formula column validates, previews, and submits one create-only recipe ste
     onSubmit(params) { calls.push(["submit", params]); },
   })));
 
-  fireEvent.change(view.getByLabelText("New column name"), { target: { value: "amount_double" } });
-  fireEvent.change(view.getByLabelText("Formula"), { target: { value: "[amount] * 2" } });
+  const outputName = view.getByLabelText("New column name");
+  assert.equal(outputName.value, "Formula column 1");
+  assert.equal(outputName.selectionStart, 0);
+  assert.equal(outputName.selectionEnd, outputName.value.length);
+  fireEvent.change(outputName, { target: { value: "amount_double" } });
+  const formula = view.getByLabelText("Formula");
+  fireEvent.change(formula, { target: { value: "[amo", selectionStart: 4 } });
+  assert.equal(view.getByRole("listbox", { name: "Column suggestions" }).textContent.includes("amount"), true);
+  fireEvent.keyDown(formula, { key: "Enter" });
+  assert.equal(formula.value, "[amount]");
+  fireEvent.change(formula, { target: { value: "[amount] * 2", selectionStart: 12 } });
   assert.match(view.getByText(/Result type:/).textContent, /DOUBLE/);
 
   await act(async () => { fireEvent.click(view.getByRole("button", { name: "Preview" })); });
@@ -277,5 +305,38 @@ test("Formula column validates, previews, and submits one create-only recipe ste
 
   fireEvent.click(view.getByRole("button", { name: "Add" }));
   assert.deepEqual(calls[1], ["submit", { outputColumn: "amount_double", expression: "[amount] * 2", expressionVersion: 1 }]);
+  view.unmount();
+});
+
+test("Formula column chooses the first unused default name and does not suggest columns inside strings", () => {
+  const view = render(React.createElement(LanguageProvider, null, React.createElement(FormulaColumnEditor, {
+    schema: [
+      { name: "Formula column 1", type: "DOUBLE" },
+      { name: "Formula Column 2", type: "VARCHAR" },
+      { name: "amount", type: "DOUBLE" },
+    ],
+    title: "Formula column",
+    submitLabel: "Add",
+    onCancel() {},
+    onSubmit() {},
+  })));
+
+  assert.equal(view.getByLabelText("New column name").value, "Formula column 3");
+  assert.equal(view.queryByText("Insert column"), null);
+  assert.equal(view.queryByText("Insert function"), null);
+  const formula = view.getByLabelText("Formula");
+  fireEvent.change(formula, { target: { value: "'[am", selectionStart: 4 } });
+  assert.equal(view.queryByRole("listbox", { name: "Column suggestions" }), null);
+  fireEvent.change(formula, { target: { value: "co", selectionStart: 2 } });
+  assert.equal(view.getByRole("listbox", { name: "Function suggestions" }).textContent.includes("COALESCE"), true);
+  fireEvent.keyDown(formula, { key: "Enter" });
+  assert.equal(formula.value, "COALESCE()");
+  assert.equal(formula.selectionStart, "COALESCE(".length);
+  assert.match(view.getByRole("status", { name: "Function syntax" }).textContent, /COALESCE\(value1, value2, \.\.\.\)/);
+  fireEvent.change(formula, { target: { value: "IF([amount])", selectionStart: 12 } });
+  const functionHelp = view.getByRole("status", { name: "Function syntax" });
+  assert.match(functionHelp.textContent, /IF\(condition, value_if_true, value_if_false\)/);
+  assert.match(functionHelp.textContent, /Argument 2: value_if_true/);
+  assert.equal(view.queryByText(/if expects 3 arguments/), null);
   view.unmount();
 });

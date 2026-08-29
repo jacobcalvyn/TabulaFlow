@@ -91,11 +91,12 @@ export function hydrateComposeSchemas(graph) {
         const compiled = compileComposeOperation(node.kind, inputs, node.config);
         compiled.schema = applySemanticModelToSchema(compiled.schema, graph.semanticModels?.[node.id]);
         relations.set(node.id, compiled);
+        const remainsStale = node.dataStatus === "stale" || node.validationStatus === "needs-validation";
         hydrated.set(node.id, {
           schema: compiled.schema,
           lastValidSchema: compiled.schema,
-          validationStatus: "valid",
-          dataStatus: "ready",
+          validationStatus: remainsStale ? "needs-validation" : "valid",
+          dataStatus: remainsStale ? "stale" : "ready",
           validationError: null,
         });
       } catch (error) {

@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Eye, WarningCircle, X } from "@phosphor-icons/react";
 import {
   CALCULATION_CATALOG,
@@ -12,14 +12,97 @@ function normalizeSchema(schema = []) {
   return schema.map((column) => typeof column === "string" ? { name: column, type: "UNKNOWN" } : column);
 }
 
-function functionSnippet(name) {
-  if (name === "cast" || name === "try_cast") return `${name}([Column] AS VARCHAR)`;
-  if (name === "if") return "if(condition, value, fallback)";
-  if (name === "coalesce" || name === "ifnull") return `${name}(value, fallback)`;
-  if (name === "substring") return "substring(text, start, length)";
-  if (name === "replace") return "replace(text, from, to)";
-  if (name === "concat") return "concat(value, value)";
-  return `${name}(value)`;
+function nextFormulaColumnName(schema, baseName) {
+  const names = new Set(schema.map((column) => column.name.toLocaleLowerCase("id-ID")));
+  let suffix = 1;
+  while (names.has(`${baseName} ${suffix}`.toLocaleLowerCase("id-ID"))) suffix += 1;
+  return `${baseName} ${suffix}`;
+}
+
+function findFormulaAutocomplete(expression, cursor) {
+  const source = String(expression ?? "");
+  const end = Math.max(0, Math.min(cursor ?? source.length, source.length));
+  let inString = false;
+  let columnStart = null;
+  for (let index = 0; index < end; index += 1) {
+    const char = source[index];
+    if (inString) {
+      if (char === "'" && source[index + 1] === "'") index += 1;
+      else if (char === "'") inString = false;
+      continue;
+    }
+    if (columnStart !== null) {
+      if (char === "]" && source[index + 1] === "]") index += 1;
+      else if (char === "]") columnStart = null;
+      continue;
+    }
+    if (char === "'") inString = true;
+    else if (char === "[") columnStart = index;
+  }
+  if (inString) return null;
+  if (columnStart !== null) {
+    const query = source.slice(columnStart + 1, end);
+    if (query.includes("\n") || query.includes("\r")) return null;
+    return { kind: "column", start: columnStart, end: source[end] === "]" ? end + 1 : end, query };
+  }
+  const identifier = source.slice(0, end).match(/[A-Za-z_][A-Za-z0-9_]*$/)?.[0] ?? "";
+  if (!identifier) return null;
+  const query = identifier.toLocaleLowerCase("id-ID");
+  if (!CALCULATION_CATALOG.functions.some((item) => item.name.startsWith(query))) return null;
+  return { kind: "function", start: end - identifier.length, end, query };
+}
+
+const FORMULA_FUNCTIONS = new Map(CALCULATION_CATALOG.functions.map((item) => [item.name, item]));
+
+function findFormulaFunctionContext(expression, cursor) {
+  const source = String(expression ?? "");
+  const end = Math.max(0, Math.min(cursor ?? source.length, source.length));
+  const stack = [];
+  let inString = false;
+  let inColumn = false;
+  let lastClosed = null;
+
+  for (let index = 0; index < end; index += 1) {
+    const char = source[index];
+    if (inString) {
+      if (char === "'" && source[index + 1] === "'") index += 1;
+      else if (char === "'") inString = false;
+      continue;
+    }
+    if (inColumn) {
+      if (char === "]" && source[index + 1] === "]") index += 1;
+      else if (char === "]") inColumn = false;
+      continue;
+    }
+    if (char === "'") {
+      inString = true;
+      continue;
+    }
+    if (char === "[") {
+      inColumn = true;
+      continue;
+    }
+    if (char === "(") {
+      let nameEnd = index;
+      while (nameEnd > 0 && /\s/.test(source[nameEnd - 1])) nameEnd -= 1;
+      const name = source.slice(0, nameEnd).match(/[A-Za-z_][A-Za-z0-9_]*$/)?.[0]?.toLocaleLowerCase("id-ID");
+      stack.push({ item: name ? FORMULA_FUNCTIONS.get(name) ?? null : null, argumentIndex: 0, openIndex: index });
+      continue;
+    }
+    if (char === ",") {
+      if (stack.at(-1)?.item) stack.at(-1).argumentIndex += 1;
+      continue;
+    }
+    if (char === ")") {
+      const frame = stack.pop();
+      if (frame?.item) lastClosed = { ...frame, closeIndex: index, closed: true };
+    }
+  }
+
+  const active = stack.findLast((frame) => frame.item);
+  if (active) return { ...active, closed: false };
+  const finalNonSpaceIndex = source.slice(0, end).trimEnd().length - 1;
+  return lastClosed?.closeIndex === finalNonSpaceIndex ? lastClosed : null;
 }
 
 export function FormulaColumnEditor({
@@ -35,15 +118,35 @@ export function FormulaColumnEditor({
 }) {
   const { t } = useI18n();
   const normalizedSchema = useMemo(() => normalizeSchema(schema), [schema]);
-  const [outputColumn, setOutputColumn] = useState(initialParams?.outputColumn ?? "");
+  const generatedOutputColumn = useMemo(
+    () => nextFormulaColumnName(normalizedSchema, t("formulaColumn")),
+    [normalizedSchema, t],
+  );
+  const [outputColumn, setOutputColumn] = useState(initialParams?.outputColumn ?? generatedOutputColumn);
   const [expression, setExpression] = useState(initialParams?.expression ?? "");
-  const [selectedColumn, setSelectedColumn] = useState(normalizedSchema[0]?.name ?? "");
-  const [selectedFunction, setSelectedFunction] = useState(CALCULATION_CATALOG.functions[0]?.name ?? "");
   const [preview, setPreview] = useState(null);
   const [previewing, setPreviewing] = useState(false);
   const [previewError, setPreviewError] = useState("");
+  const [autocomplete, setAutocomplete] = useState(null);
+  const [activeSuggestion, setActiveSuggestion] = useState(0);
+  const [cursorPosition, setCursorPosition] = useState((initialParams?.expression ?? "").length);
+  const outputInputRef = useRef(null);
   const textareaRef = useRef(null);
+  const pendingCursorRef = useRef(null);
   const validation = useMemo(() => validateFormula(expression, normalizedSchema), [expression, normalizedSchema]);
+  const functionContext = useMemo(
+    () => findFormulaFunctionContext(expression, cursorPosition),
+    [expression, cursorPosition],
+  );
+  const primaryDiagnostic = validation.diagnostics[0] ?? null;
+  const hideArityDiagnostic = functionContext && primaryDiagnostic?.code === "INVALID_ARGUMENT_COUNT";
+  const functionArguments = functionContext?.item.arguments ?? [];
+  const functionArgumentIndex = functionContext ? Math.min(
+    functionContext.closed && primaryDiagnostic?.code === "INVALID_ARGUMENT_COUNT"
+      ? functionContext.argumentIndex + 1
+      : functionContext.argumentIndex,
+    Math.max(0, functionArguments.length - 1),
+  ) : 0;
   const originalOutput = String(initialParams?.outputColumn ?? "").trim().toLocaleLowerCase("id-ID");
   const outputCollision = normalizedSchema.some((column) => (
     column.name.toLocaleLowerCase("id-ID") === outputColumn.trim().toLocaleLowerCase("id-ID")
@@ -51,18 +154,78 @@ export function FormulaColumnEditor({
   ));
   const complete = outputColumn.trim().length > 0 && validation.valid && !outputCollision;
 
-  const insertText = (text) => {
-    const input = textareaRef.current;
-    const start = input?.selectionStart ?? expression.length;
-    const end = input?.selectionEnd ?? expression.length;
-    const next = `${expression.slice(0, start)}${text}${expression.slice(end)}`;
+  const suggestions = useMemo(() => {
+    if (!autocomplete) return [];
+    const query = autocomplete.query.toLocaleLowerCase("id-ID");
+    if (autocomplete.kind === "function") {
+      return CALCULATION_CATALOG.functions
+        .filter((item) => item.name.startsWith(query))
+        .slice(0, 8)
+        .map((item) => ({ kind: "function", key: item.name, label: item.signature, meta: t("formulaFunction"), value: item.name.toUpperCase() }));
+    }
+    return normalizedSchema
+      .filter((column) => column.name.toLocaleLowerCase("id-ID").includes(query))
+      .sort((left, right) => {
+        const leftPrefix = left.name.toLocaleLowerCase("id-ID").startsWith(query) ? 0 : 1;
+        const rightPrefix = right.name.toLocaleLowerCase("id-ID").startsWith(query) ? 0 : 1;
+        return leftPrefix - rightPrefix;
+      })
+      .slice(0, 8)
+      .map((column) => ({ kind: "column", key: column.name, label: column.name, meta: column.type ?? "UNKNOWN", value: column.name }));
+  }, [autocomplete, normalizedSchema, t]);
+
+  useEffect(() => {
+    if (initialParams?.outputColumn || !outputInputRef.current) return;
+    outputInputRef.current.focus();
+    outputInputRef.current.select();
+  }, [initialParams?.outputColumn]);
+
+  useEffect(() => {
+    setActiveSuggestion(0);
+  }, [autocomplete?.kind, autocomplete?.query]);
+
+  useEffect(() => {
+    if (pendingCursorRef.current === null || !textareaRef.current) return;
+    const cursor = pendingCursorRef.current;
+    pendingCursorRef.current = null;
+    textareaRef.current.focus();
+    textareaRef.current.setSelectionRange(cursor, cursor);
+    setCursorPosition(cursor);
+  }, [expression]);
+
+  const updateAutocomplete = (nextExpression, cursor) => {
+    setCursorPosition(cursor);
+    setAutocomplete(findFormulaAutocomplete(nextExpression, cursor));
+  };
+
+  const chooseSuggestion = (suggestion) => {
+    if (!autocomplete || !suggestion) return;
+    const replacement = suggestion.kind === "column"
+      ? quoteFormulaColumnReference(suggestion.value)
+      : `${suggestion.value}()`;
+    const next = `${expression.slice(0, autocomplete.start)}${replacement}${expression.slice(autocomplete.end)}`;
+    const cursor = autocomplete.start + replacement.length - (suggestion.kind === "function" ? 1 : 0);
+    pendingCursorRef.current = cursor;
     setExpression(next);
     setPreview(null);
-    requestAnimationFrame(() => {
-      if (!textareaRef.current) return;
-      textareaRef.current.focus();
-      textareaRef.current.setSelectionRange(start + text.length, start + text.length);
-    });
+    setAutocomplete(null);
+  };
+
+  const handleFormulaKeyDown = (event) => {
+    if (!autocomplete || !suggestions.length) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setActiveSuggestion((current) => (current + 1) % suggestions.length);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveSuggestion((current) => (current - 1 + suggestions.length) % suggestions.length);
+    } else if (event.key === "Enter" || event.key === "Tab") {
+      event.preventDefault();
+      chooseSuggestion(suggestions[Math.min(activeSuggestion, suggestions.length - 1)]);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      setAutocomplete(null);
+    }
   };
 
   const params = () => ({
@@ -93,22 +256,65 @@ export function FormulaColumnEditor({
 
       <label className="formula-editor__field">
         <span>{t("formulaOutputColumn")}</span>
-        <input value={outputColumn} onChange={(event) => { setOutputColumn(event.target.value); setPreview(null); }} placeholder={t("formulaOutputPlaceholder")} autoFocus />
+        <input ref={outputInputRef} value={outputColumn} onChange={(event) => { setOutputColumn(event.target.value); setPreview(null); }} placeholder={t("formulaOutputPlaceholder")} />
       </label>
       {outputCollision && <p className="formula-editor__diagnostic" role="alert">{t("formulaCreateOnlyCollision")}</p>}
 
-      <div className="formula-editor__insert-row">
-        <label><span>{t("formulaInsertColumn")}</span><select value={selectedColumn} onChange={(event) => setSelectedColumn(event.target.value)}>{normalizedSchema.map((column) => <option key={column.name} value={column.name}>{column.name}</option>)}</select></label>
-        <button type="button" onClick={() => insertText(quoteFormulaColumnReference(selectedColumn))} disabled={!selectedColumn}>{t("insert")}</button>
-      </div>
-      <div className="formula-editor__insert-row">
-        <label><span>{t("formulaInsertFunction")}</span><select value={selectedFunction} onChange={(event) => setSelectedFunction(event.target.value)}>{CALCULATION_CATALOG.functions.map((item) => <option key={item.name} value={item.name}>{item.signature}</option>)}</select></label>
-        <button type="button" onClick={() => insertText(functionSnippet(selectedFunction))}>{t("insert")}</button>
-      </div>
-
       <label className="formula-editor__field">
         <span>{t("formulaExpression")}</span>
-        <textarea ref={textareaRef} value={expression} onChange={(event) => { setExpression(event.target.value); setPreview(null); }} spellCheck="false" placeholder="CASE WHEN [Amount] >= 1000 THEN 'High' ELSE 'Standard' END" />
+        <div className="formula-editor__expression">
+          <textarea
+            ref={textareaRef}
+            value={expression}
+            onChange={(event) => {
+              setExpression(event.target.value);
+              setPreview(null);
+              updateAutocomplete(event.target.value, event.target.selectionStart);
+            }}
+            onKeyDown={handleFormulaKeyDown}
+            onClick={(event) => updateAutocomplete(expression, event.currentTarget.selectionStart)}
+            onSelect={(event) => setCursorPosition(event.currentTarget.selectionStart)}
+            onBlur={() => setAutocomplete(null)}
+            spellCheck="false"
+            placeholder="CASE WHEN [Amount] >= 1000 THEN 'High' ELSE 'Standard' END"
+            role="combobox"
+            aria-autocomplete="list"
+            aria-expanded={Boolean(autocomplete && suggestions.length)}
+            aria-controls="formula-suggestions"
+            aria-activedescendant={autocomplete && suggestions.length ? `formula-suggestion-${activeSuggestion}` : undefined}
+          />
+          {autocomplete && suggestions.length > 0 && (
+            <ul id="formula-suggestions" className="formula-editor__suggestions" role="listbox" aria-label={autocomplete.kind === "column" ? t("formulaColumnSuggestions") : t("formulaFunctionSuggestions")}>
+              {suggestions.map((suggestion, index) => (
+                <li
+                  id={`formula-suggestion-${index}`}
+                  key={`${suggestion.kind}-${suggestion.key}`}
+                  role="option"
+                  aria-selected={index === activeSuggestion}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => chooseSuggestion(suggestion)}
+                >
+                  <strong>{suggestion.label}</strong><span>{suggestion.meta}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {functionContext && functionArguments.length > 0 && (
+            <div className="formula-editor__function-help" role="status" aria-label={t("formulaFunctionSyntax")}>
+              <code>
+                <strong>{functionContext.item.name.toUpperCase()}(</strong>
+                {functionArguments.map((argument, index) => (
+                  <span key={`${functionContext.item.name}-${argument}-${index}`}>
+                    {index > 0 && <span>{functionContext.item.name.includes("cast") ? " AS " : ", "}</span>}
+                    <mark className={index === functionArgumentIndex ? "is-active" : ""}>{argument}</mark>
+                  </span>
+                ))}
+                <strong>)</strong>
+              </code>
+              <span>{t("formulaActiveArgument", { count: functionArgumentIndex + 1, argument: functionArguments[functionArgumentIndex] })}</span>
+            </div>
+          )}
+        </div>
       </label>
 
       {validation.valid ? (
@@ -116,9 +322,9 @@ export function FormulaColumnEditor({
           <span>{t("formulaInferredType")}: <strong>{validation.inferredType}</strong></span>
           <span>{t("formulaReferences")}: <strong>{validation.referencedColumns.join(", ") || t("none")}</strong></span>
         </div>
-      ) : expression.trim() ? (
+      ) : expression.trim() && !hideArityDiagnostic ? (
         <p className="formula-editor__diagnostic" role="alert">
-          {validation.diagnostics[0]?.message} {t("formulaAtCharacter", { count: (validation.diagnostics[0]?.start ?? 0) + 1 })}
+          {primaryDiagnostic?.message} {t("formulaAtCharacter", { count: (primaryDiagnostic?.start ?? 0) + 1 })}
         </p>
       ) : null}
 

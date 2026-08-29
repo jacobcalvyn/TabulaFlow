@@ -66,3 +66,17 @@ test("compiles a create-only calculated-field recipe step", () => {
     /sudah ada/,
   );
 });
+
+test("recipe compilation uses source column types for formula validation", () => {
+  const numeric = createStep("calculated-field", {
+    outputColumn: "Amount doubled",
+    expression: "[Amount] * 2",
+    expressionVersion: FORMULA_EXPRESSION_VERSION,
+  });
+  const compiled = compileRecipe([numeric], [{ name: "Amount", type: "DOUBLE" }, { name: "Category", type: "VARCHAR" }]);
+  assert.equal(compiled.columnTypes["Amount doubled"], "DOUBLE");
+  assert.throws(() => compileRecipe([{ ...numeric, params: { ...numeric.params, expression: "[Category] * 2" } }], [
+    { name: "Amount", type: "DOUBLE" },
+    { name: "Category", type: "VARCHAR" },
+  ]), /Arithmetic operands must be numeric/);
+});

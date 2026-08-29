@@ -77,14 +77,26 @@ test("lets transactional actions reject a revision change before commit", async 
   );
 });
 
-test("allows a failed mutation to be retried with the same key", async () => {
+test("keeps failed mutations terminal and requires a new key for a retry", async () => {
   let attempts = 0;
   const run = createWebMcpMutationRunner({ getRevision: () => 5 });
   const meta = { expectedRevision: 5, requestId: "failure-001" };
   await assert.rejects(() => run(meta, async () => { attempts += 1; throw new Error("temporary"); }, "compose:create"), /temporary/);
-  const result = await run(meta, async () => { attempts += 1; return { ok: true }; }, "compose:create");
+  await assert.rejects(() => run(meta, async () => { attempts += 1; return { ok: true }; }, "compose:create"), /temporary/);
+  const result = await run({ ...meta, requestId: "failure-002" }, async () => { attempts += 1; return { ok: true }; }, "compose:create");
   assert.equal(attempts, 2);
   assert.equal(result.ok, true);
+});
+
+test("evicts failed terminal mutations using the same bounded cache policy", async () => {
+  let executions = 0;
+  const run = createWebMcpMutationRunner({ getRevision: () => 5, maximumEntries: 2 });
+  for (const requestId of ["failed-1", "failed-2", "failed-3"]) {
+    await assert.rejects(() => run({ expectedRevision: 4, requestId }, async () => { executions += 1; }, `stale:${requestId}`), (error) => error.code === "STALE_STATE");
+  }
+  const recovered = await run({ expectedRevision: 5, requestId: "failed-1" }, async () => { executions += 1; return { ok: true }; }, "stale:failed-1");
+  assert.equal(recovered.ok, true);
+  assert.equal(executions, 1);
 });
 
 test("acknowledges long mutations asynchronously and exposes terminal status", async () => {
@@ -105,4 +117,22 @@ test("acknowledges long mutations asynchronously and exposes terminal status", a
   assert.equal(completed.status, "committed");
   assert.equal(completed.result.recipeRevision, 4);
   assert.equal(completed.result.workspaceRevision, 11);
+});
+
+test("async failures replay their terminal failure instead of stale accepted state", async () => {
+  const run = createWebMcpMutationRunner({ getRevision: () => 3 });
+  const meta = { expectedRevision: 3, requestId: "async-failure-001", executionMode: "async" };
+  const accepted = await run(meta, async () => { throw new Error("worker failed"); }, "recipe:replace");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(run.getOperationStatus(accepted.operationId).status, "failed");
+  await assert.rejects(() => run(meta, async () => ({ ok: true }), "recipe:replace"), /worker failed/);
+});
+
+test("a cancelled confirmation remains terminal for the original request", async () => {
+  const run = createWebMcpMutationRunner({ getRevision: () => 2 });
+  const meta = { expectedRevision: 2, requestId: "delete-cancel-001" };
+  await run(meta, async () => ({ target: "prepared-dataset", targetId: "prepared-a", pendingConfirmation: true }), "delete:prepared-a");
+  assert.equal(run.setRequestTerminalStatus(meta.requestId, "cancelled", { target: "prepared-dataset", targetId: "prepared-a", pendingConfirmation: false }), true);
+  const replay = await run(meta, async () => ({ pendingConfirmation: true }), "delete:prepared-a");
+  assert.deepEqual(replay, { target: "prepared-dataset", targetId: "prepared-a", pendingConfirmation: false, requestId: meta.requestId, status: "cancelled" });
 });

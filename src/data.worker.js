@@ -1,9 +1,9 @@
 import * as duckdb from "@duckdb/duckdb-wasm";
 import { DUCKDB_BUNDLES } from "@duckdb-bundles";
 import { compileComposeOperation } from "./composeSql.js";
-import { applySemanticModelToSchema } from "./semanticModel.js";
+import { applySemanticModelToSchema, deriveRecipeSemanticSchema } from "./semanticModel.js";
 import { DATA_LIMITS, makeDemoRows, normalizeEmptyValues, parseDataFile } from "./data.js";
-import { canExposeProfileRange, classifyColumnSemantics, redactAgentRows, resolveColumnSemantics, shouldRedactAgentValues } from "./dataPrivacy.js";
+import { agentPreviewColumnSchema, canExposeProfileRange, classifyColumnSemantics, redactAgentRows, resolveColumnSemantics, shouldRedactAgentValues } from "./dataPrivacy.js";
 import { encodeSpreadsheetExport, sanitizeExportBaseName } from "./dataExport.js";
 import { buildJoinKeyCandidates, rankJoinKeyCandidates } from "./joinRecommendations.js";
 import { recipeForExecution } from "./preparedRecipeState.js";
@@ -311,9 +311,10 @@ async function loadRows(rows, filename, identifiers = {}) {
     currentRecipe = [];
     stepStates = [];
     activePreparedId = preparedId;
-    const sourceEntry = { id: sourceId, tableName, filename, sourceColumns: [...sourceColumns] };
+    const sourceSchema = sourceColumns.map((name) => ({ name, type: columnTypes.get(name) ?? "UNKNOWN" }));
+    const sourceEntry = { id: sourceId, tableName, filename, sourceColumns: [...sourceColumns], sourceSchema };
     sourceRegistry.set(sourceId, sourceEntry);
-    preparedRegistry.set(preparedId, { id: preparedId, sourceId, recipe: [], sourceColumns: [...sourceColumns], filename });
+    preparedRegistry.set(preparedId, { id: preparedId, sourceId, recipe: [], sourceColumns: [...sourceColumns], sourceSchema, filename });
     const result = await buildDataset();
     reportProgress("commit_data", 95);
     await query("COMMIT");
@@ -670,7 +671,7 @@ async function activatePrepared(preparedId, filters = {}, requestedAggregateColu
     error.code = "SOURCE_REQUIRED";
     throw error;
   }
-  const compiled = compileRecipeSafely(prepared.recipe, prepared.sourceColumns, source.tableName);
+  const compiled = compileRecipeSafely(prepared.recipe, source.sourceSchema ?? prepared.sourceColumns, source.tableName);
   const previousState = {
     sourceName,
     sourceColumns,
@@ -746,8 +747,8 @@ async function materializeComposePrepared(graph, nodeId, identifiers) {
       FROM (${relation.sql}) AS compose_materialized`);
     const count = await query(`SELECT COUNT(*) AS row_count FROM ${quoteIdentifier(tableName)}`);
     const sourceColumns = schema.map((column) => column.name);
-    sourceRegistry.set(sourceId, { id: sourceId, tableName, filename, sourceColumns });
-    preparedRegistry.set(preparedId, { id: preparedId, sourceId, recipe: [], sourceColumns, filename });
+    sourceRegistry.set(sourceId, { id: sourceId, tableName, filename, sourceColumns, sourceSchema: schema });
+    preparedRegistry.set(preparedId, { id: preparedId, sourceId, recipe: [], sourceColumns, sourceSchema: schema, filename });
     await query("COMMIT");
     return { sourceId, preparedId, schema, rowCount: Number(count[0]?.row_count ?? 0) };
   } catch (error) {
@@ -770,7 +771,7 @@ async function preparedRelation(preparedId, graphPrepared) {
   const source = prepared ? sourceRegistry.get(prepared.sourceId) : null;
   if (!prepared || !source) throw new Error(`Source is unavailable in this session for ${graphPrepared?.name ?? preparedId}.`);
   const recipe = recipeForExecution(graphPrepared, prepared.recipe);
-  const compiled = compileRecipe(recipe, prepared.sourceColumns, source.tableName);
+  const compiled = compileRecipe(recipe, source.sourceSchema ?? prepared.sourceColumns, source.tableName);
   const described = await describeRelation(compiled.sql);
   const graphSchema = new Map((graphPrepared?.schema ?? []).map((column) => [column.name, column]));
   const schema = described.map((column) => ({ ...graphSchema.get(column.name), ...column }));
@@ -1007,7 +1008,9 @@ function reconcileWorkerFilters(filters = {}) {
 
 async function applyRecipe(recipe, filters = {}, requestedAggregateColumns, preparedId = activePreparedId) {
   if (preparedId && preparedId !== activePreparedId) await activatePrepared(preparedId);
-  const compiled = compileRecipeSafely(recipe, sourceColumns);
+  const activePrepared = preparedRegistry.get(preparedId ?? activePreparedId);
+  const activeSource = activePrepared ? sourceRegistry.get(activePrepared.sourceId) : null;
+  const compiled = compileRecipeSafely(recipe, activeSource?.sourceSchema ?? sourceColumns);
   const previousState = {
     rowCount,
     columns,
@@ -1050,7 +1053,9 @@ async function applyRecipe(recipe, filters = {}, requestedAggregateColumns, prep
 async function previewRecipe(recipe, stepIndex, options = {}) {
   const lastIndex = Math.min(Math.max(Number(stepIndex), 0), recipe.length - 1);
   const selectedRecipe = recipe.slice(0, lastIndex + 1);
-  const compiled = compileRecipe(selectedRecipe, sourceColumns);
+  const activePrepared = preparedRegistry.get(activePreparedId);
+  const activeSource = activePrepared ? sourceRegistry.get(activePrepared.sourceId) : null;
+  const compiled = compileRecipe(selectedRecipe, activeSource?.sourceSchema ?? sourceColumns);
   const description = await query(`DESCRIBE SELECT * FROM (${compiled.sql}) AS recipe_preview_schema`);
   const previewTypes = new Map(description.map((item) => [item.column_name, item.column_type]));
   const includeRows = options.includeRows !== false;
@@ -1072,12 +1077,20 @@ async function previewRecipe(recipe, stepIndex, options = {}) {
     ? 100
     : Math.min(WEBMCP_DRY_RUN_PREVIEW_ROW_LIMIT, Math.max(1, Number(options.limit) || WEBMCP_DRY_RUN_PREVIEW_ROW_LIMIT));
   const preview = includeRows ? await query(`SELECT ${projection} FROM (${compiled.sql}) AS recipe_preview LIMIT ${previewLimit}`) : [];
-  const selectedSchema = requestedColumns.map((name) => ({ name, type: previewTypes.get(name) ?? null }));
+  const outputSchema = compiled.columns.map((name) => ({ name, type: previewTypes.get(name) ?? null }));
+  const candidateSemanticSchema = deriveRecipeSemanticSchema(
+    activeSource?.sourceSchema ?? sourceColumns.map((name) => ({ name, type: columnTypes[name] ?? null })),
+    selectedRecipe,
+    outputSchema,
+    options.semanticSchema ?? [],
+  );
+  const previewColumnSchema = (name) => agentPreviewColumnSchema(name, previewTypes.get(name), candidateSemanticSchema);
+  const selectedSchema = requestedColumns.map(previewColumnSchema);
   const safePreview = options.agentMode ? redactAgentRows(preview, selectedSchema) : { rows: preview, redactedColumns: [] };
   return {
     stepIndex: lastIndex,
     stepId: selectedRecipe.at(-1)?.id ?? null,
-    schema: compiled.columns.map((name) => ({ name, type: previewTypes.get(name) ?? null })),
+    schema: compiled.columns.map(previewColumnSchema),
     columns: requestedColumns,
     rowCount: Number(countRows[0]?.preview_count ?? 0),
     previewRowCount: preview.length,

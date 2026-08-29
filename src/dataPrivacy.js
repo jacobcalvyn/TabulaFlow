@@ -4,7 +4,7 @@ const LOCATION_PATTERN = /(^|\s)(latitude|longitude|coordinate|koordinat|locatio
 const SECRET_PATTERN = /(^|\s)(password|passwd|secret|token|api\s*key|credential|pin|otp)(\s|$)/;
 const SAFE_CATEGORY_PATTERN = /^(status|delivery status|shipment status|status pengiriman|status kiriman|state|stage|product|produk|service|layanan|category|kategori|type|jenis|sla|cod|flag|is active|enabled)$/;
 const DATE_LIKE_PATTERN = /(^|\s)(date|tanggal|time|waktu|timestamp)(\s|$)/;
-const IDENTIFIER_LIKE_PATTERN = /(^|\s)(id|code|kode|number|nomor|no)(\s|$)/;
+const IDENTIFIER_LIKE_PATTERN = /(^|\s)(id|identifier|key|pk|fk|uuid|guid|code|kode|number|nomor|no)(\s|$)/;
 const NUMERIC_MEASURE_PATTERN = /(^|\s)(amount|nilai|biaya|cost|price|harga|total|weight|berat|volume|qty|quantity|jumlah)(\s|$)/;
 
 function normalizedColumnName(name) {
@@ -20,6 +20,7 @@ function normalizedColumnName(name) {
 export function classifyColumnSemantics(name, type) {
   const normalizedName = normalizedColumnName(name);
   const normalizedType = String(type ?? "").toUpperCase();
+  const identifierLike = IDENTIFIER_LIKE_PATTERN.test(normalizedName);
   let sensitivity = "unknown";
   let category = "unclassified";
 
@@ -35,6 +36,9 @@ export function classifyColumnSemantics(name, type) {
   } else if (LOCATION_PATTERN.test(normalizedName)) {
     sensitivity = "potentially-sensitive";
     category = "location";
+  } else if (identifierLike) {
+    sensitivity = "potentially-sensitive";
+    category = "identifier";
   } else if (SAFE_CATEGORY_PATTERN.test(normalizedName)) {
     sensitivity = "non-sensitive";
     category = "categorical";
@@ -51,7 +55,7 @@ export function classifyColumnSemantics(name, type) {
     : NUMERIC_MEASURE_PATTERN.test(normalizedName) && !/INT|DECIMAL|NUMERIC|DOUBLE|FLOAT|REAL/.test(normalizedType)
       ? "DOUBLE"
       : null;
-  const semanticRole = IDENTIFIER_LIKE_PATTERN.test(normalizedName)
+  const semanticRole = identifierLike
     ? "identifier"
     : category === "categorical"
       ? "dimension"
@@ -77,15 +81,19 @@ export function classifyColumnSemantics(name, type) {
 }
 
 export function shouldRedactAgentValues(semantics) {
-  return ["sensitive", "potentially-sensitive", "pii", "financial", "secret"].includes(semantics?.sensitivity);
+  return !["non-sensitive", "public"].includes(semantics?.sensitivity);
 }
 
 export function resolveColumnSemantics(column) {
   const inferred = classifyColumnSemantics(column?.name, column?.type);
   const override = column?.semantic ?? {};
-  const overrideSensitivity = override.sensitivity === "public" || override.sensitivity === "internal"
-    ? "non-sensitive"
-    : override.sensitivity;
+  const declaredSensitivity = override.source === "inferred" ? undefined : override.sensitivity;
+  const userConfirmedPublic = declaredSensitivity === "public" && override.source === "user-override";
+  const identifierFloor = override.role === "identifier" && !userConfirmedPublic ? "potentially-sensitive" : null;
+  const overrideSensitivity = identifierFloor
+    ?? (declaredSensitivity === "public" && inferred.sensitivity !== "non-sensitive" && !userConfirmedPublic
+      ? inferred.sensitivity
+      : declaredSensitivity);
   return {
     ...inferred,
     ...override,
@@ -105,7 +113,20 @@ export function redactAgentRows(rows, schema = []) {
   };
 }
 
+export function agentPreviewColumnSchema(name, type, semanticSchema = []) {
+  const semanticSource = semanticSchema.find((column) => column.name === name);
+  return {
+    name,
+    type: type ?? null,
+    ...(semanticSource?.semantic
+      ? { semantic: semanticSource.semantic }
+      : semanticSource
+        ? {}
+        : { semantic: { sensitivity: "internal", source: "derived-agent-preview" } }),
+  };
+}
+
 export function canExposeProfileRange(semantics, type) {
-  if (!["non-sensitive", "public", "internal"].includes(semantics?.sensitivity)) return false;
+  if (!["non-sensitive", "public"].includes(semantics?.sensitivity)) return false;
   return /BOOL|INT|DECIMAL|NUMERIC|DOUBLE|FLOAT|REAL|DATE|TIME/.test(String(type ?? "").toUpperCase());
 }

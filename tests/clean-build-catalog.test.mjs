@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { createStep, CREATABLE_TRANSFORMATION_TYPES } from "../src/transformations.js";
 
 const appSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../src/App.jsx"), "utf8");
+const stylesSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../src/styles.css"), "utf8");
 
 test("Clean/Build catalog opens without a dead toolbar menu setter", () => {
   assert.equal(/\bsetOpenMenu\b/.test(appSource), false);
@@ -59,4 +60,11 @@ test("Formula column is grouped beside Choose columns in the aggregate heading",
   assert.ok(formulaTrigger > aggregateHeading);
   assert.ok(columnPicker > formulaTrigger);
   assert.doesNotMatch(appSource, /className="toolbar-actions"/);
+});
+
+test("embedded Steps keeps its header fixed and scrolls only the recipe list", () => {
+  assert.match(stylesSource, /\.sidebar-steps-host\s*\{[^}]*height:\s*0;[^}]*flex:\s*1 1 0;/s);
+  assert.match(stylesSource, /\.steps-panel--embedded\s*\{[^}]*min-height:\s*0;[^}]*max-height:\s*100%;/s);
+  assert.match(stylesSource, /\.steps-list\s*\{[^}]*flex:\s*1 1 0;[^}]*overflow-y:\s*auto;[^}]*touch-action:\s*pan-y;/s);
+  assert.match(stylesSource, /\.steps-list\s*>\s*\.step-card\s*\{[^}]*flex:\s*0 0 auto;/s);
 });

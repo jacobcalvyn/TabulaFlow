@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  assertAgentRecipeContract,
   compileRecipe,
   compileRecipeSafely,
   CREATABLE_TRANSFORMATION_TYPES,
   createStep,
   getStepLabel,
+  includeNewFormulaAggregateColumns,
+  miniTableToolTouchesColumn,
   summarizeStep,
   transformationParamsAreComplete,
   valueRowActionParams,
@@ -14,6 +17,48 @@ import {
 function step(id, type, params, enabled = true) {
   return { id, type, version: 1, enabled, params };
 }
+
+test("new Formula columns become visible without restoring manually unchecked columns", () => {
+  const previousRecipe = [step("existing", "calculated-field", { outputColumn: "existing_formula", expression: "[amount] * 2" })];
+  const nextRecipe = [
+    ...previousRecipe,
+    step("new", "calculated-field", { outputColumn: "new_formula", expression: "[amount] * 3" }),
+  ];
+
+  assert.deepEqual(
+    includeNewFormulaAggregateColumns(["amount"], previousRecipe, nextRecipe, 200),
+    ["amount", "new_formula"],
+  );
+  assert.deepEqual(
+    includeNewFormulaAggregateColumns(["amount"], previousRecipe, nextRecipe, 1),
+    ["amount"],
+  );
+});
+
+test("Formula dependencies and outputs do not activate mini-table tool indicators", () => {
+  const formula = step("formula", "calculated-field", {
+    outputColumn: "delivery_flag",
+    expression: "IF([status] = 'failed', 1, 0)",
+  });
+
+  assert.equal(miniTableToolTouchesColumn(formula, "status"), false);
+  assert.equal(miniTableToolTouchesColumn(formula, "delivery_flag"), false);
+  assert.equal(miniTableToolTouchesColumn(step("trim", "trim", { column: "status" }), "status"), true);
+});
+
+test("WebMCP recipe contract permits supported creates and preserves legacy steps by stable ID", () => {
+  const legacy = step("legacy", "group-aggregate", { groupColumns: ["status"], function: "COUNT", newName: "count" });
+  assert.doesNotThrow(() => assertAgentRecipeContract([
+    legacy,
+    step("formula", "calculated-field", { outputColumn: "amount_2", expression: "[amount] * 2" }),
+  ], [legacy]));
+  assert.throws(() => assertAgentRecipeContract([
+    step("new-legacy", "group-aggregate", { groupColumns: ["status"], function: "COUNT", newName: "count" }),
+  ], []), /cannot create/);
+  assert.throws(() => assertAgentRecipeContract([
+    step("legacy", "trim", { column: "status" }),
+  ], [legacy]), /cannot change/);
+});
 
 test("compiles an ordered recipe and tracks schema after every step", () => {
   const recipe = [

@@ -20,6 +20,16 @@ test("append rejects incompatible shared column types", () => {
   ]), /tidak kompatibel/);
 });
 
+test("append widens compatible numeric columns explicitly", () => {
+  const result = compileAppendSql([
+    relation("left_table", [["id", "INTEGER"], ["amount", "DECIMAL(10,2)"]]),
+    relation("right_table", [["id", "BIGINT"], ["amount", "DOUBLE"]]),
+  ]);
+  assert.deepEqual(result.schema.map((column) => [column.name, column.type]), [["id", "BIGINT"], ["amount", "DOUBLE"]]);
+  assert.match(result.sql, /CAST\(append_input\."id" AS BIGINT\)/);
+  assert.match(result.sql, /CAST\(append_input\."amount" AS DOUBLE\)/);
+});
+
 test("join rejects incompatible key types without implicit casting", () => {
   assert.throws(() => compileJoinSql(
     relation("SELECT 1", [["id", "BIGINT"]]),
@@ -166,6 +176,17 @@ test("pivot creates one output column for every explicit value", () => {
   });
   assert.deepEqual(result.schema.map((column) => column.name), ["month", "East", "West"]);
   assert.match(result.sql, /CASE WHEN p\."region" IS NOT DISTINCT FROM 'East'/);
+});
+
+test("pivot count counts matching rows even when the value column is null", () => {
+  const result = compilePivotSql(relation("orders", [["region", "VARCHAR"], ["status", "VARCHAR"], ["amount", "DOUBLE"]]), {
+    groupBy: ["region"],
+    pivotColumn: "status",
+    valueColumn: "amount",
+    aggregate: "count",
+    values: ["FAILED"],
+  });
+  assert.match(result.sql, /COUNT\(\*\) FILTER \(WHERE p\."status" IS NOT DISTINCT FROM 'FAILED'\)/);
 });
 
 test("unpivot turns selected columns into field and value rows", () => {

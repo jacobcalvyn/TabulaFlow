@@ -362,7 +362,7 @@ function UnaryOperationInspector({ operation, flow, byId, position, onCancel, on
   );
 }
 
-export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNode, onPreviewDraft, onCreateNode, onUpdateNode, onDeleteNode, onDeletePrepared, onMoveNode, onAutoArrange, onDuplicate, onCreatePrepared, onEditPreparation, onExport, onGetNodeQuality, deleteRequest, onDeleteRequestShown, onDeleteConfirmation }) {
+export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNode, onPreviewDraft, onCreateNode, onUpdateNode, onDeleteNode, onDeletePrepared, onDeleteMetricDefinition, onMoveNode, onAutoArrange, onDuplicate, onCreatePrepared, onEditPreparation, onExport, onGetNodeQuality, deleteRequest, onDeleteRequestShown, onDeleteConfirmation }) {
   const { formatNumber, t } = useI18n();
   const nodes = useMemo(() => [
     ...flow.preparedInputs.map((node) => ({ ...node, nodeType: "dataset" })),
@@ -378,6 +378,7 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
   const [connectionError, setConnectionError] = useState("");
   const [confirmingPreparedDeleteId, setConfirmingPreparedDeleteId] = useState(null);
   const [confirmingOperationDeleteId, setConfirmingOperationDeleteId] = useState(null);
+  const [confirmingMetricDeleteId, setConfirmingMetricDeleteId] = useState(null);
   const [deletingOperationId, setDeletingOperationId] = useState(null);
   const [operationDeleteError, setOperationDeleteError] = useState("");
   const [pendingPair, setPendingPair] = useState(null);
@@ -394,9 +395,14 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
       setOperationDeleteError("");
       setConfirmingOperationDeleteId(deleteRequest.targetId);
       setConfirmingPreparedDeleteId(null);
+      setConfirmingMetricDeleteId(null);
+    } else if (deleteRequest.target === "metric-definition" && (flow.metricDefinitions ?? []).some((metric) => metric.id === deleteRequest.targetId)) {
+      setConfirmingMetricDeleteId(deleteRequest.targetId);
+      setConfirmingPreparedDeleteId(null);
+      setConfirmingOperationDeleteId(null);
     }
     onDeleteRequestShown?.(deleteRequest.token);
-  }, [deleteRequest, flow.composeNodes, flow.preparedInputs, onDeleteRequestShown]);
+  }, [deleteRequest, flow.composeNodes, flow.metricDefinitions, flow.preparedInputs, onDeleteRequestShown]);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [qualityOpen, setQualityOpen] = useState(false);
   const [nodeQuality, setNodeQuality] = useState(null);
@@ -678,6 +684,11 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
         <div><h1>{t("compose")}</h1><p>{connectingFrom ? t("chooseSecondDataset") : t("composeCanvasHint")} {dirty && <span className="compose-dirty">· {t("unsavedChanges")}</span>}</p></div>
         <div className="compose-toolbar__actions"><div className="compose-zoom-controls" role="group" aria-label={t("canvasZoom")}><button type="button" onClick={() => zoomBy(-0.15)} aria-label={t("zoomOut")} title={t("zoomOut")}><MagnifyingGlassMinus /></button><span>{Math.round(viewScale * 100)}%</span><button type="button" onClick={() => zoomBy(0.15)} aria-label={t("zoomIn")} title={t("zoomIn")}><MagnifyingGlassPlus /></button></div><button className="compose-auto-arrange" type="button" onClick={autoArrange}><TreeStructure />{t("autoArrange")}</button><button className="compose-fit-graph" type="button" onClick={fitGraph}><CornersOut />{t("fitGraph")}</button>{connectingFrom && <button className="compose-cancel-connect" type="button" onClick={dismissConnection}><X />{t("cancelConnection")}</button>}</div>
       </header>
+      {error && <div className="compose-global-error" role="alert">{error}</div>}
+      {confirmingMetricDeleteId && <div className="compose-global-confirmation" role="alertdialog" aria-label={t("confirmDeleteMetricDefinition")}>
+        <span>{t("confirmDeleteMetricDefinition")}</span>
+        <div><button type="button" onClick={() => { const id = confirmingMetricDeleteId; setConfirmingMetricDeleteId(null); onDeleteConfirmation?.("metric-definition", id, "cancelled"); }}>{t("cancel")}</button><button className="compose-global-confirmation__delete" type="button" onClick={async () => { const id = confirmingMetricDeleteId; const removed = await onDeleteMetricDefinition?.(id); if (removed) { setConfirmingMetricDeleteId(null); onDeleteConfirmation?.("metric-definition", id, "confirmed"); } }}>{t("delete")}</button></div>
+      </div>}
       <div className={`compose-layout ${previewOpen ? "compose-layout--preview-open" : "compose-layout--preview-closed"}`}>
         <section ref={canvasRef} className={`compose-canvas ${connectingFrom ? "compose-canvas--connecting" : ""} ${isMobile ? "compose-canvas--mobile" : ""}`} aria-label={t("composeData")} onClick={handleCanvasClick}>
           <div className="compose-canvas__surface" style={{ width: canvasWidth * viewScale, height: canvasHeight * viewScale }}>

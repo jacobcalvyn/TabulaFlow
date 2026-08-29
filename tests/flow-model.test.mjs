@@ -274,6 +274,24 @@ test("hydrates Compose schemas from prepared metadata before the canvas renders"
   assert.deepEqual(result.unresolvedNodeIds, []);
 });
 
+test("schema hydration preserves stale Compose nodes until worker evaluation succeeds", () => {
+  const input = prepared("input", ["id", "status"]);
+  const graph = addPreparedInput(createFlowGraph(), input.sourceAsset, input.preparedInput);
+  const filtered = addComposeNode(graph, {
+    kind: "filter-rows",
+    name: "Stale filter",
+    inputIds: [input.preparedInput.id],
+    config: { conjunction: "and", conditions: [{ column: "status", operator: "equals", value: "open" }] },
+    schema: [],
+    validationStatus: "needs-validation",
+    dataStatus: "stale",
+  });
+  const node = hydrateComposeSchemas(filtered.graph).graph.composeNodes[0];
+  assert.equal(node.validationStatus, "needs-validation");
+  assert.equal(node.dataStatus, "stale");
+  assert.deepEqual(node.schema.map((column) => column.name), ["id", "status"]);
+});
+
 test("preserves the last valid Compose schema while an operation is invalid", () => {
   const input = prepared("input", ["id", "status"]);
   const graph = addPreparedInput(createFlowGraph(), input.sourceAsset, input.preparedInput);

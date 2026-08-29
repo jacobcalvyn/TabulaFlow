@@ -29,9 +29,62 @@ const CREATABLE_TRANSFORMATION_IDS = new Set([
   "remove-columns",
 ]);
 
+const AGENT_CREATABLE_TRANSFORMATION_IDS = new Set([
+  ...CREATABLE_TRANSFORMATION_IDS,
+  "rename-column",
+  "change-type",
+  "replace-value",
+  "delete-rows",
+  "calculated-field",
+]);
+
 export const CREATABLE_TRANSFORMATION_TYPES = Object.freeze(
   TRANSFORMATION_TYPES.filter((item) => CREATABLE_TRANSFORMATION_IDS.has(item.type)),
 );
+
+export function isAgentCreatableTransformation(type) {
+  return AGENT_CREATABLE_TRANSFORMATION_IDS.has(String(type ?? ""));
+}
+
+export function assertAgentRecipeContract(nextRecipe = [], currentRecipe = []) {
+  const currentById = new Map(currentRecipe.map((step) => [step.id, step]));
+  for (const step of nextRecipe) {
+    const current = currentById.get(step.id);
+    if (!current && !isAgentCreatableTransformation(step.type)) {
+      throw new Error(`WebMCP cannot create recipe step type: ${step.type}`);
+    }
+    if (current && current.type !== step.type) {
+      throw new Error(`WebMCP cannot change recipe step ${step.id} from ${current.type} to ${step.type}.`);
+    }
+  }
+}
+
+export function includeNewFormulaAggregateColumns(currentColumns = [], previousRecipe = [], nextRecipe = [], limit = 200) {
+  const activeFormulaOutputs = (recipe) => new Set(recipe
+    .filter((step) => step.type === "calculated-field" && step.enabled !== false)
+    .map((step) => String(step.params?.outputColumn ?? "").trim())
+    .filter(Boolean));
+  const previousOutputs = activeFormulaOutputs(previousRecipe);
+  const nextOutputs = activeFormulaOutputs(nextRecipe);
+  const selected = [...new Set(currentColumns.filter((column) => typeof column === "string" && column))].slice(0, limit);
+  for (const outputColumn of nextOutputs) {
+    if (previousOutputs.has(outputColumn) || selected.includes(outputColumn) || selected.length >= limit) continue;
+    selected.push(outputColumn);
+  }
+  return selected;
+}
+
+export function miniTableToolTouchesColumn(step, column) {
+  if (!step || step.type === "calculated-field") return false;
+  const params = step.params ?? {};
+  const directFields = ["column", "leftColumn", "rightColumn", "valueColumn", "newName", "outputColumn"];
+  if (directFields.some((field) => params[field] === column)) return true;
+  return ["columns", "groupColumns"].some((field) => {
+    const value = params[field];
+    const columns = Array.isArray(value) ? value : String(value ?? "").split(",");
+    return columns.some((item) => String(item).trim() === column);
+  });
+}
 
 const TYPE_LABELS = new Map(TRANSFORMATION_TYPES.map((item) => [item.type, item.label]));
 const CAST_TYPES = new Set(["VARCHAR", "BIGINT", "DOUBLE", "BOOLEAN", "DATE", "TIMESTAMP"]);
@@ -128,10 +181,11 @@ function stepInputName(index, sourceRelation) {
   return index === 0 ? sourceRelation : `step_${index}`;
 }
 
-function compileEnabledStep(step, input, columns) {
+function compileEnabledStep(step, input, columns, columnTypes) {
   const params = step.params ?? {};
   const source = quoteIdentifier(input);
   let nextColumns = [...columns];
+  const nextColumnTypes = new Map(columnTypes);
   let sql;
 
   if (step.type === "rename-column") {
@@ -140,15 +194,19 @@ function compileEnabledStep(step, input, columns) {
     const nextName = requireOutputName(columns, params.newName, column);
     sql = `SELECT * RENAME (${identifier} AS ${quoteIdentifier(nextName)}) FROM ${source}`;
     nextColumns = columns.map((item) => item === column ? nextName : item);
+    nextColumnTypes.set(nextName, nextColumnTypes.get(column) ?? "UNKNOWN");
+    nextColumnTypes.delete(column);
   } else if (step.type === "change-type") {
     const identifier = requireColumn(columns, params.column);
     const targetType = String(params.targetType ?? "").toUpperCase();
     if (!CAST_TYPES.has(targetType)) throw new Error("Tipe tujuan tidak didukung.");
     sql = `SELECT * REPLACE (TRY_CAST(${identifier} AS ${targetType}) AS ${identifier}) FROM ${source}`;
+    nextColumnTypes.set(String(params.column), targetType);
   } else if (step.type === "trim") {
     const identifier = requireColumn(columns, params.column);
     const functionName = params.mode === "left" ? "LTRIM" : params.mode === "right" ? "RTRIM" : "TRIM";
     sql = `SELECT * REPLACE (${functionName}(CAST(${identifier} AS VARCHAR)) AS ${identifier}) FROM ${source}`;
+    nextColumnTypes.set(String(params.column), "VARCHAR");
   } else if (step.type === "replace-value") {
     const identifier = requireColumn(columns, params.column);
     sql = `SELECT * REPLACE (CASE WHEN ${identifier} IS NOT DISTINCT FROM ${sqlLiteral(params.from)} THEN ${sqlLiteral(params.to)} ELSE ${identifier} END AS ${identifier}) FROM ${source}`;
@@ -171,10 +229,12 @@ function compileEnabledStep(step, input, columns) {
       ? `array_to_string(list_transform(string_split(lower(${textExpression}), ' '), lambda word: upper(left(word, 1)) || substring(word, 2)), ' ')`
       : `${mode === "upper" ? "UPPER" : "LOWER"}(${textExpression})`;
     sql = `SELECT * REPLACE (${caseExpression} AS ${identifier}) FROM ${source}`;
+    nextColumnTypes.set(String(params.column), "VARCHAR");
   } else if (step.type === "parse-date") {
     const identifier = requireColumn(columns, params.column);
     const format = String(params.format ?? "%Y-%m-%d");
     sql = `SELECT * REPLACE (TRY_STRPTIME(CAST(${identifier} AS VARCHAR), ${sqlLiteral(format)})::DATE AS ${identifier}) FROM ${source}`;
+    nextColumnTypes.set(String(params.column), "DATE");
   } else if (step.type === "delete-rows") {
     const identifier = requireColumn(columns, params.column);
     const operator = String(params.operator ?? "equals");
@@ -200,11 +260,13 @@ function compileEnabledStep(step, input, columns) {
     const selected = requireColumns(columns, params.columns);
     sql = `SELECT ${quoteIdentifier(INTERNAL_ROW_ID)}, ${selected.map(quoteIdentifier).join(", ")} FROM ${source}`;
     nextColumns = selected;
+    for (const name of [...nextColumnTypes.keys()]) if (!selected.includes(name)) nextColumnTypes.delete(name);
   } else if (step.type === "remove-columns") {
     const removed = requireColumns(columns, params.columns);
     if (removed.length >= columns.length) throw new Error("Minimal satu kolom harus dipertahankan.");
     sql = `SELECT * EXCLUDE (${removed.map(quoteIdentifier).join(", ")}) FROM ${source}`;
     nextColumns = columns.filter((column) => !removed.includes(column));
+    removed.forEach((name) => nextColumnTypes.delete(name));
   } else if (step.type === "sort") {
     const identifier = requireColumn(columns, params.column);
     const direction = params.direction === "desc" ? "DESC" : "ASC";
@@ -213,9 +275,10 @@ function compileEnabledStep(step, input, columns) {
     const expressionVersion = Number(params.expressionVersion ?? FORMULA_EXPRESSION_VERSION);
     if (expressionVersion !== FORMULA_EXPRESSION_VERSION) throw new Error(`Versi ekspresi ${expressionVersion} belum didukung.`);
     const name = requireOutputName(columns, params.outputColumn);
-    const formula = compileFormula(params.expression, columns.map((column) => ({ name: column, type: "UNKNOWN" })));
+    const formula = compileFormula(params.expression, columns.map((column) => ({ name: column, type: nextColumnTypes.get(column) ?? "UNKNOWN" })));
     sql = `SELECT *, ${formula.sql} AS ${quoteIdentifier(name)} FROM ${source}`;
     nextColumns.push(name);
+    nextColumnTypes.set(name, formula.inferredType ?? "UNKNOWN");
   } else if (step.type === "calculated-column") {
     const left = requireColumn(columns, params.leftColumn);
     const operator = String(params.operator ?? "");
@@ -225,6 +288,7 @@ function compileEnabledStep(step, input, columns) {
     sql = `SELECT *, (${left} ${operator} NULLIF(${right}, 0)) AS ${quoteIdentifier(name)} FROM ${source}`;
     if (operator !== "/") sql = `SELECT *, (${left} ${operator} ${right}) AS ${quoteIdentifier(name)} FROM ${source}`;
     nextColumns.push(name);
+    nextColumnTypes.set(name, "UNKNOWN");
   } else if (step.type === "conditional-column") {
     const identifier = requireColumn(columns, params.column);
     const operator = String(params.operator ?? "=");
@@ -232,6 +296,7 @@ function compileEnabledStep(step, input, columns) {
     const name = requireOutputName(columns, params.newName);
     sql = `SELECT *, CASE WHEN ${identifier} ${operator} ${sqlLiteral(params.value)} THEN ${sqlLiteral(params.thenValue)} ELSE ${sqlLiteral(params.elseValue)} END AS ${quoteIdentifier(name)} FROM ${source}`;
     nextColumns.push(name);
+    nextColumnTypes.set(name, "UNKNOWN");
   } else if (step.type === "group-aggregate") {
     const groups = requireColumns(columns, params.groupColumns);
     const aggregateFunction = String(params.function ?? "COUNT").toUpperCase();
@@ -243,17 +308,23 @@ function compileEnabledStep(step, input, columns) {
     const groupSql = groups.map(quoteIdentifier).join(", ");
     sql = `SELECT ROW_NUMBER() OVER () AS ${quoteIdentifier(INTERNAL_ROW_ID)}, ${groupSql}, ${aggregateFunction}(${valueExpression}) AS ${quoteIdentifier(name)} FROM ${source} GROUP BY ${groupSql}`;
     nextColumns = [...groups, name];
+    for (const column of [...nextColumnTypes.keys()]) if (!groups.includes(column)) nextColumnTypes.delete(column);
+    nextColumnTypes.set(name, aggregateFunction === "COUNT" ? "BIGINT" : columnTypes.get(String(params.valueColumn)) ?? "UNKNOWN");
   } else {
     throw new Error(`Tipe langkah "${step.type}" belum didukung.`);
   }
 
-  return { sql, columns: nextColumns };
+  return { sql, columns: nextColumns, columnTypes: nextColumnTypes };
 }
 
 export function compileRecipe(recipe, sourceColumns, sourceRelation = "source_data") {
   if (!Array.isArray(recipe)) throw new Error("Recipe harus berupa array.");
   const ids = new Set();
-  let columns = [...sourceColumns];
+  const sourceSchema = sourceColumns.map((column) => typeof column === "string"
+    ? { name: column, type: "UNKNOWN" }
+    : { name: String(column?.name ?? ""), type: column?.type ?? "UNKNOWN" });
+  let columns = sourceSchema.map((column) => column.name);
+  let columnTypes = new Map(sourceSchema.map((column) => [column.name, column.type]));
   const ctes = [];
   const stepStates = [];
   let enabledIndex = 0;
@@ -281,7 +352,7 @@ export function compileRecipe(recipe, sourceColumns, sourceRelation = "source_da
     const input = stepInputName(enabledIndex, sourceRelation);
     let compiled;
     try {
-      compiled = compileEnabledStep(step, input, columns);
+      compiled = compileEnabledStep(step, input, columns, columnTypes);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Konfigurasi langkah tidak valid.";
       const recipeError = new Error(`Langkah ${recipeIndex + 1} (${getStepLabel(step.type)}): ${message}`);
@@ -294,12 +365,14 @@ export function compileRecipe(recipe, sourceColumns, sourceRelation = "source_da
     ctes.push(`${quoteIdentifier(`step_${enabledIndex}`)} AS (${compiled.sql})`);
     stepStates.push({ id: step.id, status: "valid", inputColumns: [...columns], outputColumns: [...compiled.columns] });
     columns = compiled.columns;
+    columnTypes = compiled.columnTypes;
   });
 
   const finalSource = enabledIndex === 0 ? quoteIdentifier(sourceRelation) : quoteIdentifier(`step_${enabledIndex}`);
   return {
     sql: ctes.length ? `WITH ${ctes.join(",\n")} SELECT * FROM ${finalSource}` : `SELECT * FROM ${finalSource}`,
     columns,
+    columnTypes: Object.fromEntries(columnTypes),
     stepStates,
   };
 }

@@ -29,6 +29,14 @@ function commonUnpivotType(valueColumns) {
   throw error;
 }
 
+function commonAppendType(types, columnName) {
+  const uniqueTypes = [...new Set(types.map(typeKey))];
+  if (uniqueTypes.length === 1) return uniqueTypes[0];
+  if (uniqueTypes.every((type) => INTEGER_TYPE.test(type))) return "BIGINT";
+  if (uniqueTypes.every((type) => INTEGER_TYPE.test(type) || DECIMAL_TYPE.test(type) || FLOAT_TYPE.test(type))) return "DOUBLE";
+  throw new Error(`Append gagal: tipe kolom "${columnName}" tidak kompatibel (${uniqueTypes.join(" ↔ ")}).`);
+}
+
 function schemaMap(schema) {
   return new Map(schema.map((column) => [column.name, column]));
 }
@@ -104,28 +112,31 @@ export function compileAppendSql(inputs, config = {}) {
       }
     }
   }
-  for (const name of orderedNames) {
-    const types = maps.map((map) => map.get(name)?.type).filter(Boolean).map(typeKey);
-    if (new Set(types).size > 1) throw new Error(`Append gagal: tipe kolom "${name}" tidak kompatibel (${[...new Set(types)].join(" ↔ ")}).`);
-  }
+  const outputTypes = new Map(orderedNames.map((name) => [name, commonAppendType(
+    maps.map((map) => map.get(name)?.type).filter(Boolean),
+    name,
+  )]));
   const selectedNames = Array.isArray(config.outputColumns)
     ? config.outputColumns.filter((name) => orderedNames.includes(name))
     : orderedNames;
   if (!selectedNames.length) throw new Error("Append harus menghasilkan minimal satu kolom.");
-  const union = inputs.map((input) => `SELECT * EXCLUDE (${quoteIdentifier(INTERNAL_ROW_ID)}) FROM (${input.sql}) AS append_input`).join(" UNION ALL BY NAME ");
+  const union = inputs.map((input, inputIndex) => {
+    const map = maps[inputIndex];
+    const projection = selectedNames.map((name) => {
+      const source = map.get(name);
+      const value = source ? `append_input.${quoteIdentifier(name)}` : "NULL";
+      return `CAST(${value} AS ${outputTypes.get(name)}) AS ${quoteIdentifier(name)}`;
+    }).join(", ");
+    return `SELECT ${projection} FROM (${input.sql}) AS append_input`;
+  }).join(" UNION ALL ");
   const projection = selectedNames.map(quoteIdentifier).join(", ");
-  const types = new Map();
-  for (const name of selectedNames) {
-    const column = maps.map((map) => map.get(name)).find(Boolean);
-    types.set(name, column?.type ?? "VARCHAR");
-  }
   return {
     sql: `SELECT ROW_NUMBER() OVER () AS ${quoteIdentifier(INTERNAL_ROW_ID)}, ${projection} FROM (${union}) AS appended`,
     schema: selectedNames.map((name) => {
       const sources = maps.map((map) => map.get(name)).filter(Boolean);
       return {
         name,
-        type: types.get(name),
+        type: outputTypes.get(name),
         semantic: mergeFieldSemantics(sources, { kind: "append", columns: sources.map((column) => column.name) }),
       };
     }),
@@ -320,8 +331,9 @@ export function compilePivotSql(input, config = {}) {
   const pivoted = values.map((item) => {
     const value = typeof item === "object" ? item.value : item;
     const name = uniqueOutputName(typeof item === "object" ? item.alias : value, used, String(value));
-    const caseSql = `CASE WHEN p.${quoteIdentifier(pivotColumn.name)} IS NOT DISTINCT FROM ${sqlLiteral(value)} THEN p.${quoteIdentifier(valueColumn.name)} END`;
-    const expression = `${fn === "average" ? "AVG" : fn.toUpperCase()}(${caseSql})`;
+    const predicate = `p.${quoteIdentifier(pivotColumn.name)} IS NOT DISTINCT FROM ${sqlLiteral(value)}`;
+    const caseSql = `CASE WHEN ${predicate} THEN p.${quoteIdentifier(valueColumn.name)} END`;
+    const expression = fn === "count" ? `COUNT(*) FILTER (WHERE ${predicate})` : `${fn === "average" ? "AVG" : fn.toUpperCase()}(${caseSql})`;
     return { name, expression, type: fn === "count" ? "BIGINT" : fn === "average" ? "DOUBLE" : valueColumn.type, semantic: mergeFieldSemantics([valueColumn], { kind: "pivot", value: String(value), column: valueColumn.name }) };
   });
   const projection = [...groupBy.map((name) => `p.${quoteIdentifier(name)}`), ...pivoted.map((item) => `${item.expression} AS ${quoteIdentifier(item.name)}`)];
