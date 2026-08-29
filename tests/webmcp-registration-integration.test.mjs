@@ -8,7 +8,7 @@ import { createWebMcpMutationRunner } from "../src/webMcpMutation.js";
 
 function state(revision, { compose = true } = {}) {
   return {
-    contractVersion: "2.6",
+    contractVersion: "2.7",
     workspaceRevision: revision,
     workspace: "prepare",
     worker: { ready: true, recovering: false },

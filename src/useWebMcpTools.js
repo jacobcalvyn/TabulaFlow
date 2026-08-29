@@ -330,6 +330,7 @@ const UPDATE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID
 const ENABLE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, stepId: ID, enabled: { type: "boolean" }, ...MUTATION_META }));
 const MOVE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, stepId: ID, position: { type: "integer", minimum: 1 }, ...MUTATION_META }));
 const RECIPE_HISTORY_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, ...MUTATION_META }));
+const DELETE_ALL_RECIPE_STEPS_SCHEMA = Object.freeze(strictObject({ preparedId: ID, ...MUTATION_META }));
 const REPLACE_RECIPE_SCHEMA = Object.freeze(strictObject({
   preparedId: ID,
   recipe: RECIPE_PREVIEW_SCHEMA.properties.recipe,
@@ -364,7 +365,7 @@ function filterSelection(raw) {
 }
 
 const WEBMCP_CAPABILITIES = Object.freeze({
-  contractVersion: "2.6",
+  contractVersion: "2.7",
   authenticationRequired: false,
   workspaces: ["source", "prepare", "compose", "account"],
   actions: [
@@ -374,6 +375,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     "filter-preview",
     "export-prepare",
     "manage-recipe",
+    "request-delete-all-recipe-steps",
     "replace-recipe-atomically",
     "select-compose-node",
     "auto-arrange-compose",
@@ -415,7 +417,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
 });
 
 const WORKFLOW_GUIDE = Object.freeze({
-  contractVersion: "2.6",
+  contractVersion: "2.7",
   flow: [
     { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
     { workspace: "prepare", purpose: "Inspect one prepared dataset, apply temporary filters, and maintain its independent ordered recipe." },
@@ -839,6 +841,19 @@ export function createWebMcpTools(contextRef, availability) {
         const { actions } = activeContext(contextRef);
         const result = await actions.addRecipeStep(preparedId, step, { expectedRevision, requestId });
         return webMcpResult(`Added ${step.type} to the Prepare recipe.`, result);
+      },
+    }, {
+      name: "tabulaflow_request_delete_all_recipe_steps",
+      title: "Request deletion of all Prepare recipe steps",
+      description: "Open the visible Delete all confirmation for the active prepared dataset. This tool never confirms or deletes the recipe itself; the user must approve it in the Steps panel, and one Undo can restore the complete recipe.",
+      inputSchema: DELETE_ALL_RECIPE_STEPS_SCHEMA,
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      async execute({ preparedId, expectedRevision, requestId }) {
+        const { state, actions } = activeContext(contextRef);
+        if (state.activePreparedId !== preparedId) throw new Error(`Prepared dataset is not active: ${preparedId}`);
+        if (!state.recipeSteps.length) throw new Error(`Prepare recipe has no steps: ${preparedId}`);
+        const result = await actions.requestDelete("prepare-recipe", preparedId, { expectedRevision, requestId });
+        return webMcpResult(`Delete all confirmation opened for the recipe of ${preparedId}.`, result);
       },
     }, {
       name: "tabulaflow_update_recipe_step",

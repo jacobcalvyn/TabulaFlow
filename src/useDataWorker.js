@@ -261,6 +261,11 @@ export function useDataWorker() {
     rememberStableState(forgetPrepared(stableStateRef.current, preparedId));
     return result;
   }, [request]);
+  const resetWorkspace = useCallback(async () => {
+    const result = await request("reset-workspace", {});
+    rememberStableState(createWorkerRegistry());
+    return result;
+  }, [request]);
   const materializeComposePrepared = useCallback(async (graph, nodeId, identifiers) => {
     const result = await request("materialize-compose-prepared", { graph, nodeId, identifiers });
     rememberStableState(rememberLoadedSource(stableStateRef.current, {
@@ -298,6 +303,7 @@ export function useDataWorker() {
     activatePrepared,
     registerPreparedCopy,
     unregisterPrepared,
+    resetWorkspace,
     materializeComposePrepared,
     filter,
     searchAggregate,
@@ -312,5 +318,5 @@ export function useDataWorker() {
     composeNodeQuality,
     exportCompose,
     composeConnectionOptions,
-  }), [ready, recovering, progress, loadFile, inspectFile, loadDemo, activatePrepared, registerPreparedCopy, unregisterPrepared, materializeComposePrepared, filter, searchAggregate, searchAggregateForAgent, resolveAgentValue, previewPrepared, profileData, exportData, applyRecipe, previewRecipe, previewCompose, composeNodeQuality, exportCompose, composeConnectionOptions]);
+  }), [ready, recovering, progress, loadFile, inspectFile, loadDemo, activatePrepared, registerPreparedCopy, unregisterPrepared, resetWorkspace, materializeComposePrepared, filter, searchAggregate, searchAggregateForAgent, resolveAgentValue, previewPrepared, profileData, exportData, applyRecipe, previewRecipe, previewCompose, composeNodeQuality, exportCompose, composeConnectionOptions]);
 }

@@ -12,7 +12,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "2.6", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "2.7", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -105,7 +105,7 @@ const ALL_TOOL_NAMES = [
   "tabulaflow_get_prepare_dataset", "tabulaflow_get_data_profile", "tabulaflow_query_column_values",
   "tabulaflow_get_prepare_preview", "tabulaflow_preview_recipe_change", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter",
   "tabulaflow_remove_preview_filter", "tabulaflow_clear_preview_filters", "tabulaflow_export_prepare",
-  "tabulaflow_add_recipe_step", "tabulaflow_update_recipe_step", "tabulaflow_set_recipe_step_enabled",
+  "tabulaflow_add_recipe_step", "tabulaflow_request_delete_all_recipe_steps", "tabulaflow_update_recipe_step", "tabulaflow_set_recipe_step_enabled",
   "tabulaflow_move_recipe_step", "tabulaflow_undo_recipe", "tabulaflow_redo_recipe", "tabulaflow_apply_value_action",
   "tabulaflow_get_compose_graph", "tabulaflow_get_compose_node", "tabulaflow_get_node_preview", "tabulaflow_get_compose_node_quality",
   "tabulaflow_validate_compose_operation", "tabulaflow_get_connection_options", "tabulaflow_select_compose_node",
@@ -119,7 +119,7 @@ test("WebMCP exposes contextual Agent-Ready v2 tools", () => {
   assert.deepEqual(createWebMcpTools(ref, { hasDataset: false, hasPrepared: false, hasComposeNodes: false }).map((tool) => tool.name), GLOBAL_TOOL_NAMES);
   const allTools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   assert.deepEqual(allTools.map((tool) => tool.name), ALL_TOOL_NAMES);
-  assert.equal(new Set(ALL_TOOL_NAMES).size, 55);
+  assert.equal(new Set(ALL_TOOL_NAMES).size, 56);
 });
 
 test("WebMCP read plane observes workflow, Prepare data, and Compose data", async () => {
@@ -151,7 +151,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "2.6");
+  assert.equal(capabilities.structuredContent.contractVersion, "2.7");
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");
@@ -190,6 +190,7 @@ test("WebMCP mutations target stable IDs and carry revision plus idempotency met
   await toolByName(tools, "tabulaflow_clear_preview_filters").execute({ preparedId: "prepared-a", ...mutation("filter-clear-001") });
   await toolByName(tools, "tabulaflow_export_prepare").execute({ preparedId: "prepared-a", format: "csv", ...mutation("prepare-export-001") });
   await toolByName(tools, "tabulaflow_add_recipe_step").execute({ preparedId: "prepared-a", step: trim, ...mutation("recipe-add-001") });
+  const recipeDeletion = await toolByName(tools, "tabulaflow_request_delete_all_recipe_steps").execute({ preparedId: "prepared-a", ...mutation("recipe-delete-all-001") });
   await toolByName(tools, "tabulaflow_replace_recipe").execute({ preparedId: "prepared-a", recipe: [{ id: "step-a", ...trim, enabled: true }], expectedRecipeRevision: 1, ...mutation("recipe-replace-001") });
   await toolByName(tools, "tabulaflow_update_recipe_step").execute({ preparedId: "prepared-a", stepId: "step-a", step: trim, ...mutation("recipe-update-001") });
   await toolByName(tools, "tabulaflow_set_recipe_step_enabled").execute({ preparedId: "prepared-a", stepId: "step-a", enabled: false, ...mutation("recipe-enable-001") });
@@ -209,11 +210,13 @@ test("WebMCP mutations target stable IDs and carry revision plus idempotency met
 
   assert.equal(filtered.structuredContent.totalRowCount, 10);
   assert.equal(filtered.structuredContent.filteredRowCount, 4);
+  assert.equal(recipeDeletion.structuredContent.pendingConfirmation, true);
   assert.equal(deletion.structuredContent.pendingConfirmation, true);
   assert.equal(metricDeletion.structuredContent.pendingConfirmation, true);
   assert.ok(calls.some((call) => call[0] === "duplicate" && call[2].expectedRevision === REVISION));
   assert.ok(calls.some((call) => call[0] === "create-operation" && call[2].requestId === "operation-create-001"));
   assert.ok(calls.some((call) => call[0] === "delete-request" && call[3].requestId === "delete-001"));
+  assert.ok(calls.some((call) => call[0] === "delete-request" && call[1] === "prepare-recipe" && call[2] === "prepared-a" && call[3].requestId === "recipe-delete-all-001"));
   assert.ok(calls.some((call) => call[0] === "delete-request" && call[1] === "metric-definition" && call[2] === "metric-a"));
   assert.ok(calls.some((call) => call[0] === "export-prepare" && call[3].requestId === "prepare-export-001"));
   assert.ok(calls.some((call) => call[0] === "export-compose" && call[3].requestId === "compose-export-001"));
@@ -228,6 +231,7 @@ test("WebMCP rejects stale target identifiers before invoking visible actions", 
   await assert.rejects(() => toolByName(tools, "tabulaflow_select_compose_node").execute({ nodeId: "missing", ...mutation("missing-compose-select") }), /not found/);
   await assert.rejects(() => toolByName(tools, "tabulaflow_export_compose").execute({ nodeId: "missing", format: "csv", ...mutation("missing-export-001") }), /not found/);
   await assert.rejects(() => toolByName(tools, "tabulaflow_request_delete").execute({ target: "recipe-step", targetId: "missing", ...mutation("missing-delete-001") }), /not found/);
+  await assert.rejects(() => toolByName(tools, "tabulaflow_request_delete_all_recipe_steps").execute({ preparedId: "missing", ...mutation("missing-recipe-delete-all") }), /not active/);
   assert.equal(calls.length, 0);
 });
 
@@ -235,7 +239,7 @@ test("WebMCP mutation schemas require collaboration metadata and conditional val
   const { ref } = createContext();
   const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   for (const name of [
-    "tabulaflow_open_cloud_file", "tabulaflow_select_prepared_dataset", "tabulaflow_duplicate_prepared_dataset", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter", "tabulaflow_export_prepare", "tabulaflow_add_recipe_step", "tabulaflow_replace_recipe",
+    "tabulaflow_open_cloud_file", "tabulaflow_select_prepared_dataset", "tabulaflow_duplicate_prepared_dataset", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter", "tabulaflow_export_prepare", "tabulaflow_add_recipe_step", "tabulaflow_request_delete_all_recipe_steps", "tabulaflow_replace_recipe",
     "tabulaflow_select_compose_node", "tabulaflow_auto_arrange_compose", "tabulaflow_create_compose_operation", "tabulaflow_update_compose_operation",
     "tabulaflow_export_compose", "tabulaflow_promote_compose_result", "tabulaflow_request_delete",
   ]) {

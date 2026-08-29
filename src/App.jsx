@@ -18,6 +18,7 @@ import {
   Rows,
   Robot,
   ShieldCheck,
+  Trash,
   UploadSimple,
   WarningCircle,
   UserCircle,
@@ -38,6 +39,7 @@ import {
   saveStoredFlow,
   saveStoredSourceHandle,
   appendStoredActivity,
+  clearStoredWorkspaceData,
   loadStoredActivity,
 } from "./recipeStorage.js";
 import { createActivityEvent, findSupersededActivity, pageActivityEvents } from "./activityModel.js";
@@ -432,13 +434,17 @@ function AccountScreen({ onOpenFile, uploadRequestToken, onUploadRequestShown, a
   );
 }
 
-function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, workerReady, openedSources, fileRequestToken, onFileRequestShown, relinkRequest, onRelinkRequestShown }) {
+export function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, onResetAll, workerReady, openedSources, fileRequestToken, onFileRequestShown, relinkRequest, onRelinkRequestShown }) {
   const { formatNumber, t } = useI18n();
   const inputRef = useRef(null);
   const chooseFileButtonRef = useRef(null);
   const relinkButtonRefs = useRef(new Map());
   const [relinkSourceId, setRelinkSourceId] = useState(null);
   const [dragging, setDragging] = useState(false);
+  const [confirmingReset, setConfirmingReset] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const resetConfirmRef = useRef(null);
+  const resetDisabled = loading || resetting || openedSources.some((source) => source.status === "restoring");
 
   useEffect(() => {
     if (!fileRequestToken) return;
@@ -454,6 +460,20 @@ function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, wor
     button?.focus();
     onRelinkRequestShown?.(relinkRequest.token);
   }, [onRelinkRequestShown, relinkRequest]);
+
+  useEffect(() => {
+    if (confirmingReset) resetConfirmRef.current?.focus();
+  }, [confirmingReset]);
+
+  const resetAll = async () => {
+    setResetting(true);
+    try {
+      const reset = await onResetAll?.();
+      if (reset !== false) setConfirmingReset(false);
+    } finally {
+      setResetting(false);
+    }
+  };
 
   const chooseFile = async () => {
     try {
@@ -536,8 +556,27 @@ function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, wor
             <h2 id="opened-sources-title">{t("openedFiles")}</h2>
             <p>{t("openedFilesDescription")}</p>
           </div>
-          <span>{formatNumber(openedSources.length)}</span>
+          <div className="opened-sources__actions">
+            <span className="opened-sources__count">{formatNumber(openedSources.length)}</span>
+            {openedSources.length > 0 && (
+              <button className="opened-sources__reset" type="button" disabled={resetDisabled} onClick={() => setConfirmingReset(true)}>
+                <Trash weight="bold" /> {t("resetAll")}
+              </button>
+            )}
+          </div>
         </header>
+        {confirmingReset && (
+          <div className="source-reset-confirmation" role="alertdialog" aria-labelledby="source-reset-title" aria-describedby="source-reset-description" onKeyDown={(event) => { if (event.key === "Escape" && !resetting) setConfirmingReset(false); }}>
+            <div>
+              <strong id="source-reset-title">{t("confirmResetAll")}</strong>
+              <span id="source-reset-description">{t("resetAllDescription")}</span>
+            </div>
+            <div className="source-reset-confirmation__actions">
+              <button type="button" disabled={resetting} onClick={() => setConfirmingReset(false)}>{t("cancel")}</button>
+              <button ref={resetConfirmRef} className="source-reset-confirmation__confirm" type="button" disabled={resetting} onClick={() => void resetAll()}>{t(resetting ? "resettingAll" : "resetAll")}</button>
+            </div>
+          </div>
+        )}
         {openedSources.length > 0 ? (
           <ul>
             {openedSources.map((source) => (
@@ -2128,6 +2167,48 @@ export function App() {
     };
   }), [flow.preparedInputs, flow.sourceAssets]);
 
+  const resetAll = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      await worker.resetWorkspace();
+      const nextFlow = createFlowGraph();
+      await commitFlow(nextFlow);
+      try {
+        await clearStoredWorkspaceData();
+        await saveStoredFlow(nextFlow);
+        setFlowDirty(false);
+      } catch {
+        setError(t("resetAllCleanupFailed"));
+      }
+      updateActivePreparedId(null);
+      setDataset(null);
+      filtersRef.current = {};
+      setFilters({});
+      recipeHistory.reset([]);
+      setRecipeRecovery({ error: "", invalidStepId: null });
+      setComposePreview(null);
+      setComposeLoading(false);
+      setComposeError("");
+      activityEventsRef.current = [];
+      setActivityEvents([]);
+      setActivityError("");
+      setActivityOverrideNotice("");
+      pendingDeleteConfirmationsRef.current.clear();
+      webMcpMutationRunnerRef.current = createWebMcpMutationRunner({ getRevision: () => workspaceRevisionRef.current });
+      setWebMcpFileRequestToken(0);
+      setWebMcpRelinkRequest(null);
+      setWebMcpCloudUploadToken(0);
+      setWebMcpDeleteRequest(null);
+      return true;
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("resetAllFailed"));
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }, [commitFlow, recipeHistory, t, updateActivePreparedId, worker]);
+
   const relinkSource = useCallback(async (sourceAssetId, nextFile, handle = null, automatic = false, beforeCommit = null, activityContext = null) => {
     beforeCommit?.();
     const source = flowRef.current.sourceAssets.find((item) => item.id === sourceAssetId);
@@ -2180,6 +2261,12 @@ export function App() {
     (async () => {
       let nextFlow = flowRef.current;
       for (const source of nextFlow.sourceAssets.filter(isFlowFileSource)) {
+        nextFlow = {
+          ...flowRef.current,
+          sourceAssets: flowRef.current.sourceAssets.map((item) => item.id === source.id ? { ...item, status: "restoring" } : item),
+        };
+        flowRef.current = nextFlow;
+        setFlow(nextFlow);
         try {
           const handle = await loadStoredSourceHandle(source.id);
           const restored = await restoreFileFromHandle(handle);
@@ -3056,10 +3143,10 @@ export function App() {
     if (!targetId) return {
       workspace: screen === "input" ? "source" : screen === "data" ? "prepare" : screen,
       workspaceRevision: workspaceRevisionRef.current,
-      actions: screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", "inspect-activity"],
+      actions: screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", ...(recipeHistory.recipe.length ? ["request-delete-all-recipe-steps"] : []), "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", "inspect-activity"],
     };
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === targetId);
-    if (prepared) return { targetId, kind: "dataset", actions: ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", "export", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
+    if (prepared) return { targetId, kind: "dataset", actions: ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", ...((prepared.recipe?.length ?? 0) > 0 ? ["request-delete-all-recipe-steps"] : []), "export", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
     const operation = flowRef.current.composeNodes.find((item) => item.id === targetId);
     if (operation) return { targetId, kind: operation.kind, actions: ["inspect", "preview", "update", "export", "promote-result", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
     throw new Error(`Target not found: ${targetId}`);
@@ -3290,7 +3377,11 @@ export function App() {
   }, `compose:promote:${nodeId}`);
 
   const requestDeleteFromTool = async (target, targetId, meta) => runWebMcpMutation(meta, async () => {
-    setScreen(target === "recipe-step" ? "data" : "compose");
+    if (target === "prepare-recipe") {
+      assertActivePreparedForTool(targetId);
+      if (!currentPreparedRecipe(targetId).length) throw new Error(`Prepare recipe has no steps: ${targetId}`);
+    }
+    setScreen(target === "recipe-step" || target === "prepare-recipe" ? "data" : "compose");
     const token = `${Date.now()}-${Math.random()}`;
     setWebMcpDeleteRequest({ target, targetId, token, requestId: meta.requestId });
     const activity = await recordActivity({ action: "delete_requested", targetType: target, targetId, status: "pending-confirmation", summary: { targetKind: target } }, webMcpActivity(meta));
@@ -3338,7 +3429,7 @@ export function App() {
 
   useWebMcpTools({
     state: {
-      contractVersion: "2.6",
+      contractVersion: "2.7",
       workspaceRevision,
       flowId: flow.id,
       flowRevision: flow.revision,
@@ -3384,6 +3475,7 @@ export function App() {
         name: item.name,
         totalRowCount: item.rowCount,
         columnCount: item.schema?.length ?? null,
+        recipeStepCount: item.recipe?.length ?? 0,
         recipeRevision: item.recipeVersion ?? 0,
         recipeStatus: item.recipeStatus ?? null,
       })),
@@ -3469,6 +3561,7 @@ export function App() {
           onFile={loadFile}
           onOpenSource={openPrepared}
           onRelinkSource={relinkSourceFromPicker}
+          onResetAll={resetAll}
           workerReady={worker.ready}
           openedSources={openedSources}
           fileRequestToken={webMcpFileRequestToken}
@@ -3497,7 +3590,7 @@ export function App() {
           onEditPreparation={openPrepared}
           onExport={exportComposeNode}
           onGetNodeQuality={getComposeNodeQualityFromTool}
-          deleteRequest={webMcpDeleteRequest?.target === "recipe-step" ? null : webMcpDeleteRequest}
+          deleteRequest={["recipe-step", "prepare-recipe"].includes(webMcpDeleteRequest?.target) ? null : webMcpDeleteRequest}
           onDeleteRequestShown={acknowledgeDeleteRequest}
           onDeleteConfirmation={resolveDeleteConfirmation}
         />
@@ -3522,7 +3615,7 @@ export function App() {
           onRecipeRedo={redoRecipe}
           onRecipePreview={previewRecipe}
           onPreparedChange={openPrepared}
-          deleteRequest={webMcpDeleteRequest?.target === "recipe-step" ? webMcpDeleteRequest : null}
+          deleteRequest={["recipe-step", "prepare-recipe"].includes(webMcpDeleteRequest?.target) ? webMcpDeleteRequest : null}
           onDeleteRequestShown={acknowledgeDeleteRequest}
           onDeleteConfirmation={resolveDeleteConfirmation}
         />

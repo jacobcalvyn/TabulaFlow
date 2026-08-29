@@ -232,7 +232,10 @@ export function StepsPanel({
   const [editingId, setEditingId] = useState(null);
   const [draggedId, setDraggedId] = useState(null);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState(null);
+  const [confirmingDeleteAll, setConfirmingDeleteAll] = useState(false);
+  const [deleteAllRequestTargetId, setDeleteAllRequestTargetId] = useState(null);
   const sheetPointerRef = useRef(null);
+  const deleteAllConfirmRef = useRef(null);
   const sheetDragOffsetRef = useRef(0);
   const sheetDragMovedRef = useRef(false);
   const dismissTimerRef = useRef(null);
@@ -263,10 +266,44 @@ export function StepsPanel({
   }, [embedded, open]);
 
   useEffect(() => {
-    if (!deleteRequest || deleteRequest.target !== "recipe-step") return;
-    if (recipe.some((step) => step.id === deleteRequest.targetId)) setConfirmingDeleteId(deleteRequest.targetId);
+    if (confirmingDeleteAll) deleteAllConfirmRef.current?.focus();
+  }, [confirmingDeleteAll]);
+
+  useEffect(() => {
+    if (recipe.length) return;
+    setConfirmingDeleteAll(false);
+    setDeleteAllRequestTargetId(null);
+  }, [recipe.length]);
+
+  useEffect(() => {
+    if (!deleteRequest) return;
+    if (deleteRequest.target === "prepare-recipe" && recipe.length > 0) {
+      setConfirmingDeleteId(null);
+      setDeleteAllRequestTargetId(deleteRequest.targetId);
+      setConfirmingDeleteAll(true);
+    } else if (deleteRequest.target === "recipe-step" && recipe.some((step) => step.id === deleteRequest.targetId)) {
+      setConfirmingDeleteAll(false);
+      setDeleteAllRequestTargetId(null);
+      setConfirmingDeleteId(deleteRequest.targetId);
+    }
     onDeleteRequestShown?.(deleteRequest.token);
   }, [deleteRequest, onDeleteRequestShown, recipe]);
+
+  const cancelDeleteAll = () => {
+    setConfirmingDeleteAll(false);
+    if (deleteAllRequestTargetId) onDeleteConfirmation?.("prepare-recipe", deleteAllRequestTargetId, "cancelled");
+    setDeleteAllRequestTargetId(null);
+  };
+
+  const confirmDeleteAll = async () => {
+    const result = await onChange([], recipe[0]?.id ?? null);
+    if (result === null) return;
+    setConfirmingDeleteAll(false);
+    setEditingId(null);
+    dismissForm();
+    if (deleteAllRequestTargetId) onDeleteConfirmation?.("prepare-recipe", deleteAllRequestTargetId, "confirmed");
+    setDeleteAllRequestTargetId(null);
+  };
 
   const openEdit = (step) => {
     setEditingId(step.id);
@@ -354,7 +391,21 @@ export function StepsPanel({
       <div className="steps-panel__history">
         <button type="button" onClick={onUndo} disabled={!canUndo || applying}><ArrowCounterClockwise /> {t("undo")}</button>
         <button type="button" onClick={onRedo} disabled={!canRedo || applying}><ArrowClockwise /> {t("redo")}</button>
+        {recipe.length > 0 && <button className="steps-panel__delete-all" type="button" onClick={() => { setConfirmingDeleteId(null); setDeleteAllRequestTargetId(null); setConfirmingDeleteAll(true); }} disabled={applying}><Trash /> {t("deleteAllSteps")}</button>}
       </div>
+
+      {confirmingDeleteAll && (
+        <div className="steps-panel__delete-all-confirm" role="alertdialog" aria-labelledby="delete-all-steps-title" aria-describedby="delete-all-steps-description" onKeyDown={(event) => { if (event.key === "Escape" && !applying) cancelDeleteAll(); }}>
+          <div>
+            <strong id="delete-all-steps-title">{t(recipe.length === 1 ? "confirmDeleteAllStep" : "confirmDeleteAllSteps", { count: recipe.length })}</strong>
+            <span id="delete-all-steps-description">{t("deleteAllStepsDescription")}</span>
+          </div>
+          <div>
+            <button type="button" disabled={applying} onClick={cancelDeleteAll}>{t("cancel")}</button>
+            <button ref={deleteAllConfirmRef} className="steps-panel__delete-all-confirm-action" type="button" disabled={applying} onClick={() => void confirmDeleteAll()}>{t("deleteAllSteps")}</button>
+          </div>
+        </div>
+      )}
 
       {error && <div className="steps-panel__error" role="alert"><WarningCircle weight="fill" />{error}</div>}
 

@@ -728,6 +728,37 @@ function unregisterPrepared(preparedId) {
   return { preparedId, sourceId: prepared.sourceId, removed: true, sourceRemoved: !sourceStillUsed };
 }
 
+async function resetWorkspace() {
+  await initializeDuckDB();
+  const tableNames = [...new Set([...sourceRegistry.values()].map((source) => source.tableName).filter(Boolean))];
+  await query("BEGIN TRANSACTION");
+  try {
+    await query(`DROP VIEW IF EXISTS ${WORKING_VIEW}`);
+    await query(`DROP VIEW IF EXISTS ${SOURCE_TABLE}`);
+    for (const tableName of tableNames) await query(`DROP TABLE IF EXISTS ${quoteIdentifier(tableName)}`);
+    await query("COMMIT");
+  } catch (error) {
+    try { await query("ROLLBACK"); } catch { /* recovery owns a failed rollback */ }
+    throw error;
+  }
+
+  sourceRegistry.clear();
+  preparedRegistry.clear();
+  clearAgentValueReferences();
+  sourceName = "";
+  datasetId = 0;
+  rowCount = 0;
+  columns = [];
+  sourceColumns = [];
+  columnTypes = new Map();
+  aggregateColumns = [];
+  qualityCache = null;
+  currentRecipe = [];
+  stepStates = [];
+  activePreparedId = null;
+  return { reset: true };
+}
+
 async function materializeComposePrepared(graph, nodeId, identifiers) {
   const relation = await compileGraphNode(graph, nodeId);
   const described = relation.schema?.length ? relation.schema : await describeRelation(relation.sql);
@@ -1115,6 +1146,7 @@ async function handleRequest(type, payload) {
   if (type === "activate-prepared") return activatePrepared(payload.preparedId, payload.filters, payload.aggregateColumns);
   if (type === "register-prepared-copy") return registerPreparedCopy(payload.preparedId, payload.sourcePreparedId, payload.recipe);
   if (type === "unregister-prepared") return unregisterPrepared(payload.preparedId);
+  if (type === "reset-workspace") return resetWorkspace();
   if (type === "materialize-compose-prepared") return materializeComposePrepared(payload.graph, payload.nodeId, payload.identifiers);
   if (type === "filter") return buildDataset(payload.filters, payload.aggregateColumns);
   if (type === "search-aggregate") return searchAggregate(payload.column, payload.query, payload.filters, payload.offset, payload.limit);

@@ -75,6 +75,28 @@ export async function loadStoredActivity(flowId) {
   }
 }
 
+export async function clearStoredWorkspaceData() {
+  await Promise.allSettled([...saveQueues.values()]);
+  const database = await openDatabase();
+  try {
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction([
+        STORE_NAME,
+        SOURCE_HANDLE_STORE_NAME,
+        ACTIVITY_STORE_NAME,
+      ], "readwrite");
+      transaction.objectStore(STORE_NAME).clear();
+      transaction.objectStore(SOURCE_HANDLE_STORE_NAME).clear();
+      transaction.objectStore(ACTIVITY_STORE_NAME).clear();
+      transaction.addEventListener("complete", () => resolve());
+      transaction.addEventListener("error", () => reject(transaction.error ?? new Error("Stored workspace data could not be cleared.")));
+      transaction.addEventListener("abort", () => reject(transaction.error ?? new Error("Stored workspace reset was aborted.")));
+    });
+  } finally {
+    database.close();
+  }
+}
+
 export function preparedRecipeStorageKey(preparedId) {
   return `prepared-recipe:${preparedId}`;
 }

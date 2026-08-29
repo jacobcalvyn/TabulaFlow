@@ -272,6 +272,115 @@ test("a WebMCP recipe deletion also waits for visible confirmation", () => {
   view.unmount();
 });
 
+test("Prepare Steps deletes the complete recipe only after inline confirmation", async () => {
+  const calls = [];
+  const recipe = [
+    { id: "step-a", type: "trim", version: 1, enabled: true, params: { column: "name", mode: "both" } },
+    { id: "step-b", type: "normalize-case", version: 1, enabled: true, params: { column: "name", mode: "upper" } },
+  ];
+  const view = render(React.createElement(LanguageProvider, null, React.createElement(StepsPanel, {
+    open: true,
+    embedded: true,
+    columns: ["name"],
+    recipe,
+    stepStates: [],
+    invalidStepId: null,
+    error: "",
+    applying: false,
+    canUndo: false,
+    canRedo: false,
+    onClose() {},
+    onChange(nextRecipe, changedStepId) { calls.push([nextRecipe, changedStepId]); },
+    onUndo() {},
+    onRedo() {},
+    onPreview() {},
+    previewedStepId: null,
+  })));
+
+  fireEvent.click(view.getByRole("button", { name: "Delete all" }));
+  let confirmation = view.getByRole("alertdialog", { name: "Delete all 2 steps?" });
+  fireEvent.keyDown(confirmation, { key: "Escape" });
+  assert.deepEqual(calls, []);
+  assert.equal(view.queryByRole("alertdialog"), null);
+
+  fireEvent.click(view.getByRole("button", { name: "Delete all" }));
+  confirmation = view.getByRole("alertdialog", { name: "Delete all 2 steps?" });
+  fireEvent.click(within(confirmation).getByRole("button", { name: "Cancel" }));
+  assert.deepEqual(calls, []);
+  assert.equal(view.queryByRole("alertdialog"), null);
+
+  fireEvent.click(view.getByRole("button", { name: "Delete all" }));
+  await act(async () => { fireEvent.click(within(view.getByRole("alertdialog")).getByRole("button", { name: "Delete all" })); });
+  assert.deepEqual(calls, [[[], "step-a"]]);
+  view.unmount();
+});
+
+test("a WebMCP Delete all request uses the visible Prepare confirmation", async () => {
+  const calls = [];
+  const recipe = [{ id: "step-a", type: "trim", version: 1, enabled: true, params: { column: "name", mode: "both" } }];
+  const renderSteps = (deleteRequest) => render(React.createElement(LanguageProvider, null, React.createElement(StepsPanel, {
+    open: true,
+    embedded: true,
+    columns: ["name"],
+    recipe,
+    stepStates: [],
+    invalidStepId: null,
+    error: "",
+    applying: false,
+    canUndo: false,
+    canRedo: false,
+    onClose() {},
+    async onChange(nextRecipe, changedStepId) { calls.push(["change", nextRecipe, changedStepId]); return { rowCount: 1 }; },
+    onUndo() {},
+    onRedo() {},
+    onPreview() {},
+    previewedStepId: null,
+    deleteRequest,
+    onDeleteRequestShown(token) { calls.push(["shown", token]); },
+    onDeleteConfirmation(target, targetId, outcome) { calls.push(["confirmation", target, targetId, outcome]); },
+  })));
+
+  let view = renderSteps({ target: "prepare-recipe", targetId: "prepared-a", token: "delete-all-cancel" });
+  assert.deepEqual(calls, [["shown", "delete-all-cancel"]]);
+  fireEvent.click(within(view.getByRole("alertdialog", { name: "Delete the only recipe step?" })).getByRole("button", { name: "Cancel" }));
+  assert.deepEqual(calls, [["shown", "delete-all-cancel"], ["confirmation", "prepare-recipe", "prepared-a", "cancelled"]]);
+  view.unmount();
+
+  calls.length = 0;
+  view = renderSteps({ target: "prepare-recipe", targetId: "prepared-a", token: "delete-all-confirm" });
+  await act(async () => { fireEvent.click(within(view.getByRole("alertdialog", { name: "Delete the only recipe step?" })).getByRole("button", { name: "Delete all" })); });
+  assert.deepEqual(calls, [
+    ["shown", "delete-all-confirm"],
+    ["change", [], "step-a"],
+    ["confirmation", "prepare-recipe", "prepared-a", "confirmed"],
+  ]);
+  view.unmount();
+});
+
+test("Prepare Steps hides Delete all when the active recipe is empty", () => {
+  const view = render(React.createElement(LanguageProvider, null, React.createElement(StepsPanel, {
+    open: true,
+    embedded: true,
+    columns: ["name"],
+    recipe: [],
+    stepStates: [],
+    invalidStepId: null,
+    error: "",
+    applying: false,
+    canUndo: true,
+    canRedo: false,
+    onClose() {},
+    onChange() {},
+    onUndo() {},
+    onRedo() {},
+    onPreview() {},
+    previewedStepId: null,
+  })));
+
+  assert.equal(view.queryByRole("button", { name: "Delete all" }), null);
+  view.unmount();
+});
+
 test("Formula column validates, previews, and submits one create-only recipe step", async () => {
   const calls = [];
   const view = render(React.createElement(LanguageProvider, null, React.createElement(FormulaColumnEditor, {
