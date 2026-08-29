@@ -57,6 +57,23 @@ test("duplicates a prepared input without duplicating its source asset and with 
   });
 });
 
+test("new flows persist a monotonic workspace revision field", () => {
+  const graph = createFlowGraph();
+  assert.equal(graph.workspaceRevision, 0);
+  const source = prepared("orders");
+  const next = addPreparedInput(graph, source.sourceAsset, source.preparedInput);
+  assert.equal(next.workspaceRevision, 0);
+});
+
+test("promoting a prepared dataset returns an operation-kind diagnostic", () => {
+  const source = prepared("orders");
+  const graph = addPreparedInput(createFlowGraph(), source.sourceAsset, source.preparedInput);
+  assert.throws(
+    () => createPreparedFromCompose(graph, source.preparedInput.id),
+    (error) => error.code === "OPERATION_NODE_REQUIRED" && error.actualKind === "prepared-dataset",
+  );
+});
+
 test("keeps a restored recipe out of execution until the user applies it", () => {
   const storedRecipe = [{ id: "trim-id", type: "trim", params: { column: "id" } }];
   const preparedInput = {

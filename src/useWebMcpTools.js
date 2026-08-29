@@ -165,41 +165,44 @@ const VALUE_ACTION_SCHEMA = Object.freeze(strictObject({
 
 const FILTER_VALUE_OPERATORS = ["equals", "not-equals", "contains", "not-contains", "greater-than", "greater-or-equal", "less-than", "less-or-equal"];
 const FILTER_VALUELESS_OPERATORS = ["is-null", "is-not-null", "is-empty", "is-not-empty"];
-const OPTIONAL_NAME = { type: "string", minLength: 1, maxLength: 120 };
 const ID = { type: "string", minLength: 1 };
-const COLUMN_NAMES = { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, uniqueItems: true };
+// The browser counts the complete active WebMCP schema against a small
+// configuration budget. Compose keeps strict object shapes here and delegates
+// semantic constraints (known IDs, non-empty names, uniqueness) to the same
+// runtime validator used by the UI.
+const OPERATION_ID = { type: "string" };
+const OPERATION_NAME = { type: "string", maxLength: 120 };
+const OPERATION_COLUMNS = { type: "array", items: OPERATION_ID, minItems: 1 };
 
 const COMPOSE_OPERATION_SCHEMA = Object.freeze({
   oneOf: [
-    strictObject({ kind: { const: "append" }, inputIds: { type: "array", items: ID, minItems: 2, maxItems: 2, uniqueItems: true }, name: OPTIONAL_NAME }, ["kind", "inputIds"]),
-    strictObject({ kind: { const: "join" }, leftId: ID, rightId: ID, leftKey: ID, rightKey: ID, joinType: { type: "string", enum: ["inner", "left", "right", "full"] }, name: OPTIONAL_NAME }, ["kind", "leftId", "rightId", "leftKey", "rightKey", "joinType"]),
-    strictObject({ kind: { const: "difference" }, leftId: ID, rightId: ID, leftKey: ID, rightKey: ID, mode: { type: "string", enum: ["left-only", "right-only"] }, name: OPTIONAL_NAME }, ["kind", "leftId", "rightId", "leftKey", "rightKey", "mode"]),
-    strictObject({ kind: { const: "filter-rows" }, inputId: ID, column: ID, operator: { type: "string", enum: FILTER_VALUE_OPERATORS }, value: COMPOSE_VALUE_SCHEMA, name: OPTIONAL_NAME }, ["kind", "inputId", "column", "operator", "value"]),
-    strictObject({ kind: { const: "filter-rows" }, inputId: ID, column: ID, operator: { type: "string", enum: FILTER_VALUELESS_OPERATORS }, name: OPTIONAL_NAME }, ["kind", "inputId", "column", "operator"]),
-    strictObject({ kind: { const: "distinct-rows" }, inputId: ID, columns: COLUMN_NAMES, mode: { type: "string", enum: ["representative-rows", "project-columns"], default: "representative-rows" }, name: OPTIONAL_NAME }, ["kind", "inputId", "columns"]),
+    strictObject({ kind: { const: "append" }, inputIds: { type: "array", items: OPERATION_ID, minItems: 2, maxItems: 2 }, name: OPERATION_NAME }, ["kind", "inputIds"]),
+    strictObject({ kind: { const: "join" }, leftId: OPERATION_ID, rightId: OPERATION_ID, leftKey: OPERATION_ID, rightKey: OPERATION_ID, joinType: { type: "string", enum: ["inner", "left", "right", "full"] }, name: OPERATION_NAME }, ["kind", "leftId", "rightId", "leftKey", "rightKey", "joinType"]),
+    strictObject({ kind: { const: "difference" }, leftId: OPERATION_ID, rightId: OPERATION_ID, leftKey: OPERATION_ID, rightKey: OPERATION_ID, mode: { type: "string", enum: ["left-only", "right-only"] }, name: OPERATION_NAME }, ["kind", "leftId", "rightId", "leftKey", "rightKey", "mode"]),
+    strictObject({ kind: { const: "filter-rows" }, inputId: OPERATION_ID, column: OPERATION_ID, operator: { type: "string", enum: FILTER_VALUE_OPERATORS }, value: COMPOSE_VALUE_SCHEMA, name: OPERATION_NAME }, ["kind", "inputId", "column", "operator", "value"]),
+    strictObject({ kind: { const: "filter-rows" }, inputId: OPERATION_ID, column: OPERATION_ID, operator: { type: "string", enum: FILTER_VALUELESS_OPERATORS }, name: OPERATION_NAME }, ["kind", "inputId", "column", "operator"]),
+    strictObject({ kind: { const: "distinct-rows" }, inputId: OPERATION_ID, columns: OPERATION_COLUMNS, mode: { type: "string", enum: ["representative-rows", "project-columns"] }, name: OPERATION_NAME }, ["kind", "inputId", "columns"]),
     strictObject({
       kind: { const: "aggregate" },
-      inputId: ID,
-      groupBy: { type: "array", items: ID, uniqueItems: true },
+      inputId: OPERATION_ID,
+      groupBy: { type: "array", items: OPERATION_ID },
       metrics: {
         type: "array",
         minItems: 1,
         maxItems: 20,
         items: strictObject({
           function: { type: "string", enum: ["count", "count-distinct", "sum", "average", "min", "max", "median", "percentile"] },
-          measureColumn: ID,
-          alias: ID,
+          measureColumn: OPERATION_ID,
+          alias: OPERATION_ID,
           percentile: { type: "number", exclusiveMinimum: 0, exclusiveMaximum: 1 },
         }, ["function", "alias"]),
       },
-      minimumSampleSize: { type: "integer", minimum: 1, default: 1 },
-      suppressSmallGroups: { type: "boolean", default: false },
-      name: OPTIONAL_NAME,
+      minimumSampleSize: { type: "integer", minimum: 1 },
+      suppressSmallGroups: { type: "boolean" },
+      name: OPERATION_NAME,
     }, ["kind", "inputId", "metrics"]),
-    strictObject({ kind: { const: "aggregate" }, inputId: ID, groupBy: { type: "array", items: ID, uniqueItems: true }, function: { const: "count" }, measureColumn: ID, alias: ID, name: OPTIONAL_NAME }, ["kind", "inputId", "function", "alias"]),
-    strictObject({ kind: { const: "aggregate" }, inputId: ID, groupBy: { type: "array", items: ID, uniqueItems: true }, function: { type: "string", enum: ["sum", "average", "min", "max", "count-distinct"] }, measureColumn: ID, alias: ID, name: OPTIONAL_NAME }, ["kind", "inputId", "function", "measureColumn", "alias"]),
-    strictObject({ kind: { const: "pivot" }, inputId: ID, groupBy: { type: "array", items: ID, uniqueItems: true }, pivotColumn: ID, valueColumn: ID, aggregate: { type: "string", enum: ["sum", "count", "average", "min", "max"] }, values: { type: "array", items: COMPOSE_VALUE_SCHEMA, minItems: 1 }, name: OPTIONAL_NAME }, ["kind", "inputId", "pivotColumn", "valueColumn", "aggregate", "values"]),
-    strictObject({ kind: { const: "unpivot" }, inputId: ID, idColumns: { type: "array", items: ID, uniqueItems: true }, valueColumns: COLUMN_NAMES, fieldColumn: ID, valueColumn: ID, name: OPTIONAL_NAME }, ["kind", "inputId", "valueColumns", "fieldColumn", "valueColumn"]),
+    strictObject({ kind: { const: "pivot" }, inputId: OPERATION_ID, groupBy: { type: "array", items: OPERATION_ID }, pivotColumn: OPERATION_ID, valueColumn: OPERATION_ID, aggregate: { type: "string", enum: ["sum", "count", "average", "min", "max"] }, values: { type: "array", items: COMPOSE_VALUE_SCHEMA, minItems: 1 }, name: OPERATION_NAME }, ["kind", "inputId", "pivotColumn", "valueColumn", "aggregate", "values"]),
+    strictObject({ kind: { const: "unpivot" }, inputId: OPERATION_ID, idColumns: { type: "array", items: OPERATION_ID }, valueColumns: OPERATION_COLUMNS, fieldColumn: OPERATION_ID, valueColumn: OPERATION_ID, name: OPERATION_NAME }, ["kind", "inputId", "valueColumns", "fieldColumn", "valueColumn"]),
   ],
 });
 
@@ -365,7 +368,7 @@ function filterSelection(raw) {
 }
 
 const WEBMCP_CAPABILITIES = Object.freeze({
-  contractVersion: "2.8",
+  contractVersion: "2.9",
   authenticationRequired: false,
   workspaces: ["source", "prepare", "compose", "account"],
   actions: [
@@ -417,7 +420,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
 });
 
 const WORKFLOW_GUIDE = Object.freeze({
-  contractVersion: "2.8",
+  contractVersion: "2.9",
   flow: [
     { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
     { workspace: "prepare", purpose: "Inspect one prepared dataset, apply temporary filters, and maintain its independent ordered recipe." },
@@ -1189,7 +1192,33 @@ export function createWebMcpToolBundles(contextRef, availability) {
 
 export async function registerWebMcpTools(modelContext, tools, signal) {
   if (typeof modelContext?.registerTool !== "function") return false;
-  for (const tool of tools) await modelContext.registerTool(tool, { signal });
+  for (const tool of tools) {
+    if (signal?.aborted) return false;
+    await modelContext.registerTool({
+      ...tool,
+      execute(input = {}) {
+        const normalizedFailure = (cause) => {
+          const hadCode = Boolean(cause?.code);
+          if (cause && typeof cause === "object") {
+            cause.code ??= cause instanceof SyntaxError ? "WEBMCP_EXECUTION_SYNTAX_ERROR" : "WEBMCP_EXECUTION_FAILED";
+            cause.phase ??= "handler";
+            cause.tool ??= tool.name;
+          }
+          if (!hadCode || cause instanceof SyntaxError) console.warn(`WebMCP tool execution failed: ${tool.name}`, cause);
+          return cause;
+        };
+        try {
+          const result = tool.execute(input);
+          return result && typeof result.then === "function"
+            ? result.catch((cause) => { throw normalizedFailure(cause); })
+            : result;
+        } catch (cause) {
+          throw normalizedFailure(cause);
+        }
+      },
+    }, { signal });
+    if (signal?.aborted) return false;
+  }
   return true;
 }
 
@@ -1198,9 +1227,11 @@ export function useWebMcpTools(context) {
   contextRef.current = context;
   const availability = {
     workspace: context.state.workspace,
-    hasDataset: Boolean(context.state.activeDataset),
-    hasPrepared: context.state.preparedInputs.length > 0,
-    hasComposeNodes: context.state.composeNodes.length > 0,
+    // Keep each workspace contract stable. Runtime preconditions report when a
+    // dataset or node is unavailable instead of churning registrations.
+    hasDataset: true,
+    hasPrepared: true,
+    hasComposeNodes: true,
   };
 
   useEffect(() => {
@@ -1247,5 +1278,5 @@ export function useWebMcpTools(context) {
       }
     });
     return () => controller.abort();
-  }, [availability.workspace, availability.hasComposeNodes, availability.hasDataset, availability.hasPrepared]);
+  }, [availability.workspace]);
 }

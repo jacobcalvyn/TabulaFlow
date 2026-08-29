@@ -250,6 +250,7 @@ export function normalizeMetricDefinition(definition, schema = []) {
   }
   return {
     id,
+    targetId: String(definition?.targetId ?? ""),
     name,
     function: fn,
     column,

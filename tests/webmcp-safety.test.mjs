@@ -14,7 +14,7 @@ import {
   restoreProtectedComposeOperation,
   restoreProtectedRecipeValues,
 } from "../src/agentDataProtection.js";
-import { deriveRecipeSemanticSchema, isSensitivityAtLeastAsStrict, reconcileSemanticModel } from "../src/semanticModel.js";
+import { deriveRecipeSemanticSchema, isSensitivityAtLeastAsStrict, normalizeMetricDefinition, reconcileSemanticModel } from "../src/semanticModel.js";
 
 test("sensitivity heuristics redact profile ranges for identifiers and free text", () => {
   const tracking = classifyColumnSemantics("Nomor Resi", "VARCHAR");
@@ -32,6 +32,11 @@ test("sensitivity heuristics redact profile ranges for identifiers and free text
   assert.equal(classifyColumnSemantics("Status Pengiriman", "VARCHAR").sensitivity, "non-sensitive");
   assert.equal(classifyColumnSemantics("Biaya Kirim", "VARCHAR").recommendedType, "DOUBLE");
   assert.equal(classifyColumnSemantics("Tanggal Kirim", "VARCHAR").recommendedType, "TIMESTAMP");
+});
+
+test("metric normalization preserves its stable target across persistence and listing", () => {
+  const metric = normalizeMetricDefinition({ targetId: "prepared-a", name: "Row count", function: "count" }, []);
+  assert.equal(metric.targetId, "prepared-a");
 });
 
 test("agent previews redact sensitive columns while preserving nulls and safe categories", () => {

@@ -2034,18 +2034,21 @@ export function App() {
   }, []);
 
   const commitFlow = useCallback(async (nextFlow, { semantic = true } = {}) => {
-    flowRef.current = nextFlow;
-    setFlow(nextFlow);
-    bumpWorkspaceRevision({ semantic });
+    const nextRevision = bumpWorkspaceRevision({ semantic });
+    const persistedFlow = nextFlow.workspaceRevision === nextRevision
+      ? nextFlow
+      : { ...nextFlow, workspaceRevision: nextRevision };
+    flowRef.current = persistedFlow;
+    setFlow(persistedFlow);
     if (flowHydratedRef.current) {
       try {
-        await saveStoredFlow(nextFlow);
+        await saveStoredFlow(persistedFlow);
         setFlowDirty(false);
       } catch {
         setFlowDirty(true);
       }
     }
-    return nextFlow;
+    return persistedFlow;
   }, [bumpWorkspaceRevision]);
 
   const runWebMcpMutation = useCallback(
@@ -2140,6 +2143,9 @@ export function App() {
         const consolidated = consolidateDuplicateFileSources(cleaned);
         await migrateConsolidatedSourceHandles(consolidated.sourceIdMap);
         const restored = markSourcesUnlinked(consolidated.graph);
+        const restoredWorkspaceRevision = Math.max(0, Number(restored.workspaceRevision) || 0);
+        workspaceRevisionRef.current = restoredWorkspaceRevision;
+        setWorkspaceRevision(restoredWorkspaceRevision);
         flowRef.current = restored;
         setFlow(restored);
       } catch {
@@ -2235,7 +2241,7 @@ export function App() {
         ? { ...node, validationStatus: "needs-validation", dataStatus: "stale", validationError: null }
         : node),
     };
-    await commitFlow(linkedFlow);
+    await commitFlow(linkedFlow, { semantic: !automatic });
     if (descendantIds.size) setComposePreview(null);
     if (handle) await saveStoredSourceHandle(source.id, handle);
     if (!automatic) setError("");
@@ -2282,7 +2288,7 @@ export function App() {
           setFlow(nextFlow);
         }
       }
-      await commitFlow(nextFlow);
+      await commitFlow(nextFlow, { semantic: false });
     })();
   }, [commitFlow, flowHydrated, relinkSource, worker.ready]);
 
@@ -2557,7 +2563,6 @@ export function App() {
   };
 
   const openPrepared = async (preparedId, beforeCommit = null, throwOnError = false) => {
-    const selectionChanged = preparedId !== activePreparedIdRef.current;
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === preparedId);
     const source = flowRef.current.sourceAssets.find((item) => item.id === prepared?.sourceAssetId);
     if (!prepared || !source) {
@@ -2591,7 +2596,7 @@ export function App() {
       await commitFlow(updatePreparedInput(flowRef.current, preparedId, {
         rowCount: result.rowCount,
         schema: result.columns.map((name) => ({ name, type: result.columnTypes?.[name] ?? null })),
-      }), { semantic: selectionChanged });
+      }), { semantic: false });
       setScreen("data");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("fileReadFailed"));
@@ -2716,7 +2721,7 @@ export function App() {
           updatedAt: new Date().toISOString(),
         }
         : nextFlow;
-      await commitFlow(committedFlow);
+      await commitFlow(committedFlow, { semantic: false });
       setComposePreview(preview);
     } catch (cause) {
       setComposePreview(null);
@@ -3025,7 +3030,13 @@ export function App() {
 
   const listMetricDefinitionsFromTool = async (targetId) => {
     await getSemanticModelFromTool(targetId);
-    return { targetId, metrics: structuredClone((flowRef.current.metricDefinitions ?? []).filter((item) => item.targetId === targetId)), workspaceRevision: workspaceRevisionRef.current };
+    const allMetrics = flowRef.current.metricDefinitions ?? [];
+    return {
+      targetId,
+      metrics: structuredClone(allMetrics.filter((item) => item.targetId === targetId)),
+      availableTargetIds: [...new Set(allMetrics.map((item) => item.targetId).filter(Boolean))],
+      workspaceRevision: workspaceRevisionRef.current,
+    };
   };
 
   const upsertMetricDefinitionFromTool = async (definition, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
@@ -3429,7 +3440,7 @@ export function App() {
 
   useWebMcpTools({
     state: {
-      contractVersion: "2.8",
+      contractVersion: "2.9",
       workspaceRevision,
       flowId: flow.id,
       flowRevision: flow.revision,

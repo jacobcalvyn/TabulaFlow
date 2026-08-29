@@ -61,6 +61,7 @@ export function createFlowGraph() {
     schemaVersion: FLOW_SCHEMA_VERSION,
     id: createId("flow"),
     revision: 0,
+    workspaceRevision: 0,
     activeNodeId: null,
     sourceAssets: [],
     preparedInputs: [],
@@ -376,7 +377,15 @@ function uniquePreparedName(graph, baseName) {
 
 export function createPreparedFromCompose(graph, composeNodeId) {
   const sourceNode = graph.composeNodes.find((item) => item.id === composeNodeId);
-  if (!sourceNode) throw new Error("Compose node tidak ditemukan.");
+  if (!sourceNode) {
+    const preparedNode = graph.preparedInputs.find((item) => item.id === composeNodeId);
+    const error = new Error(preparedNode
+      ? "Only an operation result can be promoted to a prepared dataset."
+      : `Compose node not found: ${composeNodeId}`);
+    error.code = preparedNode ? "OPERATION_NODE_REQUIRED" : "COMPOSE_NODE_NOT_FOUND";
+    error.actualKind = preparedNode ? "prepared-dataset" : "missing";
+    throw error;
+  }
   const sourceAssetId = createId("source");
   const preparedInputId = createId("prepared");
   const name = uniquePreparedName(graph, `${sourceNode.name} prepared`);

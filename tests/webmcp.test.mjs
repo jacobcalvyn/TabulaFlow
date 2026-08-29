@@ -139,7 +139,7 @@ test("WebMCP registers a small permanent core and only the active workspace bund
     const bundles = createWebMcpToolBundles(ref, { ...availability, workspace });
     assert.deepEqual(bundles.core.map((tool) => tool.name), WEBMCP_CORE_TOOL_NAMES);
     assert.equal(new Set([...bundles.core, ...bundles.workspace].map((tool) => tool.name)).size, bundles.core.length + bundles.workspace.length);
-    assert.ok(Buffer.byteLength(JSON.stringify([...bundles.core, ...bundles.workspace])) < 48 * 1024, `${workspace} WebMCP bundle exceeded its configuration budget`);
+    assert.ok(Buffer.byteLength(JSON.stringify([...bundles.core, ...bundles.workspace])) < 32 * 1024, `${workspace} WebMCP bundle exceeded its configuration budget`);
     if (expectedWorkspaceTools[workspace]) assert.deepEqual(bundles.workspace.map((tool) => tool.name), expectedWorkspaceTools[workspace]);
   }
 
@@ -183,7 +183,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "2.8");
+  assert.equal(capabilities.structuredContent.contractVersion, "2.9");
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");
@@ -285,8 +285,7 @@ test("WebMCP mutation schemas require collaboration metadata and conditional val
   assert.ok(filters.some((branch) => branch.required.includes("value")));
   assert.ok(filters.some((branch) => !Object.hasOwn(branch.properties, "value")));
   const aggregates = branches.filter((branch) => branch.properties.kind.const === "aggregate");
-  assert.equal(aggregates.length, 3);
-  assert.ok(aggregates.some((branch) => branch.required.includes("measureColumn")));
+  assert.equal(aggregates.length, 1);
   assert.ok(aggregates.some((branch) => branch.required.includes("metrics")));
   assert.equal(toolByName(tools, "tabulaflow_replace_recipe").inputSchema.properties.executionMode.default, "wait");
   const previewStep = toolByName(tools, "tabulaflow_preview_recipe_change").inputSchema.properties.recipe.items;
@@ -338,4 +337,39 @@ test("WebMCP registration is sequential, uses one lifecycle signal, and skips un
   assert.equal(await registerWebMcpTools(undefined, tools, controller.signal), false);
   controller.abort();
   assert.equal(registrations[0].options.signal.aborted, true);
+});
+
+test("WebMCP registration stops immediately when its lifecycle is aborted", async () => {
+  const { ref } = createContext();
+  const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
+  const controller = new AbortController();
+  const registrations = [];
+  const supported = await registerWebMcpTools({
+    async registerTool(tool) {
+      registrations.push(tool.name);
+      controller.abort();
+    },
+  }, tools, controller.signal);
+  assert.equal(supported, false);
+  assert.deepEqual(registrations, [tools[0].name]);
+});
+
+test("registered WebMCP tools annotate unexpected syntax failures at the handler boundary", async () => {
+  const controller = new AbortController();
+  let registered;
+  const previousWarn = console.warn;
+  console.warn = () => undefined;
+  try {
+    await registerWebMcpTools({ async registerTool(tool) { registered = tool; } }, [{
+      name: "tabulaflow_test_failure",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute() { throw new SyntaxError("missing ) after argument list"); },
+    }], controller.signal);
+    assert.throws(
+      () => registered.execute({}),
+      (error) => error.code === "WEBMCP_EXECUTION_SYNTAX_ERROR" && error.phase === "handler" && error.tool === "tabulaflow_test_failure",
+    );
+  } finally {
+    console.warn = previousWarn;
+  }
 });

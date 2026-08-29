@@ -893,22 +893,59 @@ async function profileComposeNodeQuality(graph, nodeId) {
   const affectedColumns = [];
   for (const batch of qualityProfileBatches(schema, QUALITY_PROFILE_BATCH_SIZE)) {
     const expressions = [];
+    const jsonProfiles = [];
     batch.forEach((column, index) => {
       const identifier = quoteIdentifier(column.name);
+      const normalizedType = String(column.type).toUpperCase();
       expressions.push(`COUNT(*) FILTER (WHERE ${identifier} IS NULL OR TRIM(CAST(${identifier} AS VARCHAR)) = '') AS missing_${index}`);
-      if (/VARCHAR|CHAR|TEXT/.test(String(column.type).toUpperCase())) {
+      if (/VARCHAR|CHAR|TEXT/.test(normalizedType)) {
         expressions.push(
           `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NOT NULL) AS numeric_${index}`,
           `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) IN ('true', 'false')) AS boolean_${index}`,
           `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) NOT IN ('true', 'false') AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DATE) IS NOT NULL) AS date_${index}`,
           `COUNT(*) FILTER (WHERE NULLIF(TRIM(${identifier}), '') IS NOT NULL AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DOUBLE) IS NULL AND LOWER(NULLIF(TRIM(${identifier}), '')) NOT IN ('true', 'false') AND TRY_CAST(NULLIF(TRIM(${identifier}), '') AS DATE) IS NULL) AS text_${index}`,
         );
-      }
+      } else if (normalizedType.includes("JSON")) jsonProfiles.push({ column, index });
     });
     const row = (await query(`SELECT ${expressions.join(", ")} FROM (${relation.sql}) AS compose_quality`))[0] ?? {};
+    const jsonProfileRows = jsonProfiles.length ? await query(jsonProfiles.map(({ column, index }) => {
+      const identifier = quoteIdentifier(column.name);
+      return `SELECT ${index} AS column_index, JSON_TYPE(${identifier}) AS source_type FROM (${relation.sql}) AS compose_json_quality WHERE ${identifier} IS NOT NULL GROUP BY source_type`;
+    }).join("\nUNION ALL\n")) : [];
+    const jsonTypesByColumn = new Map();
+    for (const profileRow of jsonProfileRows) {
+      const index = Number(profileRow.column_index);
+      const categories = jsonTypesByColumn.get(index) ?? new Set();
+      const sourceType = String(profileRow.source_type).toUpperCase();
+      if (["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL"].includes(sourceType)) categories.add("angka");
+      else if (sourceType === "BOOLEAN") categories.add("boolean");
+      else categories.add("teks");
+      jsonTypesByColumn.set(index, categories);
+    }
     batch.forEach((column, index) => {
       const missing = Number(row[`missing_${index}`] ?? 0);
-      const categories = ["numeric", "boolean", "date", "text"].filter((kind) => Number(row[`${kind}_${index}`] ?? 0) > 0);
+      const normalizedType = String(column.type).toUpperCase();
+      let categories = [];
+      if (/VARCHAR|CHAR|TEXT/.test(normalizedType)) {
+        categories = [
+          ["angka", "numeric"],
+          ["boolean", "boolean"],
+          ["tanggal", "date"],
+          ["teks", "text"],
+        ].filter(([, key]) => Number(row[`${key}_${index}`] ?? 0) > 0).map(([label]) => label);
+      } else if (normalizedType.includes("JSON")) {
+        categories = [...(jsonTypesByColumn.get(index) ?? new Set())];
+      } else if (normalizedType.includes("UNION")) {
+        categories = [
+          /INT|DECIMAL|DOUBLE|FLOAT/.test(normalizedType) && "angka",
+          normalizedType.includes("BOOLEAN") && "boolean",
+          /DATE|TIME/.test(normalizedType) && "tanggal",
+          /VARCHAR|CHAR/.test(normalizedType) && "teks",
+        ].filter(Boolean);
+        categories = [...new Set(categories)];
+      } else {
+        categories = [typeToUi(column.type)];
+      }
       const mixed = categories.length > 1;
       emptyCellCount += missing;
       if (mixed) mixedTypeColumnCount += 1;
