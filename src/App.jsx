@@ -3429,7 +3429,7 @@ export function App() {
 
   useWebMcpTools({
     state: {
-      contractVersion: "2.7",
+      contractVersion: "2.8",
       workspaceRevision,
       flowId: flow.id,
       flowRevision: flow.revision,

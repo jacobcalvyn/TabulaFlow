@@ -6,11 +6,11 @@ import { JSDOM } from "jsdom";
 import { useWebMcpTools } from "../src/useWebMcpTools.js";
 import { createWebMcpMutationRunner } from "../src/webMcpMutation.js";
 
-function state(revision, { compose = true } = {}) {
+function state(revision, { compose = true, workspace = "prepare" } = {}) {
   return {
-    contractVersion: "2.7",
+    contractVersion: "2.8",
     workspaceRevision: revision,
-    workspace: "prepare",
+    workspace,
     worker: { ready: true, recovering: false },
     flowDirty: false,
     diagnostics: [],
@@ -32,7 +32,7 @@ function Harness({ context }) {
   return null;
 }
 
-test("React WebMCP registration uses current context and aborts stale tool lifecycles", async (t) => {
+test("React WebMCP registration keeps core stable and rotates only the active workspace bundle", async (t) => {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "https://example.test" });
   const previousWindow = globalThis.window;
   const previousDocument = globalThis.document;
@@ -66,7 +66,10 @@ test("React WebMCP registration uses current context and aborts stale tool lifec
 
   const view = render(React.createElement(Harness, { context: { state: state(revision), actions } }));
   await waitFor(() => assert.ok(registry.has("tabulaflow_export_prepare")));
-  const firstSignal = registrations[0].signal;
+  const coreSignal = registrations.find(({ name }) => name === "tabulaflow_get_workspace_state").signal;
+  const prepareSignal = registrations.find(({ name }) => name === "tabulaflow_export_prepare").signal;
+  assert.notEqual(coreSignal, prepareSignal);
+  assert.equal(registry.has("tabulaflow_export_compose"), false);
   const exportTool = registry.get("tabulaflow_export_prepare");
   const args = { preparedId: "prepared-a", format: "csv", expectedRevision: 7, requestId: "registered-export-001" };
   await exportTool.execute(args);
@@ -75,15 +78,56 @@ test("React WebMCP registration uses current context and aborts stale tool lifec
 
   revision = 8;
   view.rerender(React.createElement(Harness, { context: { state: state(revision), actions } }));
+  assert.equal(coreSignal.aborted, false);
+  assert.equal(prepareSignal.aborted, false);
   assert.equal(registry.get("tabulaflow_get_workspace_state").execute({}).structuredContent.workspaceRevision, 8);
   await assert.rejects(
     () => exportTool.execute({ ...args, requestId: "registered-export-stale-001" }),
     (error) => error.code === "STALE_STATE",
   );
 
-  view.rerender(React.createElement(Harness, { context: { state: state(revision, { compose: false }), actions } }));
-  await waitFor(() => assert.equal(firstSignal.aborted, true));
-  const latestSignal = registrations.at(-1).signal;
+  view.rerender(React.createElement(Harness, { context: { state: state(revision, { workspace: "compose" }), actions } }));
+  await waitFor(() => assert.ok(registry.has("tabulaflow_export_compose")));
+  assert.equal(prepareSignal.aborted, true);
+  assert.equal(coreSignal.aborted, false);
+  const composeSignal = registrations.find(({ name }) => name === "tabulaflow_export_compose").signal;
   view.unmount();
-  assert.equal(latestSignal.aborted, true);
+  assert.equal(coreSignal.aborted, true);
+  assert.equal(composeSignal.aborted, true);
+});
+
+test("a workspace registration failure does not disable the WebMCP core", async (t) => {
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "https://example.test" });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousWarn = console.warn;
+  globalThis.window = dom.window;
+  globalThis.document = dom.window.document;
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args);
+  t.after(() => {
+    cleanup();
+    dom.window.close();
+    globalThis.window = previousWindow;
+    globalThis.document = previousDocument;
+    console.warn = previousWarn;
+  });
+
+  const registrations = [];
+  document.modelContext = {
+    async registerTool(tool, options) {
+      registrations.push({ name: tool.name, signal: options.signal });
+      if (tool.name === "tabulaflow_get_prepare_dataset") throw new Error("configuration limit exceeded");
+    },
+  };
+
+  const view = render(React.createElement(Harness, { context: { state: state(7), actions: {} } }));
+  await waitFor(() => assert.ok(warnings.length > 0));
+  const coreSignal = registrations.find(({ name }) => name === "tabulaflow_get_workspace_state").signal;
+  const workspaceSignal = registrations.find(({ name }) => name === "tabulaflow_get_prepare_dataset").signal;
+  assert.equal(coreSignal.aborted, false);
+  assert.equal(workspaceSignal.aborted, true);
+  assert.match(warnings[0][0], /prepare tool registration failed/);
+  view.unmount();
+  assert.equal(coreSignal.aborted, true);
 });

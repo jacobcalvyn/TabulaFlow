@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createWebMcpTools, registerWebMcpTools } from "../src/useWebMcpTools.js";
+import {
+  WEBMCP_CORE_TOOL_NAMES,
+  createWebMcpToolBundles,
+  createWebMcpTools,
+  registerWebMcpTools,
+} from "../src/useWebMcpTools.js";
 
 const REVISION = 7;
 const mutation = (requestId) => ({ expectedRevision: REVISION, requestId });
@@ -12,7 +17,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "2.7", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "2.8", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -122,6 +127,33 @@ test("WebMCP exposes contextual Agent-Ready v2 tools", () => {
   assert.equal(new Set(ALL_TOOL_NAMES).size, 56);
 });
 
+test("WebMCP registers a small permanent core and only the active workspace bundle", () => {
+  const { ref } = createContext();
+  const availability = { hasDataset: true, hasPrepared: true, hasComposeNodes: true };
+  const expectedWorkspaceTools = {
+    source: ["tabulaflow_request_source_file", "tabulaflow_request_source_relink"],
+    account: ["tabulaflow_list_cloud_files", "tabulaflow_open_cloud_file", "tabulaflow_request_cloud_upload"],
+  };
+
+  for (const workspace of ["source", "prepare", "compose", "account"]) {
+    const bundles = createWebMcpToolBundles(ref, { ...availability, workspace });
+    assert.deepEqual(bundles.core.map((tool) => tool.name), WEBMCP_CORE_TOOL_NAMES);
+    assert.equal(new Set([...bundles.core, ...bundles.workspace].map((tool) => tool.name)).size, bundles.core.length + bundles.workspace.length);
+    assert.ok(Buffer.byteLength(JSON.stringify([...bundles.core, ...bundles.workspace])) < 48 * 1024, `${workspace} WebMCP bundle exceeded its configuration budget`);
+    if (expectedWorkspaceTools[workspace]) assert.deepEqual(bundles.workspace.map((tool) => tool.name), expectedWorkspaceTools[workspace]);
+  }
+
+  const prepare = createWebMcpToolBundles(ref, { ...availability, workspace: "prepare" }).workspace.map((tool) => tool.name);
+  assert.ok(prepare.includes("tabulaflow_get_prepare_preview"));
+  assert.ok(prepare.includes("tabulaflow_add_recipe_step"));
+  assert.equal(prepare.includes("tabulaflow_get_compose_graph"), false);
+
+  const compose = createWebMcpToolBundles(ref, { ...availability, workspace: "compose" }).workspace.map((tool) => tool.name);
+  assert.ok(compose.includes("tabulaflow_get_compose_graph"));
+  assert.ok(compose.includes("tabulaflow_create_compose_operation"));
+  assert.equal(compose.includes("tabulaflow_add_recipe_step"), false);
+});
+
 test("WebMCP read plane observes workflow, Prepare data, and Compose data", async () => {
   const { calls, ref } = createContext();
   const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
@@ -151,7 +183,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "2.7");
+  assert.equal(capabilities.structuredContent.contractVersion, "2.8");
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");

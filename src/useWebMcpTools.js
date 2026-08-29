@@ -365,7 +365,7 @@ function filterSelection(raw) {
 }
 
 const WEBMCP_CAPABILITIES = Object.freeze({
-  contractVersion: "2.7",
+  contractVersion: "2.8",
   authenticationRequired: false,
   workspaces: ["source", "prepare", "compose", "account"],
   actions: [
@@ -417,7 +417,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
 });
 
 const WORKFLOW_GUIDE = Object.freeze({
-  contractVersion: "2.7",
+  contractVersion: "2.8",
   flow: [
     { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
     { workspace: "prepare", purpose: "Inspect one prepared dataset, apply temporary filters, and maintain its independent ordered recipe." },
@@ -441,6 +441,82 @@ const OPERATION_GUIDES = Object.freeze({
   "distinct-rows": { inputs: 1, purpose: "Keep one representative row per unique key or return only the projected distinct columns.", parameters: ["inputId", "columns", "mode?", "name?"], compatibility: "At least one existing column is required. representative-rows preserves the full schema; project-columns returns only comparison columns.", example: { kind: "distinct-rows", inputId: "prepared-orders", columns: ["tracking_id"], mode: "project-columns" }, undoable: "Update its configuration or delete the leaf operation." },
   pivot: { inputs: 1, purpose: "Turn distinct row values into columns using an aggregate.", parameters: ["inputId", "groupBy?", "pivotColumn", "valueColumn", "aggregate", "values", "name?"], compatibility: "Pivot/value columns and explicit pivot values must exist.", example: { kind: "pivot", inputId: "prepared-orders", groupBy: ["region"], pivotColumn: "status", valueColumn: "amount", aggregate: "sum", values: ["open", "closed"] }, undoable: "Update its configuration or delete the leaf operation." },
   unpivot: { inputs: 1, purpose: "Turn multiple value columns into field/value rows.", parameters: ["inputId", "idColumns?", "valueColumns", "fieldColumn", "valueColumn", "name?"], compatibility: "At least one value column is required and output names must not collide.", example: { kind: "unpivot", inputId: "prepared-costs", idColumns: ["id"], valueColumns: ["fee", "tax"], fieldColumn: "cost_type", valueColumn: "cost_value" }, undoable: "Update its configuration or delete the leaf operation." },
+});
+
+export const WEBMCP_CORE_TOOL_NAMES = Object.freeze([
+  "tabulaflow_get_workspace_state",
+  "tabulaflow_get_capabilities",
+  "tabulaflow_get_workflow_guide",
+  "tabulaflow_get_available_actions",
+  "tabulaflow_get_activity_log",
+  "tabulaflow_get_changes_since",
+  "tabulaflow_get_operation_status",
+  "tabulaflow_open_workspace",
+]);
+
+const WEBMCP_WORKSPACE_TOOL_NAMES = Object.freeze({
+  source: Object.freeze([
+    "tabulaflow_request_source_file",
+    "tabulaflow_request_source_relink",
+  ]),
+  prepare: Object.freeze([
+    "tabulaflow_get_calculation_catalog",
+    "tabulaflow_select_prepared_dataset",
+    "tabulaflow_get_recipe",
+    "tabulaflow_get_semantic_model",
+    "tabulaflow_update_semantic_field",
+    "tabulaflow_list_metric_definitions",
+    "tabulaflow_upsert_metric_definition",
+    "tabulaflow_delete_metric_definition",
+    "tabulaflow_replace_recipe",
+    "tabulaflow_duplicate_prepared_dataset",
+    "tabulaflow_get_prepare_dataset",
+    "tabulaflow_get_data_profile",
+    "tabulaflow_query_column_values",
+    "tabulaflow_get_prepare_preview",
+    "tabulaflow_preview_recipe_change",
+    "tabulaflow_set_aggregate_columns",
+    "tabulaflow_set_preview_filter",
+    "tabulaflow_remove_preview_filter",
+    "tabulaflow_clear_preview_filters",
+    "tabulaflow_export_prepare",
+    "tabulaflow_add_recipe_step",
+    "tabulaflow_request_delete_all_recipe_steps",
+    "tabulaflow_update_recipe_step",
+    "tabulaflow_set_recipe_step_enabled",
+    "tabulaflow_move_recipe_step",
+    "tabulaflow_undo_recipe",
+    "tabulaflow_redo_recipe",
+    "tabulaflow_apply_value_action",
+    "tabulaflow_request_delete",
+  ]),
+  compose: Object.freeze([
+    "tabulaflow_describe_operation",
+    "tabulaflow_get_semantic_model",
+    "tabulaflow_update_semantic_field",
+    "tabulaflow_list_metric_definitions",
+    "tabulaflow_upsert_metric_definition",
+    "tabulaflow_delete_metric_definition",
+    "tabulaflow_get_compose_graph",
+    "tabulaflow_get_compose_node",
+    "tabulaflow_get_node_preview",
+    "tabulaflow_get_compose_node_quality",
+    "tabulaflow_validate_compose_operation",
+    "tabulaflow_get_connection_options",
+    "tabulaflow_select_compose_node",
+    "tabulaflow_auto_arrange_compose",
+    "tabulaflow_move_compose_node",
+    "tabulaflow_export_compose",
+    "tabulaflow_create_compose_operation",
+    "tabulaflow_update_compose_operation",
+    "tabulaflow_promote_compose_result",
+    "tabulaflow_request_delete",
+  ]),
+  account: Object.freeze([
+    "tabulaflow_list_cloud_files",
+    "tabulaflow_open_cloud_file",
+    "tabulaflow_request_cloud_upload",
+  ]),
 });
 
 export function createWebMcpTools(contextRef, availability) {
@@ -1101,6 +1177,16 @@ export function createWebMcpTools(contextRef, availability) {
   return tools;
 }
 
+export function createWebMcpToolBundles(contextRef, availability) {
+  const allTools = createWebMcpTools(contextRef, availability);
+  const coreNames = new Set(WEBMCP_CORE_TOOL_NAMES);
+  const workspaceNames = new Set(WEBMCP_WORKSPACE_TOOL_NAMES[availability.workspace] ?? []);
+  return {
+    core: allTools.filter((tool) => coreNames.has(tool.name)),
+    workspace: allTools.filter((tool) => workspaceNames.has(tool.name)),
+  };
+}
+
 export async function registerWebMcpTools(modelContext, tools, signal) {
   if (typeof modelContext?.registerTool !== "function") return false;
   for (const tool of tools) await modelContext.registerTool(tool, { signal });
@@ -1111,6 +1197,7 @@ export function useWebMcpTools(context) {
   const contextRef = useRef(context);
   contextRef.current = context;
   const availability = {
+    workspace: context.state.workspace,
     hasDataset: Boolean(context.state.activeDataset),
     hasPrepared: context.state.preparedInputs.length > 0,
     hasComposeNodes: context.state.composeNodes.length > 0,
@@ -1126,13 +1213,39 @@ export function useWebMcpTools(context) {
     if (typeof modelContext?.registerTool !== "function") return undefined;
 
     const controller = new AbortController();
-    const tools = createWebMcpTools(contextRef, availability);
-    void registerWebMcpTools(modelContext, tools, controller.signal).catch((error) => {
+    const { core } = createWebMcpToolBundles(contextRef, {
+      workspace: "source",
+      hasDataset: false,
+      hasPrepared: false,
+      hasComposeNodes: false,
+    });
+    void registerWebMcpTools(modelContext, core, controller.signal).catch((error) => {
       if (!controller.signal.aborted) {
         controller.abort();
-        console.warn("WebMCP tool registration failed.", error);
+        console.warn("WebMCP core tool registration failed.", error);
       }
     });
     return () => controller.abort();
-  }, [availability.hasComposeNodes, availability.hasDataset, availability.hasPrepared]);
+  }, []);
+
+  useEffect(() => {
+    let modelContext;
+    try {
+      modelContext = document.modelContext;
+    } catch {
+      return undefined;
+    }
+    if (typeof modelContext?.registerTool !== "function") return undefined;
+
+    const controller = new AbortController();
+    const { workspace } = createWebMcpToolBundles(contextRef, availability);
+    if (!workspace.length) return () => controller.abort();
+    void registerWebMcpTools(modelContext, workspace, controller.signal).catch((error) => {
+      if (!controller.signal.aborted) {
+        controller.abort();
+        console.warn(`WebMCP ${availability.workspace} tool registration failed.`, error);
+      }
+    });
+    return () => controller.abort();
+  }, [availability.workspace, availability.hasComposeNodes, availability.hasDataset, availability.hasPrepared]);
 }
