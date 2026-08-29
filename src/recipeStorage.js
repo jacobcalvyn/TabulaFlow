@@ -3,8 +3,9 @@ const STORE_NAME = "recipes";
 const FLOW_STORE_NAME = "flows";
 const SOURCE_HANDLE_STORE_NAME = "source-handles";
 const ACTIVITY_STORE_NAME = "activity-events";
+const WEBMCP_OPERATION_STORE_NAME = "webmcp-operations";
 const ACTIVE_FLOW_KEY = "active-flow";
-const DATABASE_VERSION = 4;
+const DATABASE_VERSION = 5;
 const saveQueues = new Map();
 
 function openDatabase() {
@@ -24,6 +25,11 @@ function openDatabase() {
         const activityStore = request.result.createObjectStore(ACTIVITY_STORE_NAME, { keyPath: "sequence", autoIncrement: true });
         activityStore.createIndex("flowId", "flowId", { unique: false });
         activityStore.createIndex("targetId", "targetId", { unique: false });
+      }
+      if (!request.result.objectStoreNames.contains(WEBMCP_OPERATION_STORE_NAME)) {
+        const operationStore = request.result.createObjectStore(WEBMCP_OPERATION_STORE_NAME, { keyPath: "operationId" });
+        operationStore.createIndex("flowId", "flowId", { unique: false });
+        operationStore.createIndex("requestId", "requestId", { unique: false });
       }
     });
     request.addEventListener("success", () => resolve(request.result));
@@ -84,13 +90,66 @@ export async function clearStoredWorkspaceData() {
         STORE_NAME,
         SOURCE_HANDLE_STORE_NAME,
         ACTIVITY_STORE_NAME,
+        WEBMCP_OPERATION_STORE_NAME,
       ], "readwrite");
       transaction.objectStore(STORE_NAME).clear();
       transaction.objectStore(SOURCE_HANDLE_STORE_NAME).clear();
       transaction.objectStore(ACTIVITY_STORE_NAME).clear();
+      transaction.objectStore(WEBMCP_OPERATION_STORE_NAME).clear();
       transaction.addEventListener("complete", () => resolve());
       transaction.addEventListener("error", () => reject(transaction.error ?? new Error("Stored workspace data could not be cleared.")));
       transaction.addEventListener("abort", () => reject(transaction.error ?? new Error("Stored workspace reset was aborted.")));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function writeStoredWebMcpOperation(operation) {
+  if (!operation?.operationId || !operation?.flowId) return;
+  const database = await openDatabase();
+  try {
+    await new Promise((resolve, reject) => {
+      const request = database.transaction(WEBMCP_OPERATION_STORE_NAME, "readwrite")
+        .objectStore(WEBMCP_OPERATION_STORE_NAME)
+        .put(structuredClone(operation));
+      request.addEventListener("success", () => resolve());
+      request.addEventListener("error", () => reject(request.error ?? new Error("WebMCP operation could not be saved.")));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+export function saveStoredWebMcpOperation(operation) {
+  if (!operation?.operationId || !operation?.flowId) return Promise.resolve();
+  const queueKey = `webmcp-operation:${operation.operationId}`;
+  const previous = saveQueues.get(queueKey) ?? Promise.resolve();
+  const next = previous
+    .catch(() => undefined)
+    .then(() => writeStoredWebMcpOperation(operation));
+  saveQueues.set(queueKey, next);
+  return next.finally(() => {
+    if (saveQueues.get(queueKey) === next) saveQueues.delete(queueKey);
+  });
+}
+
+export async function loadStoredWebMcpOperations(flowId, limit = 200) {
+  if (!flowId) return [];
+  const database = await openDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = database.transaction(WEBMCP_OPERATION_STORE_NAME, "readonly")
+        .objectStore(WEBMCP_OPERATION_STORE_NAME)
+        .index("flowId")
+        .getAll(flowId);
+      request.addEventListener("success", () => {
+        const records = (request.result ?? [])
+          .sort((left, right) => String(right.acceptedAt ?? "").localeCompare(String(left.acceptedAt ?? "")))
+          .slice(0, Math.max(1, limit));
+        resolve(records);
+      });
+      request.addEventListener("error", () => reject(request.error ?? new Error("WebMCP operations could not be read.")));
     });
   } finally {
     database.close();

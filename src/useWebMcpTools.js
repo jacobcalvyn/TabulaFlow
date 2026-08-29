@@ -1,6 +1,63 @@
 import { useEffect, useRef } from "react";
 import { CALCULATION_CATALOG, FORMULA_EXPRESSION_VERSION } from "./formulaEngine.js";
 
+const WEBMCP_RUNTIME_HEALTH = new WeakMap();
+
+function runtimeHealthFor(contextRef) {
+  let health = WEBMCP_RUNTIME_HEALTH.get(contextRef);
+  if (health) return health;
+  const failures = new Map();
+  health = {
+    record(toolName, cause) {
+      if (!(cause instanceof SyntaxError) && cause?.code !== "WEBMCP_EXECUTION_SYNTAX_ERROR") return;
+      const previous = failures.get(toolName);
+      failures.set(toolName, {
+        tool: toolName,
+        code: "WEBMCP_EXECUTION_SYNTAX_ERROR",
+        phase: cause?.phase ?? "handler",
+        count: (previous?.count ?? 0) + 1,
+        firstSeenAt: previous?.firstSeenAt ?? new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+      });
+    },
+    clear(toolName) {
+      failures.delete(toolName);
+    },
+    snapshot() {
+      const degradedTools = [...failures.values()].sort((left, right) => left.tool.localeCompare(right.tool));
+      return {
+        status: degradedTools.length ? "degraded" : "available",
+        degradedTools,
+      };
+    },
+  };
+  WEBMCP_RUNTIME_HEALTH.set(contextRef, health);
+  return health;
+}
+
+const ACTION_TOOL_DEPENDENCIES = Object.freeze({
+  "formula-column": ["tabulaflow_preview_recipe_change", "tabulaflow_add_recipe_step", "tabulaflow_replace_recipe"],
+  recipe: ["tabulaflow_preview_recipe_change", "tabulaflow_add_recipe_step", "tabulaflow_replace_recipe"],
+  duplicate: ["tabulaflow_duplicate_prepared_dataset"],
+  export: ["tabulaflow_export_prepare", "tabulaflow_export_compose"],
+  "create-operation": ["tabulaflow_create_compose_operation"],
+  "create-unary-operation": ["tabulaflow_create_compose_operation"],
+  "connect-binary-operation": ["tabulaflow_create_compose_operation"],
+  update: ["tabulaflow_update_compose_operation"],
+});
+
+function applyRuntimeHealthToActions(result, health) {
+  const degradedNames = new Set((health.degradedTools ?? []).map((item) => item.tool));
+  const unavailableActions = [];
+  const actions = (result.actions ?? []).filter((action) => {
+    const failedTools = (ACTION_TOOL_DEPENDENCIES[action] ?? []).filter((name) => degradedNames.has(name));
+    if (!failedTools.length) return true;
+    unavailableActions.push({ action, reason: "runtime-degraded", failedTools });
+    return false;
+  });
+  return { ...result, actions, unavailableActions, runtimeHealth: health };
+}
+
 const EMPTY_INPUT_SCHEMA = Object.freeze({
   type: "object",
   properties: {},
@@ -257,6 +314,11 @@ const COMPOSE_PREVIEW_SCHEMA = Object.freeze(strictObject({
   limit: { type: "integer", minimum: 1, maximum: 20, default: 20 },
 }, ["nodeId", "columns"]));
 const COMPOSE_QUALITY_SCHEMA = Object.freeze(strictObject({ nodeId: ID }));
+const COMPOSE_SCHEMA_PAGE_SCHEMA = Object.freeze(strictObject({
+  nodeId: ID,
+  offset: { type: "integer", minimum: 0, default: 0 },
+  limit: { type: "integer", minimum: 1, maximum: 100, default: 100 },
+}, ["nodeId"]));
 const OPERATION_STATUS_SCHEMA = Object.freeze(strictObject({ operationId: ID }));
 const SEMANTIC_MODEL_SCHEMA = Object.freeze(strictObject({ targetId: ID }));
 const UPDATE_SEMANTIC_FIELD_SCHEMA = Object.freeze(strictObject({
@@ -303,6 +365,7 @@ const UPDATE_COMPOSE_OPERATION_SCHEMA = Object.freeze(strictObject({
   executionMode: MUTATION_EXECUTION_MODE,
 }, ["nodeId", "operation", "expectedRevision", "requestId"]));
 const SOURCE_RELINK_SCHEMA = Object.freeze(strictObject({ sourceAssetId: ID }));
+const RESET_ALL_SCHEMA = Object.freeze(strictObject({ ...MUTATION_META }));
 const CLOUD_FILE_SCHEMA = Object.freeze(strictObject({ fileId: ID, ...MUTATION_META }));
 
 const FILTER_MUTATION_SCHEMA = Object.freeze(strictObject({
@@ -368,13 +431,14 @@ function filterSelection(raw) {
 }
 
 const WEBMCP_CAPABILITIES = Object.freeze({
-  contractVersion: "2.9",
+  contractVersion: "3.0",
   authenticationRequired: false,
   workspaces: ["source", "prepare", "compose", "account"],
   actions: [
     "inspect-workspace",
     "navigate-workspace",
     "request-local-file-selection",
+    "request-reset-all",
     "filter-preview",
     "export-prepare",
     "manage-recipe",
@@ -392,6 +456,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     "remove-one-preview-filter",
     "inspect-compose-graph",
     "inspect-compose-node-preview",
+    "inspect-compose-node-schema",
     "inspect-compatible-connections",
     "validate-compose-operation",
     "update-compose-operation",
@@ -416,11 +481,12 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     semanticDeclassification: "visible-user-action-required",
     recipeLiterals: "opaque-preserve-only",
     exports: "revision-and-idempotency-required",
+    idempotency: "flow-scoped-and-persistent-across-reload",
   },
 });
 
 const WORKFLOW_GUIDE = Object.freeze({
-  contractVersion: "2.9",
+  contractVersion: "3.0",
   flow: [
     { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
     { workspace: "prepare", purpose: "Inspect one prepared dataset, apply temporary filters, and maintain its independent ordered recipe." },
@@ -428,7 +494,7 @@ const WORKFLOW_GUIDE = Object.freeze({
   ],
   collaboration: {
     observeBeforeActing: "Read workspace state and the target dataset or node immediately before a mutation.",
-    concurrency: "Pass the latest workspaceRevision as expectedRevision and a unique requestId with every mutation or export side effect.",
+    concurrency: "Pass the latest workspaceRevision as expectedRevision and a unique requestId with every mutation or export side effect. Operation and idempotency status persist for the active flow across page reloads.",
     visibility: "Every successful action updates the same visible state used by the user.",
     activity: "UI and WebMCP changes share one privacy-safe persistent ledger. Read it before continuing after user interaction.",
     userControlled: ["local file selection", "source relinking", "cloud upload file selection", "deletion confirmation"],
@@ -461,6 +527,7 @@ const WEBMCP_WORKSPACE_TOOL_NAMES = Object.freeze({
   source: Object.freeze([
     "tabulaflow_request_source_file",
     "tabulaflow_request_source_relink",
+    "tabulaflow_request_reset_all",
   ]),
   prepare: Object.freeze([
     "tabulaflow_get_calculation_catalog",
@@ -502,6 +569,7 @@ const WEBMCP_WORKSPACE_TOOL_NAMES = Object.freeze({
     "tabulaflow_delete_metric_definition",
     "tabulaflow_get_compose_graph",
     "tabulaflow_get_compose_node",
+    "tabulaflow_get_node_schema",
     "tabulaflow_get_node_preview",
     "tabulaflow_get_compose_node_quality",
     "tabulaflow_validate_compose_operation",
@@ -523,6 +591,7 @@ const WEBMCP_WORKSPACE_TOOL_NAMES = Object.freeze({
 });
 
 export function createWebMcpTools(contextRef, availability) {
+  const runtimeHealth = runtimeHealthFor(contextRef);
   const tools = [{
     name: "tabulaflow_get_workspace_state",
     title: "Get TabulaFlow workspace state",
@@ -540,7 +609,10 @@ export function createWebMcpTools(contextRef, availability) {
     inputSchema: EMPTY_INPUT_SCHEMA,
     annotations: { readOnlyHint: true },
     execute() {
-      return webMcpResult("TabulaFlow WebMCP is available without login. Local file selection and deletion remain under user control.", WEBMCP_CAPABILITIES);
+      return webMcpResult("TabulaFlow WebMCP is available without login. Local file selection and deletion remain under user control.", {
+        ...WEBMCP_CAPABILITIES,
+        runtimeHealth: runtimeHealth.snapshot(),
+      });
     },
   }, {
     name: "tabulaflow_get_workflow_guide",
@@ -578,7 +650,7 @@ export function createWebMcpTools(contextRef, availability) {
     async execute({ targetId }) {
       const { actions } = activeContext(contextRef);
       const result = await actions.getAvailableActions(targetId);
-      return webMcpResult("Returned the actions available in the current context.", result);
+      return webMcpResult("Returned the actions available in the current context.", applyRuntimeHealthToActions(result, runtimeHealth.snapshot()));
     },
   }, {
     name: "tabulaflow_get_activity_log",
@@ -645,6 +717,17 @@ export function createWebMcpTools(contextRef, availability) {
       const { actions } = activeContext(contextRef);
       await actions.requestSourceRelink(sourceAssetId);
       return webMcpResult("The source Re-link control is ready for the user.", { sourceAssetId, awaitingUser: true });
+    },
+  }, {
+    name: "tabulaflow_request_reset_all",
+    title: "Request a complete flow reset",
+    description: "Open Source and show the visible Reset all confirmation. This requests deletion of every source, Prepare recipe, filter, and Compose node in the current flow, but never confirms the destructive action for the user.",
+    inputSchema: RESET_ALL_SCHEMA,
+    annotations: { readOnlyHint: false, destructiveHint: true },
+    async execute({ expectedRevision, requestId }) {
+      const { actions } = activeContext(contextRef);
+      const result = await actions.requestResetAll({ expectedRevision, requestId });
+      return webMcpResult("Reset all is waiting for visible user confirmation in Source.", result);
     },
   }, {
     name: "tabulaflow_list_cloud_files",
@@ -1007,7 +1090,7 @@ export function createWebMcpTools(contextRef, availability) {
     tools.push({
       name: "tabulaflow_get_compose_graph",
       title: "Get the Compose graph",
-      description: "Read the complete Compose graph including node schemas, configs, edges, positions, revisions, and validation/data status.",
+      description: "Read a compact Compose graph summary with node IDs, counts, positions, statuses, and edges. Use tabulaflow_get_node_schema and tabulaflow_get_compose_node for paged schema and protected configuration details.",
       inputSchema: EMPTY_INPUT_SCHEMA,
       annotations: { readOnlyHint: true, untrustedContentHint: true },
       async execute() {
@@ -1018,13 +1101,24 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_get_compose_node",
       title: "Get one Compose node",
-      description: "Read one dataset or operation node including its full schema, configuration, inputs, result counts, and status.",
+      description: "Read one compact dataset or operation node including protected configuration, inputs, result counts, and status. Schema is available separately through tabulaflow_get_node_schema.",
       inputSchema: COMPOSE_NODE_INPUT_SCHEMA,
       annotations: { readOnlyHint: true, untrustedContentHint: true },
       async execute({ nodeId }) {
         const { actions } = activeContext(contextRef);
         const result = await actions.getComposeNode(nodeId);
         return webMcpResult(`Read Compose node ${result.name}.`, result);
+      },
+    }, {
+      name: "tabulaflow_get_node_schema",
+      title: "Read a Compose node schema page",
+      description: "Read up to 100 schema columns for one dataset or operation node. Use offset pagination until hasMore is false instead of requesting the entire schema through the graph.",
+      inputSchema: COMPOSE_SCHEMA_PAGE_SCHEMA,
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
+      async execute({ nodeId, offset = 0, limit = 100 }) {
+        const { actions } = activeContext(contextRef);
+        const result = await actions.getComposeNodeSchema(nodeId, { offset, limit });
+        return webMcpResult(`Returned ${result.columns.length} schema columns for Compose node ${nodeId}.`, result);
       },
     }, {
       name: "tabulaflow_get_node_preview",
@@ -1177,7 +1271,25 @@ export function createWebMcpTools(contextRef, availability) {
     });
   }
 
-  return tools;
+  return tools.map((tool) => ({
+    ...tool,
+    async execute(input = {}) {
+      try {
+        const result = await tool.execute(input);
+        runtimeHealth.clear(tool.name);
+        return result;
+      } catch (cause) {
+        if (cause && typeof cause === "object") {
+          cause.code ??= cause instanceof SyntaxError ? "WEBMCP_EXECUTION_SYNTAX_ERROR" : "WEBMCP_EXECUTION_FAILED";
+          cause.phase ??= "handler";
+          cause.tool ??= tool.name;
+          if (typeof input?.requestId === "string") cause.requestId ??= input.requestId;
+        }
+        runtimeHealth.record(tool.name, cause);
+        throw cause;
+      }
+    },
+  }));
 }
 
 export function createWebMcpToolBundles(contextRef, availability) {
@@ -1190,28 +1302,29 @@ export function createWebMcpToolBundles(contextRef, availability) {
   };
 }
 
-export async function registerWebMcpTools(modelContext, tools, signal) {
+export async function registerWebMcpTools(modelContext, tools, signal, { onExecutionFailure, onExecutionSuccess } = {}) {
   if (typeof modelContext?.registerTool !== "function") return false;
   for (const tool of tools) {
     if (signal?.aborted) return false;
     await modelContext.registerTool({
       ...tool,
-      execute(input = {}) {
+      async execute(input = {}) {
         const normalizedFailure = (cause) => {
           const hadCode = Boolean(cause?.code);
           if (cause && typeof cause === "object") {
             cause.code ??= cause instanceof SyntaxError ? "WEBMCP_EXECUTION_SYNTAX_ERROR" : "WEBMCP_EXECUTION_FAILED";
             cause.phase ??= "handler";
             cause.tool ??= tool.name;
+            if (typeof input?.requestId === "string") cause.requestId ??= input.requestId;
           }
+          onExecutionFailure?.(tool.name, cause);
           if (!hadCode || cause instanceof SyntaxError) console.warn(`WebMCP tool execution failed: ${tool.name}`, cause);
           return cause;
         };
         try {
-          const result = tool.execute(input);
-          return result && typeof result.then === "function"
-            ? result.catch((cause) => { throw normalizedFailure(cause); })
-            : result;
+          const result = await tool.execute(input);
+          onExecutionSuccess?.(tool.name);
+          return result;
         } catch (cause) {
           throw normalizedFailure(cause);
         }

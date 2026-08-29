@@ -92,3 +92,21 @@ test("Reset all is hidden for an already empty flow", () => {
   assert.equal(view.queryByRole("button", { name: "Reset all" }), null);
   view.unmount();
 });
+
+test("a WebMCP Reset all request opens the same visible confirmation and can be cancelled", async () => {
+  const resolutions = [];
+  let resetCount = 0;
+  let view;
+  await act(async () => {
+    view = renderSource({
+      resetRequest: { token: "reset-token", requestId: "reset-request-001" },
+      onResetRequestResolved: (token, outcome) => resolutions.push({ token, outcome }),
+      onResetAll: async () => { resetCount += 1; return true; },
+    });
+  });
+  assert.ok(view.getByRole("alertdialog", { name: "Reset the entire flow?" }));
+  fireEvent.click(view.getByRole("button", { name: "Cancel" }));
+  assert.equal(resetCount, 0);
+  assert.deepEqual(resolutions, [{ token: "reset-token", outcome: "cancelled" }]);
+  view.unmount();
+});

@@ -136,3 +136,52 @@ test("a cancelled confirmation remains terminal for the original request", async
   const replay = await run(meta, async () => ({ pendingConfirmation: true }), "delete:prepared-a");
   assert.deepEqual(replay, { target: "prepared-dataset", targetId: "prepared-a", pendingConfirmation: false, requestId: meta.requestId, status: "cancelled" });
 });
+
+test("hydrates committed mutation results across a runner reload", async () => {
+  const stored = new Map();
+  const options = {
+    getRevision: () => 6,
+    getFlowId: () => "flow-a",
+    persistOperation: async (operation) => stored.set(operation.operationId, structuredClone(operation)),
+  };
+  const first = createWebMcpMutationRunner(options);
+  const meta = { expectedRevision: 6, requestId: "durable-commit-001" };
+  const committed = await first(meta, async () => ({ value: 42 }), "recipe:durable");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  let reexecuted = false;
+  const restored = createWebMcpMutationRunner(options);
+  restored.hydrate([...stored.values()]);
+  const replay = await restored(meta, async () => { reexecuted = true; return { value: 99 }; }, "recipe:durable");
+  assert.equal(reexecuted, false);
+  assert.deepEqual(replay, committed);
+});
+
+test("marks non-terminal persisted mutations as interrupted after reload", async () => {
+  const stored = [];
+  const restored = createWebMcpMutationRunner({
+    getRevision: () => 9,
+    getFlowId: () => "flow-a",
+    persistOperation: async (operation) => stored.push(structuredClone(operation)),
+  });
+  restored.hydrate([{
+    operationId: "operation-interrupted",
+    requestId: "durable-running-001",
+    fingerprint: "compose:create",
+    flowId: "flow-a",
+    executionMode: "async",
+    status: "running",
+    acceptedAt: "2026-08-30T00:00:00.000Z",
+    startedAt: "2026-08-30T00:00:01.000Z",
+    completedAt: null,
+    result: null,
+    error: null,
+  }]);
+  const status = restored.getOperationStatus("operation-interrupted");
+  assert.equal(status.status, "failed");
+  assert.equal(status.error.code, "OPERATION_INTERRUPTED_BY_RELOAD");
+  await assert.rejects(
+    () => restored({ expectedRevision: 9, requestId: "durable-running-001", executionMode: "async" }, async () => ({ ok: true }), "compose:create"),
+    (error) => error.code === "OPERATION_INTERRUPTED_BY_RELOAD",
+  );
+});

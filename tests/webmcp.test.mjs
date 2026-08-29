@@ -17,7 +17,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "2.8", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "3.0", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -45,6 +45,7 @@ function createContext() {
         async openWorkspace(workspace) { calls.push(["workspace", workspace]); return { workspace, workspaceRevision: REVISION, activityCursor: 12, activePreparedId: "prepared-a", activeNodeId: "operation-a" }; },
         async requestSourceFileSelection() { calls.push(["file"]); },
         async requestSourceRelink(sourceAssetId) { calls.push(["relink", sourceAssetId]); },
+        async requestResetAll(meta) { calls.push(["reset-all", meta]); return result({ pendingConfirmation: true }); },
         async listCloudFiles() { calls.push(["cloud-list"]); return { authenticated: true, files: [{ id: "cloud-a" }] }; },
         async openCloudFile(fileId, meta) { calls.push(["cloud-open", fileId, meta]); return result({ fileId, name: "orders.csv" }); },
         async requestCloudUpload() { calls.push(["cloud-upload"]); },
@@ -73,6 +74,7 @@ function createContext() {
         async applyValueAction(preparedId, action, column, value, meta) { calls.push(["value-action", preparedId, action, column, value, meta]); return result({ action, column, value }); },
         async getComposeGraph() { calls.push(["graph"]); return { nodes: [{ id: "operation-a" }], edges: [], workspaceRevision: REVISION }; },
         async getComposeNode(nodeId) { calls.push(["compose-node", nodeId]); return { id: nodeId, name: "Filtered orders" }; },
+        async getComposeNodeSchema(nodeId, options) { calls.push(["node-schema", nodeId, options]); return { nodeId, columns: [{ name: "status", type: "VARCHAR" }], totalColumnCount: 1, hasMore: false }; },
         async getComposeNodePreview(nodeId, columns, options) { calls.push(["node-preview", nodeId, columns, options]); return { previewRowCount: 1, rows: [{ status: "open" }] }; },
         async getComposeNodeQuality(nodeId) { calls.push(["node-quality", nodeId]); return { nodeId, emptyCellCount: 0, mixedTypeColumnCount: 0 }; },
         async validateComposeOperation(operation, options) { calls.push(["validate", operation, options]); return { valid: true, output: { rowCount: 4, columnCount: 2 }, schemaDelta: {}, diagnostics: [] }; },
@@ -100,7 +102,7 @@ const GLOBAL_TOOL_NAMES = [
   "tabulaflow_get_workspace_state", "tabulaflow_get_capabilities", "tabulaflow_get_workflow_guide", "tabulaflow_get_calculation_catalog",
   "tabulaflow_describe_operation", "tabulaflow_get_available_actions", "tabulaflow_get_activity_log",
   "tabulaflow_get_changes_since", "tabulaflow_get_operation_status", "tabulaflow_open_workspace",
-  "tabulaflow_request_source_file", "tabulaflow_request_source_relink", "tabulaflow_list_cloud_files",
+  "tabulaflow_request_source_file", "tabulaflow_request_source_relink", "tabulaflow_request_reset_all", "tabulaflow_list_cloud_files",
   "tabulaflow_open_cloud_file", "tabulaflow_request_cloud_upload",
 ];
 
@@ -112,7 +114,7 @@ const ALL_TOOL_NAMES = [
   "tabulaflow_remove_preview_filter", "tabulaflow_clear_preview_filters", "tabulaflow_export_prepare",
   "tabulaflow_add_recipe_step", "tabulaflow_request_delete_all_recipe_steps", "tabulaflow_update_recipe_step", "tabulaflow_set_recipe_step_enabled",
   "tabulaflow_move_recipe_step", "tabulaflow_undo_recipe", "tabulaflow_redo_recipe", "tabulaflow_apply_value_action",
-  "tabulaflow_get_compose_graph", "tabulaflow_get_compose_node", "tabulaflow_get_node_preview", "tabulaflow_get_compose_node_quality",
+  "tabulaflow_get_compose_graph", "tabulaflow_get_compose_node", "tabulaflow_get_node_schema", "tabulaflow_get_node_preview", "tabulaflow_get_compose_node_quality",
   "tabulaflow_validate_compose_operation", "tabulaflow_get_connection_options", "tabulaflow_select_compose_node",
   "tabulaflow_auto_arrange_compose", "tabulaflow_move_compose_node", "tabulaflow_export_compose",
   "tabulaflow_create_compose_operation", "tabulaflow_update_compose_operation", "tabulaflow_promote_compose_result",
@@ -124,14 +126,14 @@ test("WebMCP exposes contextual Agent-Ready v2 tools", () => {
   assert.deepEqual(createWebMcpTools(ref, { hasDataset: false, hasPrepared: false, hasComposeNodes: false }).map((tool) => tool.name), GLOBAL_TOOL_NAMES);
   const allTools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   assert.deepEqual(allTools.map((tool) => tool.name), ALL_TOOL_NAMES);
-  assert.equal(new Set(ALL_TOOL_NAMES).size, 56);
+  assert.equal(new Set(ALL_TOOL_NAMES).size, 58);
 });
 
 test("WebMCP registers a small permanent core and only the active workspace bundle", () => {
   const { ref } = createContext();
   const availability = { hasDataset: true, hasPrepared: true, hasComposeNodes: true };
   const expectedWorkspaceTools = {
-    source: ["tabulaflow_request_source_file", "tabulaflow_request_source_relink"],
+    source: ["tabulaflow_request_source_file", "tabulaflow_request_source_relink", "tabulaflow_request_reset_all"],
     account: ["tabulaflow_list_cloud_files", "tabulaflow_open_cloud_file", "tabulaflow_request_cloud_upload"],
   };
 
@@ -176,6 +178,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_preview_recipe_change").execute({ preparedId: "prepared-a", recipe: [], stepIndex: 0 });
   await toolByName(tools, "tabulaflow_get_compose_graph").execute({});
   await toolByName(tools, "tabulaflow_get_compose_node").execute({ nodeId: "operation-a" });
+  await toolByName(tools, "tabulaflow_get_node_schema").execute({ nodeId: "operation-a", offset: 0, limit: 20 });
   await toolByName(tools, "tabulaflow_get_node_preview").execute({ nodeId: "operation-a", columns: ["status"], offset: 0, limit: 20 });
   await toolByName(tools, "tabulaflow_get_compose_node_quality").execute({ nodeId: "operation-a" });
   const candidate = { kind: "filter-rows", inputId: "prepared-a", column: "status", operator: "equals", value: "open" };
@@ -183,7 +186,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "2.9");
+  assert.equal(capabilities.structuredContent.contractVersion, "3.0");
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");
@@ -197,7 +200,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
     ["available-actions", "prepared-a"], ["activity", { limit: 20, targetId: undefined, actor: "agent" }], ["changes", 12, { limit: 20 }], ["operation-status", "operation-1"], ["recipe", "prepared-a"], ["semantic", "prepared-a"], ["metric-list", "prepared-a"], ["dataset", "prepared-a"],
     ["profile", "prepared-a", ["status"]], ["values", "prepared-a", "status", "op", { offset: 0, limit: 20 }],
     ["prepare-preview", "prepared-a", ["status"], { offset: 0, limit: 20 }], ["recipe-preview", "prepared-a", [], 0, { previewColumns: undefined, previewLimit: 10 }],
-    ["graph"], ["compose-node", "operation-a"], ["node-preview", "operation-a", ["status"], { offset: 0, limit: 20 }], ["node-quality", "operation-a"],
+    ["graph"], ["compose-node", "operation-a"], ["node-schema", "operation-a", { offset: 0, limit: 20 }], ["node-preview", "operation-a", ["status"], { offset: 0, limit: 20 }], ["node-quality", "operation-a"],
     ["validate", candidate, { previewColumns: undefined, previewLimit: 10 }], ["connections", "prepared-a"],
   ]);
 });
@@ -211,6 +214,7 @@ test("WebMCP mutations target stable IDs and carry revision plus idempotency met
   await toolByName(tools, "tabulaflow_open_workspace").execute({ workspace: "source" });
   await toolByName(tools, "tabulaflow_request_source_file").execute({});
   await toolByName(tools, "tabulaflow_request_source_relink").execute({ sourceAssetId: "source-a" });
+  const resetRequest = await toolByName(tools, "tabulaflow_request_reset_all").execute(mutation("reset-all-001"));
   await toolByName(tools, "tabulaflow_list_cloud_files").execute({});
   await toolByName(tools, "tabulaflow_open_cloud_file").execute({ fileId: "cloud-a", ...mutation("cloud-open-001") });
   await toolByName(tools, "tabulaflow_request_cloud_upload").execute({});
@@ -245,6 +249,7 @@ test("WebMCP mutations target stable IDs and carry revision plus idempotency met
   assert.equal(recipeDeletion.structuredContent.pendingConfirmation, true);
   assert.equal(deletion.structuredContent.pendingConfirmation, true);
   assert.equal(metricDeletion.structuredContent.pendingConfirmation, true);
+  assert.equal(resetRequest.structuredContent.pendingConfirmation, true);
   assert.ok(calls.some((call) => call[0] === "duplicate" && call[2].expectedRevision === REVISION));
   assert.ok(calls.some((call) => call[0] === "create-operation" && call[2].requestId === "operation-create-001"));
   assert.ok(calls.some((call) => call[0] === "delete-request" && call[3].requestId === "delete-001"));
@@ -271,7 +276,7 @@ test("WebMCP mutation schemas require collaboration metadata and conditional val
   const { ref } = createContext();
   const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   for (const name of [
-    "tabulaflow_open_cloud_file", "tabulaflow_select_prepared_dataset", "tabulaflow_duplicate_prepared_dataset", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter", "tabulaflow_export_prepare", "tabulaflow_add_recipe_step", "tabulaflow_request_delete_all_recipe_steps", "tabulaflow_replace_recipe",
+    "tabulaflow_request_reset_all", "tabulaflow_open_cloud_file", "tabulaflow_select_prepared_dataset", "tabulaflow_duplicate_prepared_dataset", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter", "tabulaflow_export_prepare", "tabulaflow_add_recipe_step", "tabulaflow_request_delete_all_recipe_steps", "tabulaflow_replace_recipe",
     "tabulaflow_select_compose_node", "tabulaflow_auto_arrange_compose", "tabulaflow_create_compose_operation", "tabulaflow_update_compose_operation",
     "tabulaflow_export_compose", "tabulaflow_promote_compose_result", "tabulaflow_request_delete",
   ]) {
@@ -365,11 +370,44 @@ test("registered WebMCP tools annotate unexpected syntax failures at the handler
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       execute() { throw new SyntaxError("missing ) after argument list"); },
     }], controller.signal);
-    assert.throws(
+    await assert.rejects(
       () => registered.execute({}),
       (error) => error.code === "WEBMCP_EXECUTION_SYNTAX_ERROR" && error.phase === "handler" && error.tool === "tabulaflow_test_failure",
     );
   } finally {
     console.warn = previousWarn;
   }
+});
+
+test("runtime health stops advertising actions whose execution path is degraded", async () => {
+  const { ref } = createContext();
+  ref.current.actions.getAvailableActions = async () => ({ targetId: "prepared-a", actions: ["inspect", "recipe", "formula-column", "export"] });
+  ref.current.actions.addRecipeStep = async () => { throw new SyntaxError("missing ) after argument list"); };
+  const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
+  const registry = new Map();
+  const controller = new AbortController();
+  await registerWebMcpTools({ async registerTool(tool) { registry.set(tool.name, tool); } }, tools, controller.signal, {
+    onExecutionFailure: () => undefined,
+  });
+  const previousWarn = console.warn;
+  console.warn = () => undefined;
+  try {
+    await assert.rejects(
+      () => registry.get("tabulaflow_add_recipe_step").execute({
+        preparedId: "prepared-a",
+        step: { type: "trim", params: { column: "status", mode: "both" } },
+        ...mutation("runtime-health-failure-001"),
+      }),
+      (error) => error.code === "WEBMCP_EXECUTION_SYNTAX_ERROR",
+    );
+  } finally {
+    console.warn = previousWarn;
+  }
+  const healthAwareTools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
+  const capabilities = await toolByName(healthAwareTools, "tabulaflow_get_capabilities").execute({});
+  const available = await toolByName(healthAwareTools, "tabulaflow_get_available_actions").execute({ targetId: "prepared-a" });
+  assert.equal(capabilities.structuredContent.runtimeHealth.status, "degraded");
+  assert.equal(available.structuredContent.actions.includes("recipe"), false);
+  assert.ok(available.structuredContent.unavailableActions.some((item) => item.action === "recipe"));
+  controller.abort();
 });

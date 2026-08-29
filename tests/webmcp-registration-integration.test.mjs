@@ -8,7 +8,7 @@ import { createWebMcpMutationRunner } from "../src/webMcpMutation.js";
 
 function state(revision, { compose = true, workspace = "prepare" } = {}) {
   return {
-    contractVersion: "2.9",
+    contractVersion: "3.0",
     workspaceRevision: revision,
     workspace,
     worker: { ready: true, recovering: false },
@@ -80,7 +80,7 @@ test("React WebMCP registration keeps core stable and rotates only the active wo
   view.rerender(React.createElement(Harness, { context: { state: state(revision), actions } }));
   assert.equal(coreSignal.aborted, false);
   assert.equal(prepareSignal.aborted, false);
-  assert.equal(registry.get("tabulaflow_get_workspace_state").execute({}).structuredContent.workspaceRevision, 8);
+  assert.equal((await registry.get("tabulaflow_get_workspace_state").execute({})).structuredContent.workspaceRevision, 8);
   await assert.rejects(
     () => exportTool.execute({ ...args, requestId: "registered-export-stale-001" }),
     (error) => error.code === "STALE_STATE",

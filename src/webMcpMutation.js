@@ -4,11 +4,21 @@ function mutationError(message, code) {
   return error;
 }
 
-export function createWebMcpMutationRunner({ getRevision, maximumEntries = 100 } = {}) {
+export function createWebMcpMutationRunner({
+  getRevision,
+  getFlowId = () => null,
+  persistOperation = null,
+  maximumEntries = 100,
+} = {}) {
   if (typeof getRevision !== "function") throw new Error("WebMCP mutation runner requires getRevision.");
   const cache = new Map();
   const operations = new Map();
   let mutationQueue = Promise.resolve();
+
+  const persist = (operation) => {
+    if (typeof persistOperation !== "function" || !operation?.flowId) return;
+    Promise.resolve(persistOperation(structuredClone(operation))).catch(() => undefined);
+  };
 
   const evictTerminalEntries = () => {
     while (cache.size > maximumEntries) cache.delete(cache.keys().next().value);
@@ -44,6 +54,8 @@ export function createWebMcpMutationRunner({ getRevision, maximumEntries = 100 }
       operationId,
       requestId,
       fingerprint,
+      flowId: getFlowId(),
+      executionMode,
       status: "accepted",
       acceptedAt: new Date().toISOString(),
       startedAt: null,
@@ -52,9 +64,11 @@ export function createWebMcpMutationRunner({ getRevision, maximumEntries = 100 }
       error: null,
     };
     operations.set(operationId, operation);
+    persist(operation);
     const promise = mutationQueue.then(async () => {
       operation.status = "running";
       operation.startedAt = new Date().toISOString();
+      persist(operation);
       const currentRevision = getRevision();
       if (!Number.isInteger(expectedRevision) || expectedRevision !== currentRevision) {
         throw mutationError(`Workspace state is stale. Expected revision ${currentRevision}, received ${meta?.expectedRevision}.`, "STALE_STATE");
@@ -71,11 +85,13 @@ export function createWebMcpMutationRunner({ getRevision, maximumEntries = 100 }
       operation.status = "committed";
       operation.completedAt = new Date().toISOString();
       operation.result = committed;
+      persist(operation);
       return committed;
     }).catch((cause) => {
       operation.status = "failed";
       operation.completedAt = new Date().toISOString();
       operation.error = { code: cause?.code ?? "MUTATION_FAILED", message: cause instanceof Error ? cause.message : "Mutation failed." };
+      persist(operation);
       throw cause;
     });
     mutationQueue = promise.then(() => undefined, () => undefined);
@@ -109,7 +125,36 @@ export function createWebMcpMutationRunner({ getRevision, maximumEntries = 100 }
     operation.completedAt = new Date().toISOString();
     operation.result = { ...result, requestId: operation.requestId, status };
     operation.error = null;
+    persist(operation);
     return true;
+  };
+
+  runWebMcpMutation.hydrate = (records = []) => {
+    for (const stored of records.slice(0, maximumEntries * 2)) {
+      if (!stored?.operationId || !stored?.requestId || !stored?.fingerprint) continue;
+      const operation = structuredClone(stored);
+      if (operation.status === "accepted" || operation.status === "running") {
+        operation.status = "failed";
+        operation.completedAt = new Date().toISOString();
+        operation.error = {
+          code: "OPERATION_INTERRUPTED_BY_RELOAD",
+          message: "The WebMCP operation was interrupted by a page reload. Reconcile workspace state before retrying.",
+        };
+        persist(operation);
+      }
+      operations.set(operation.operationId, operation);
+      cache.set(operation.requestId, {
+        fingerprint: operation.fingerprint,
+        operationId: operation.operationId,
+        executionMode: operation.executionMode ?? "wait",
+        response: operation.result,
+        promise: operation.status === "committed" || operation.status === "cancelled"
+          ? Promise.resolve(structuredClone(operation.result))
+          : Promise.reject(mutationError(operation.error?.message ?? "Mutation failed.", operation.error?.code ?? "MUTATION_FAILED")),
+      });
+      cache.get(operation.requestId).promise.catch(() => undefined);
+    }
+    evictTerminalEntries();
   };
 
   return runWebMcpMutation;

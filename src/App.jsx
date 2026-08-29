@@ -28,6 +28,7 @@ import { formatValue, isSupportedFile } from "./data.js";
 import { useDataWorker } from "./useDataWorker.js";
 import { useWebMcpTools } from "./useWebMcpTools.js";
 import { createWebMcpMutationRunner } from "./webMcpMutation.js";
+import { composeNodeSummaryForAgent, paginateAgentSchema } from "./webMcpDto.js";
 import { StepsPanel, TransformationForm } from "./StepsPanel.jsx";
 import { FormulaColumnEditor } from "./FormulaColumnEditor.jsx";
 import { useRecipeHistory } from "./useRecipeHistory.js";
@@ -41,6 +42,8 @@ import {
   appendStoredActivity,
   clearStoredWorkspaceData,
   loadStoredActivity,
+  loadStoredWebMcpOperations,
+  saveStoredWebMcpOperation,
 } from "./recipeStorage.js";
 import { createActivityEvent, findSupersededActivity, pageActivityEvents } from "./activityModel.js";
 import { schemaDelta } from "./schemaDelta.js";
@@ -434,7 +437,7 @@ function AccountScreen({ onOpenFile, uploadRequestToken, onUploadRequestShown, a
   );
 }
 
-export function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, onResetAll, workerReady, openedSources, fileRequestToken, onFileRequestShown, relinkRequest, onRelinkRequestShown }) {
+export function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, onResetAll, workerReady, openedSources, fileRequestToken, onFileRequestShown, relinkRequest, onRelinkRequestShown, resetRequest, onResetRequestShown, onResetRequestResolved }) {
   const { formatNumber, t } = useI18n();
   const inputRef = useRef(null);
   const chooseFileButtonRef = useRef(null);
@@ -462,14 +465,28 @@ export function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSour
   }, [onRelinkRequestShown, relinkRequest]);
 
   useEffect(() => {
+    if (!resetRequest?.token) return;
+    setConfirmingReset(true);
+    onResetRequestShown?.(resetRequest.token);
+  }, [onResetRequestShown, resetRequest]);
+
+  useEffect(() => {
     if (confirmingReset) resetConfirmRef.current?.focus();
   }, [confirmingReset]);
+
+  const dismissReset = () => {
+    setConfirmingReset(false);
+    if (resetRequest?.token) onResetRequestResolved?.(resetRequest.token, "cancelled");
+  };
 
   const resetAll = async () => {
     setResetting(true);
     try {
-      const reset = await onResetAll?.();
-      if (reset !== false) setConfirmingReset(false);
+      const reset = await onResetAll?.({ requestId: resetRequest?.requestId ?? null });
+      if (reset !== false) {
+        setConfirmingReset(false);
+        if (resetRequest?.token) onResetRequestResolved?.(resetRequest.token, "confirmed");
+      }
     } finally {
       setResetting(false);
     }
@@ -566,13 +583,13 @@ export function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSour
           </div>
         </header>
         {confirmingReset && (
-          <div className="source-reset-confirmation" role="alertdialog" aria-labelledby="source-reset-title" aria-describedby="source-reset-description" onKeyDown={(event) => { if (event.key === "Escape" && !resetting) setConfirmingReset(false); }}>
+          <div className="source-reset-confirmation" role="alertdialog" aria-labelledby="source-reset-title" aria-describedby="source-reset-description" onKeyDown={(event) => { if (event.key === "Escape" && !resetting) dismissReset(); }}>
             <div>
               <strong id="source-reset-title">{t("confirmResetAll")}</strong>
               <span id="source-reset-description">{t("resetAllDescription")}</span>
             </div>
             <div className="source-reset-confirmation__actions">
-              <button type="button" disabled={resetting} onClick={() => setConfirmingReset(false)}>{t("cancel")}</button>
+              <button type="button" disabled={resetting} onClick={dismissReset}>{t("cancel")}</button>
               <button ref={resetConfirmRef} className="source-reset-confirmation__confirm" type="button" disabled={resetting} onClick={() => void resetAll()}>{t(resetting ? "resettingAll" : "resetAll")}</button>
             </div>
           </div>
@@ -1994,14 +2011,20 @@ export function App() {
   const [webMcpRelinkRequest, setWebMcpRelinkRequest] = useState(null);
   const [webMcpCloudUploadToken, setWebMcpCloudUploadToken] = useState(0);
   const [webMcpDeleteRequest, setWebMcpDeleteRequest] = useState(null);
+  const [webMcpResetRequest, setWebMcpResetRequest] = useState(null);
   const restoreStartedRef = useRef(false);
   const flowHydratedRef = useRef(false);
   const workspaceRevisionRef = useRef(0);
   const activityEventsRef = useRef([]);
   const pendingDeleteConfirmationsRef = useRef(new Map());
+  const pendingResetConfirmationRef = useRef(null);
   const webMcpMutationRunnerRef = useRef(null);
   if (!webMcpMutationRunnerRef.current) {
-    webMcpMutationRunnerRef.current = createWebMcpMutationRunner({ getRevision: () => workspaceRevisionRef.current });
+    webMcpMutationRunnerRef.current = createWebMcpMutationRunner({
+      getRevision: () => workspaceRevisionRef.current,
+      getFlowId: () => flowRef.current.id,
+      persistOperation: saveStoredWebMcpOperation,
+    });
   }
 
   useEffect(() => { flowRef.current = flow; }, [flow]);
@@ -2148,6 +2171,12 @@ export function App() {
         setWorkspaceRevision(restoredWorkspaceRevision);
         flowRef.current = restored;
         setFlow(restored);
+        try {
+          const storedOperations = await loadStoredWebMcpOperations(restored.id);
+          webMcpMutationRunnerRef.current.hydrate(storedOperations);
+        } catch {
+          // Operation-status recovery is best effort and must not block flow restoration.
+        }
       } catch {
         if (!cancelled) setError(t("flowRestoreFailed"));
       } finally {
@@ -2201,11 +2230,17 @@ export function App() {
       setActivityError("");
       setActivityOverrideNotice("");
       pendingDeleteConfirmationsRef.current.clear();
-      webMcpMutationRunnerRef.current = createWebMcpMutationRunner({ getRevision: () => workspaceRevisionRef.current });
+      pendingResetConfirmationRef.current = null;
+      webMcpMutationRunnerRef.current = createWebMcpMutationRunner({
+        getRevision: () => workspaceRevisionRef.current,
+        getFlowId: () => flowRef.current.id,
+        persistOperation: saveStoredWebMcpOperation,
+      });
       setWebMcpFileRequestToken(0);
       setWebMcpRelinkRequest(null);
       setWebMcpCloudUploadToken(0);
       setWebMcpDeleteRequest(null);
+      setWebMcpResetRequest(null);
       return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("resetAllFailed"));
@@ -2573,7 +2608,15 @@ export function App() {
     if (source.status !== "linked" && source.location === "local-device") {
       setError(t("relinkRequired"));
       setScreen("input");
-      if (throwOnError) throw new Error(t("relinkRequired"));
+      if (throwOnError) {
+        const relinkRequired = new Error(t("relinkRequired"));
+        relinkRequired.code = "SOURCE_RELINK_REQUIRED";
+        relinkRequired.requiresUserAction = true;
+        relinkRequired.recommendedWorkspace = "source";
+        relinkRequired.sourceAssetIds = [source.id];
+        relinkRequired.affectedNodeIds = [prepared.id];
+        throw relinkRequired;
+      }
       return;
     }
     setLoading(true);
@@ -2750,7 +2793,6 @@ export function App() {
       name: candidate.node.name,
       rowCount: preview.rowCount,
       columnCount: preview.schema.length,
-      schema: preview.schema,
       activity,
     };
   };
@@ -2778,7 +2820,6 @@ export function App() {
       name: candidate.node.name,
       rowCount: preview.rowCount,
       columnCount: preview.schema.length,
-      schema: preview.schema,
       activity,
     };
   };
@@ -3103,21 +3144,30 @@ export function App() {
     }
   };
 
-  const composeNodesForTool = () => {
+  const findComposeNodeForTool = (nodeId) => {
     const graph = flowRef.current;
-    const byId = new Map([...graph.preparedInputs, ...graph.composeNodes].map((item) => [item.id, item]));
-    return [
-      ...graph.preparedInputs.map((item) => ({ ...structuredClone(item), nodeType: "dataset", kind: "dataset", config: null, inputIds: [] })),
-      ...graph.composeNodes.map((item) => ({
-        ...structuredClone(item),
-        nodeType: "operation",
-        config: protectComposeConfigForAgent(item, byId.get(item.inputIds?.[0])?.schema ?? []),
-      })),
-    ];
+    const prepared = graph.preparedInputs.find((item) => item.id === nodeId);
+    if (prepared) return { node: prepared, nodeType: "dataset" };
+    const operation = graph.composeNodes.find((item) => item.id === nodeId);
+    if (operation) return { node: operation, nodeType: "operation" };
+    return null;
+  };
+
+  const composeNodeDetailForTool = (nodeId) => {
+    const found = findComposeNodeForTool(nodeId);
+    if (!found) throw new Error(`Compose node not found: ${nodeId}`);
+    const summary = composeNodeSummaryForAgent(found.node, found.nodeType);
+    if (found.nodeType === "dataset") return { ...summary, config: null };
+    const input = flowRef.current.preparedInputs.find((item) => item.id === found.node.inputIds?.[0])
+      ?? flowRef.current.composeNodes.find((item) => item.id === found.node.inputIds?.[0]);
+    return { ...summary, config: protectComposeConfigForAgent(found.node, input?.schema ?? []) };
   };
 
   const getComposeGraphFromTool = async () => {
-    const nodes = composeNodesForTool();
+    const nodes = [
+      ...flowRef.current.preparedInputs.map((item) => composeNodeSummaryForAgent(item, "dataset")),
+      ...flowRef.current.composeNodes.map((item) => composeNodeSummaryForAgent(item, "operation")),
+    ];
     const sourceById = new Map(flowRef.current.sourceAssets.map((item) => [item.id, item]));
     const edges = flowRef.current.composeNodes.flatMap((node) => node.inputIds.map((sourceId) => ({ sourceId, targetId: node.id, type: "operation-input" })));
     for (const prepared of flowRef.current.preparedInputs) {
@@ -3128,9 +3178,13 @@ export function App() {
   };
 
   const getComposeNodeFromTool = async (nodeId) => {
-    const node = composeNodesForTool().find((item) => item.id === nodeId);
-    if (!node) throw new Error(`Compose node not found: ${nodeId}`);
-    return { ...node, workspaceRevision: workspaceRevisionRef.current };
+    return { ...composeNodeDetailForTool(nodeId), workspaceRevision: workspaceRevisionRef.current };
+  };
+
+  const getComposeNodeSchemaFromTool = async (nodeId, options = {}) => {
+    const found = findComposeNodeForTool(nodeId);
+    if (!found) throw new Error(`Compose node not found: ${nodeId}`);
+    return { nodeId, ...paginateAgentSchema(found.node.schema ?? [], options), workspaceRevision: workspaceRevisionRef.current };
   };
 
   const getComposeNodePreviewFromTool = async (nodeId, columns, options) => {
@@ -3154,7 +3208,7 @@ export function App() {
     if (!targetId) return {
       workspace: screen === "input" ? "source" : screen === "data" ? "prepare" : screen,
       workspaceRevision: workspaceRevisionRef.current,
-      actions: screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", ...(recipeHistory.recipe.length ? ["request-delete-all-recipe-steps"] : []), "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", "inspect-activity"],
+      actions: screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", ...(recipeHistory.recipe.length ? ["request-delete-all-recipe-steps"] : []), "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", ...(flowRef.current.sourceAssets.length ? ["request-reset-all"] : []), "inspect-activity"],
     };
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === targetId);
     if (prepared) return { targetId, kind: "dataset", actions: ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", ...((prepared.recipe?.length ?? 0) > 0 ? ["request-delete-all-recipe-steps"] : []), "export", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
@@ -3344,8 +3398,7 @@ export function App() {
         agentMode: true,
         ...(includeRows ? { columns: previewColumns, limit: previewLimit } : {}),
       }));
-      const nodes = composeNodesForTool();
-      const inputSchema = draft.inputIds.flatMap((inputId) => nodes.find((node) => node.id === inputId)?.schema ?? []);
+      const inputSchema = draft.inputIds.flatMap((inputId) => findComposeNodeForTool(inputId)?.node.schema ?? []);
       return {
         valid: true,
         output: { rowCount: preview.rowCount, columnCount: preview.schema.length },
@@ -3400,6 +3453,31 @@ export function App() {
     return { target, targetId, confirmationToken: token, pendingConfirmation: true, activity };
   }, `delete:request:${target}:${targetId}`);
 
+  const requestResetAllFromTool = async (meta) => runWebMcpMutation(meta, async () => {
+    const currentFlow = flowRef.current;
+    const hasFlowData = currentFlow.sourceAssets.length > 0
+      || currentFlow.preparedInputs.length > 0
+      || currentFlow.composeNodes.length > 0;
+    if (!hasFlowData) {
+      const emptyError = new Error("The current flow is already empty.");
+      emptyError.code = "FLOW_ALREADY_EMPTY";
+      throw emptyError;
+    }
+    setScreen("input");
+    const token = `${Date.now()}-${Math.random()}`;
+    const request = { token, requestId: meta.requestId, flowId: currentFlow.id };
+    setWebMcpResetRequest(request);
+    const activity = await recordActivity({
+      action: "reset_all_requested",
+      targetType: "flow",
+      targetId: currentFlow.id,
+      status: "pending-confirmation",
+      summary: { scope: "source-prepare-compose" },
+    }, webMcpActivity(meta));
+    pendingResetConfirmationRef.current = { ...request, activityEventId: activity?.eventId ?? null };
+    return { confirmationToken: token, pendingConfirmation: true, workspace: "source", activity };
+  }, "flow:request-reset-all");
+
   const getActivityLogFromTool = async ({ limit = 50, targetId = null, actor = null } = {}) => {
     const filtered = activityEventsRef.current
       .filter((event) => !targetId || event.targetId === targetId)
@@ -3434,13 +3512,35 @@ export function App() {
     }, { actor: "user", origin: "ui", requestId: pending.requestId });
   }, [recordActivity]);
 
+  const resolveResetConfirmation = useCallback(async (token, outcome) => {
+    const pending = pendingResetConfirmationRef.current;
+    if (!pending || pending.token !== token) return null;
+    if (outcome === "confirmed") return null;
+    pendingResetConfirmationRef.current = null;
+    setWebMcpResetRequest(null);
+    webMcpMutationRunnerRef.current?.setRequestTerminalStatus?.(pending.requestId, "cancelled", {
+      target: "flow",
+      targetId: pending.flowId,
+      pendingConfirmation: false,
+      confirmed: false,
+    });
+    return recordActivity({
+      action: "reset_all_cancelled",
+      targetType: "flow",
+      targetId: pending.flowId,
+      status: "cancelled",
+      summary: { scope: "source-prepare-compose" },
+      supersedesEventId: pending.activityEventId,
+    }, { actor: "user", origin: "ui", requestId: pending.requestId });
+  }, [recordActivity]);
+
   const activeAgentSchema = flow.preparedInputs.find((item) => item.id === activePreparedId)?.schema
     ?? dataset?.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] }))
     ?? [];
 
   useWebMcpTools({
     state: {
-      contractVersion: "2.9",
+      contractVersion: "3.0",
       workspaceRevision,
       flowId: flow.id,
       flowRevision: flow.revision,
@@ -3523,12 +3623,14 @@ export function App() {
       moveComposeNode: moveComposeNodeFromTool,
       getComposeGraph: getComposeGraphFromTool,
       getComposeNode: getComposeNodeFromTool,
+      getComposeNodeSchema: getComposeNodeSchemaFromTool,
       getComposeNodePreview: getComposeNodePreviewFromTool,
       getComposeNodeQuality: getComposeNodeQualityFromTool,
       validateComposeOperation: validateComposeOperationFromTool,
       getConnectionOptions: getConnectionOptionsFromTool,
       requestSourceFileSelection,
       requestSourceRelink: requestSourceRelinkFromTool,
+      requestResetAll: requestResetAllFromTool,
       listCloudFiles: listCloudFilesFromTool,
       openCloudFile: openCloudFileFromTool,
       requestCloudUpload: requestCloudUploadFromTool,
@@ -3579,6 +3681,9 @@ export function App() {
           onFileRequestShown={(token) => setWebMcpFileRequestToken((current) => current === token ? 0 : current)}
           relinkRequest={webMcpRelinkRequest}
           onRelinkRequestShown={(token) => setWebMcpRelinkRequest((current) => current?.token === token ? null : current)}
+          resetRequest={webMcpResetRequest}
+          onResetRequestShown={() => undefined}
+          onResetRequestResolved={(token, outcome) => void resolveResetConfirmation(token, outcome)}
         />
       ) : screen === "compose" ? (
         <ComposeScreen
