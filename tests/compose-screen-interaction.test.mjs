@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import React from "react";
 import { JSDOM } from "jsdom";
 import react from "@vitejs/plugin-react";
 import { createServer } from "vite";
+
+const stylesSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../src/styles.css"), "utf8");
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost/" });
 globalThis.window = dom.window;
@@ -81,6 +86,14 @@ function renderCompose(overrides = {}) {
   };
   return render(React.createElement(LanguageProvider, null, React.createElement(ComposeScreen, props)));
 }
+
+test("Compose overlays and workspace share one explicit grid column", () => {
+  assert.match(stylesSource, /\.compose-screen\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);/s);
+  assert.match(stylesSource, /\.compose-toolbar\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*1;/s);
+  assert.match(stylesSource, /\.compose-global-error\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*2;/s);
+  assert.match(stylesSource, /\.compose-layout\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*2;/s);
+  assert.match(stylesSource, /\.compose-global-confirmation\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*2;/s);
+});
 
 test("connector starts connection mode and opens only the new continuation actions", () => {
   const view = renderCompose();

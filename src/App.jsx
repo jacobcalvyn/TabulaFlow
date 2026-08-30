@@ -84,6 +84,7 @@ import {
 import { useI18n } from "./i18n.jsx";
 import { ComposeScreen } from "./ComposeScreen.jsx";
 import { activatePreparedForFlow } from "./preparedActivation.js";
+import { assertNodeExecutable, resolveNodeExecutionState } from "./flowExecutionState.js";
 import { getCloudAccount, getCloudFiles, openCloudFile, uploadCloudFile } from "./cloudFiles.js";
 import {
   PREPARED_RECIPE_STATUS,
@@ -123,6 +124,49 @@ function protectFiltersForAgent(filters = {}, schema = []) {
     if (!selection || !shouldRedactAgentValues(resolveColumnSemantics(columns.get(column) ?? { name: column, type: "VARCHAR" }))) return [column, structuredClone(selection)];
     return [column, { key: selection.valueRef ?? "[redacted]", label: "[redacted]", ...(selection.valueRef ? { valueRef: selection.valueRef } : {}) }];
   }));
+}
+
+const PREPARED_DATA_ACTIONS = new Set([
+  "open-prepare",
+  "duplicate",
+  "query-column-values",
+  "set-aggregate-columns",
+  "filter",
+  "recipe",
+  "formula-column",
+  "qualitative-coding",
+  "export",
+  "create-unary-operation",
+  "connect-binary-operation",
+]);
+
+const COMPOSE_DATA_ACTIONS = new Set([
+  "get-connection-options",
+  "validate-operation",
+  "create-operation",
+  "preview",
+  "update",
+  "export",
+  "promote-result",
+  "create-unary-operation",
+  "connect-binary-operation",
+]);
+
+function contextualActionStatus(actions, executionState, executionActions) {
+  return actions.map((action) => {
+    const requiresData = executionActions.has(action);
+    const executable = !requiresData || executionState?.executable !== false;
+    return {
+      action,
+      registered: true,
+      callable: true,
+      executable,
+      blockedReason: executable ? null : executionState.blockedReason,
+      ...(executable || !executionState.requiredAction ? {} : { requiredAction: executionState.requiredAction }),
+      ...(executable || !executionState.sourceAssetIds?.length ? {} : { sourceAssetIds: [...executionState.sourceAssetIds] }),
+      ...(executable || !executionState.blockedDependencyIds?.length ? {} : { blockedDependencyIds: [...executionState.blockedDependencyIds] }),
+    };
+  });
 }
 
 const ACCEPTED_FILES = ".xlsx,.xls,.csv,.json,.jsonl,.ndjson";
@@ -3013,6 +3057,7 @@ export function App() {
   }, `prepare:select:${preparedId}`);
 
   const assertActivePreparedForTool = (preparedId) => {
+    assertNodeExecutable(flowRef.current, preparedId);
     if (!dataset || preparedId !== activePreparedIdRef.current) {
       const inactive = new Error(`Prepared dataset is not active: ${preparedId}. Open it before reading or changing its data.`);
       inactive.code = "PREPARED_NOT_ACTIVE";
@@ -3462,7 +3507,7 @@ export function App() {
   const composeNodeDetailForTool = (nodeId) => {
     const found = findComposeNodeForTool(nodeId);
     if (!found) throw new Error(`Compose node not found: ${nodeId}`);
-    const summary = composeNodeSummaryForAgent(found.node, found.nodeType);
+    const summary = composeNodeSummaryForAgent(found.node, found.nodeType, resolveNodeExecutionState(flowRef.current, nodeId));
     if (found.nodeType === "dataset") return { ...summary, config: null };
     const input = flowRef.current.preparedInputs.find((item) => item.id === found.node.inputIds?.[0])
       ?? flowRef.current.composeNodes.find((item) => item.id === found.node.inputIds?.[0]);
@@ -3471,8 +3516,8 @@ export function App() {
 
   const getComposeGraphFromTool = async () => {
     const nodes = [
-      ...flowRef.current.preparedInputs.map((item) => composeNodeSummaryForAgent(item, "dataset")),
-      ...flowRef.current.composeNodes.map((item) => composeNodeSummaryForAgent(item, "operation")),
+      ...flowRef.current.preparedInputs.map((item) => composeNodeSummaryForAgent(item, "dataset", resolveNodeExecutionState(flowRef.current, item.id))),
+      ...flowRef.current.composeNodes.map((item) => composeNodeSummaryForAgent(item, "operation", resolveNodeExecutionState(flowRef.current, item.id))),
     ];
     const sourceById = new Map(flowRef.current.sourceAssets.map((item) => [item.id, item]));
     const edges = flowRef.current.composeNodes.flatMap((node) => node.inputIds.map((sourceId) => ({ sourceId, targetId: node.id, type: "operation-input" })));
@@ -3495,17 +3540,20 @@ export function App() {
 
   const getComposeNodePreviewFromTool = async (nodeId, columns, options) => {
     await getComposeNodeFromTool(nodeId);
+    assertNodeExecutable(flowRef.current, nodeId);
     return runWebMcpRead(() => worker.previewCompose(flowRef.current, nodeId, { columns, ...options, agentMode: true }));
   };
 
   const getComposeNodeQualityFromTool = async (nodeId) => {
     await getComposeNodeFromTool(nodeId);
+    assertNodeExecutable(flowRef.current, nodeId);
     const result = await runWebMcpRead(() => worker.composeNodeQuality(flowRef.current, nodeId));
     return { ...result, workspaceRevision: workspaceRevisionRef.current };
   };
 
   const getConnectionOptionsFromTool = async (nodeId) => {
     await getComposeNodeFromTool(nodeId);
+    assertNodeExecutable(flowRef.current, nodeId);
     const result = await runWebMcpRead(() => worker.composeConnectionOptions(flowRef.current, nodeId));
     return { ...result, workspaceRevision: workspaceRevisionRef.current };
   };
@@ -3515,30 +3563,62 @@ export function App() {
       const workspace = screen === "input" ? "source" : screen === "data" ? "prepare" : screen;
       const actions = screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", "qualitative-coding", ...(recipeHistory.recipe.length ? ["request-delete-all-recipe-steps"] : []), "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", ...(flowRef.current.sourceAssets.length ? ["request-reset-all"] : []), "inspect-activity"];
       const hasUnlinkedSource = flowRef.current.sourceAssets.some((source) => isFlowFileSource(source) && source.status === "unlinked");
+      const activeTargetId = screen === "data" ? activePreparedIdRef.current : screen === "compose" ? flowRef.current.activeNodeId : null;
+      const executionState = activeTargetId ? resolveNodeExecutionState(flowRef.current, activeTargetId) : null;
+      const executionActions = screen === "data" ? PREPARED_DATA_ACTIONS : screen === "compose" ? COMPOSE_DATA_ACTIONS : new Set();
+      const dataActionStatus = contextualActionStatus(actions, executionState, executionActions);
       return {
         workspace,
         workspaceRevision: workspaceRevisionRef.current,
         actions,
-        actionStatus: actions.map((action) => ({
-          action,
-          registered: true,
-          callable: action === "request-source-file"
+        actionStatus: dataActionStatus.map((status) => ({
+          ...status,
+          callable: status.action === "request-source-file"
             ? worker.ready
-            : action === "request-source-relink"
+            : status.action === "request-source-relink"
               ? hasUnlinkedSource
-              : true,
-          blockedReason: action === "request-source-file" && !worker.ready
+              : status.callable,
+          executable: status.action === "request-source-file"
+            ? worker.ready
+            : status.action === "request-source-relink"
+              ? hasUnlinkedSource
+              : status.executable,
+          blockedReason: status.action === "request-source-file" && !worker.ready
             ? "WORKER_NOT_READY"
-            : action === "request-source-relink" && !hasUnlinkedSource
+            : status.action === "request-source-relink" && !hasUnlinkedSource
               ? "SOURCE_NOT_UNLINKED"
-              : null,
+              : status.blockedReason,
         })),
       };
     }
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === targetId);
-    if (prepared) return { targetId, kind: "dataset", actions: ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", "qualitative-coding", ...((prepared.recipe?.length ?? 0) > 0 ? ["request-delete-all-recipe-steps"] : []), "export", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
+    if (prepared) {
+      const actions = ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", "qualitative-coding", ...((prepared.recipe?.length ?? 0) > 0 ? ["request-delete-all-recipe-steps"] : []), "export", "create-unary-operation", "connect-binary-operation", "request-delete"];
+      const executionState = resolveNodeExecutionState(flowRef.current, targetId);
+      return {
+        targetId,
+        kind: "dataset",
+        actions,
+        executable: executionState.executable,
+        blockedReason: executionState.blockedReason,
+        actionStatus: contextualActionStatus(actions, executionState, PREPARED_DATA_ACTIONS),
+        workspaceRevision: workspaceRevisionRef.current,
+      };
+    }
     const operation = flowRef.current.composeNodes.find((item) => item.id === targetId);
-    if (operation) return { targetId, kind: operation.kind, actions: ["inspect", "preview", "update", "export", "promote-result", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
+    if (operation) {
+      const actions = ["inspect", "preview", "update", "export", "promote-result", "create-unary-operation", "connect-binary-operation", "request-delete"];
+      const executionState = resolveNodeExecutionState(flowRef.current, targetId);
+      return {
+        targetId,
+        kind: operation.kind,
+        actions,
+        executable: executionState.executable,
+        blockedReason: executionState.blockedReason,
+        actionStatus: contextualActionStatus(actions, executionState, COMPOSE_DATA_ACTIONS),
+        workspaceRevision: workspaceRevisionRef.current,
+      };
+    }
     throw new Error(`Target not found: ${targetId}`);
   };
 
@@ -3565,6 +3645,7 @@ export function App() {
   }, `prepare:aggregate-columns:${preparedId}:${JSON.stringify(columns)}`);
 
   const duplicatePreparedFromTool = async (preparedId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    assertNodeExecutable(flowRef.current, preparedId);
     const result = await duplicatePreparation(preparedId, assertCurrent, webMcpActivity(meta));
     if (!result.ok) throw new Error(result.error || "Prepared dataset could not be duplicated.");
     return result;
@@ -3702,21 +3783,26 @@ export function App() {
   };
 
   const createComposeOperationFromTool = async (operation, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    const draft = composeOperationDraftFromTool(operation);
+    for (const inputId of draft.inputIds) assertNodeExecutable(flowRef.current, inputId);
     setScreen("compose");
-    return createComposeNode(composeOperationDraftFromTool(operation), assertCurrent, webMcpActivity(meta));
+    return createComposeNode(draft, assertCurrent, webMcpActivity(meta));
   }, `compose:create:${JSON.stringify(operation)}`);
 
   const updateComposeOperationFromTool = async (nodeId, operation, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
     const existing = flowRef.current.composeNodes.find((node) => node.id === nodeId);
     if (!existing) throw new Error(`Compose operation not found: ${nodeId}`);
     if (operation.kind !== existing.kind) throw new Error("Changing the operation kind is not supported. Create a new operation instead.");
+    const draft = composeOperationDraftFromTool(operation, existing);
+    for (const inputId of draft.inputIds) assertNodeExecutable(flowRef.current, inputId);
     setScreen("compose");
-    return updateComposeOperation(nodeId, composeOperationDraftFromTool(operation, existing), assertCurrent, webMcpActivity(meta));
+    return updateComposeOperation(nodeId, draft, assertCurrent, webMcpActivity(meta));
   }, `compose:update:${nodeId}:${JSON.stringify(operation)}`);
 
   const validateComposeOperationFromTool = async (operation, { previewColumns, previewLimit = 10 } = {}) => {
     const draft = composeOperationDraftFromTool(operation);
     try {
+      for (const inputId of draft.inputIds) assertNodeExecutable(flowRef.current, inputId);
       const includeRows = Array.isArray(previewColumns) && previewColumns.length > 0;
       const preview = await runWebMcpRead(() => previewComposeDraft(draft, null, {
         includeRows,
@@ -3750,6 +3836,7 @@ export function App() {
     if (!flowRef.current.composeNodes.some((item) => item.id === nodeId) && !flowRef.current.preparedInputs.some((item) => item.id === nodeId)) {
       throw new Error(`Compose node not found: ${nodeId}`);
     }
+    assertNodeExecutable(flowRef.current, nodeId);
     setScreen("compose");
     return exportComposeNode(format, nodeId, webMcpActivity(meta), assertCurrent);
   }, `compose:export:${nodeId}:${format}`);
@@ -3760,6 +3847,7 @@ export function App() {
   }, `compose:move:${nodeId}:${JSON.stringify(position)}`);
 
   const promoteComposeResultFromTool = async (nodeId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    assertNodeExecutable(flowRef.current, nodeId);
     const result = await createPreparationFromCompose(nodeId, assertCurrent, webMcpActivity(meta), { selectCreated: false });
     if (!result.ok) throw new Error(result.error || "Compose result could not be promoted.");
     return result;
@@ -4022,18 +4110,32 @@ export function App() {
         params: { ...step.params },
       })),
       recipeHistory: { canUndo: recipeHistory.canUndo, canRedo: recipeHistory.canRedo },
-      preparedInputs: flow.preparedInputs.map((item) => ({
-        id: item.id,
-        name: item.name,
-        totalRowCount: item.rowCount,
-        columnCount: item.schema?.length ?? null,
-        recipeStepCount: item.recipe?.length ?? 0,
-        recipeRevision: item.recipeVersion ?? 0,
-        recipeStatus: item.recipeStatus ?? null,
-      })),
+      preparedInputs: flow.preparedInputs.map((item) => {
+        const execution = resolveNodeExecutionState(flow, item.id);
+        return {
+          id: item.id,
+          name: item.name,
+          totalRowCount: item.rowCount,
+          columnCount: item.schema?.length ?? null,
+          recipeStepCount: item.recipe?.length ?? 0,
+          recipeRevision: item.recipeVersion ?? 0,
+          recipeStatus: item.recipeStatus ?? null,
+          dataStatus: execution.status,
+          executable: execution.executable,
+          blockedReason: execution.blockedReason,
+          sourceAssetIds: execution.sourceAssetIds,
+          blockedDependencyIds: execution.blockedDependencyIds,
+        };
+      }),
       composeNodes: [
-        ...flow.preparedInputs.map((item) => ({ id: item.id, name: item.name, kind: "dataset", totalRowCount: item.rowCount, columnCount: item.schema?.length ?? null, dataStatus: "ready" })),
-        ...flow.composeNodes.map((item) => ({ id: item.id, name: item.name, kind: item.kind, inputIds: [...item.inputIds], totalRowCount: item.rowCount, columnCount: item.schema?.length ?? null, validationStatus: item.validationStatus ?? null, dataStatus: item.dataStatus ?? "ready" })),
+        ...flow.preparedInputs.map((item) => {
+          const execution = resolveNodeExecutionState(flow, item.id);
+          return { id: item.id, name: item.name, kind: "dataset", totalRowCount: item.rowCount, columnCount: item.schema?.length ?? null, dataStatus: execution.status, executable: execution.executable, blockedReason: execution.blockedReason, sourceAssetIds: execution.sourceAssetIds, blockedDependencyIds: execution.blockedDependencyIds };
+        }),
+        ...flow.composeNodes.map((item) => {
+          const execution = resolveNodeExecutionState(flow, item.id);
+          return { id: item.id, name: item.name, kind: item.kind, inputIds: [...item.inputIds], totalRowCount: item.rowCount, columnCount: item.schema?.length ?? null, validationStatus: item.validationStatus ?? null, dataStatus: execution.status, executable: execution.executable, blockedReason: execution.blockedReason, sourceAssetIds: execution.sourceAssetIds, blockedDependencyIds: execution.blockedDependencyIds };
+        }),
       ],
       metricDefinitions: (flow.metricDefinitions ?? []).map((item) => ({ id: item.id, name: item.name, targetId: item.targetId })),
       codingProjects: (flow.codingProjects ?? []).map((project) => codingProjectForAgent(

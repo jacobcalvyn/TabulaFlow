@@ -375,14 +375,14 @@ button { color: inherit; }
 .cloud-file-list button:disabled { opacity: .55; cursor: wait; }
 .account-empty { margin: 16px 0 8px; padding: 28px 12px; color: var(--muted); background: #f8fafa; text-align: center; font-size: 11px; }
 
-.compose-screen { min-width: 0; min-height: 0; display: grid; grid-template-rows: 72px minmax(0, 1fr); overflow: hidden; background: #f7f9f9; }
-.compose-toolbar { padding: 0 22px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border-bottom: 1px solid var(--line); background: #fff; }
+.compose-screen { min-width: 0; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 72px minmax(0, 1fr); overflow: hidden; background: #f7f9f9; }
+.compose-toolbar { grid-column: 1; grid-row: 1; padding: 0 22px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border-bottom: 1px solid var(--line); background: #fff; }
 .compose-toolbar > div:first-child { min-width: 0; }
 .compose-toolbar h1 { margin: 0; font-size: 19px; }
 .compose-toolbar p { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
-.compose-global-error { grid-row: 2; z-index: 8; align-self: start; margin: 8px 14px 0; padding: 9px 12px; border: 1px solid #e6aaa6; border-radius: 8px; background: #fff4f3; color: #963f3a; font-size: 11px; font-weight: 650; }
-.compose-layout { grid-row: 2; min-height: 0; }
-.compose-global-confirmation { grid-row: 2; z-index: 9; align-self: start; margin: 8px 14px 0; padding: 9px 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid #e6aaa6; border-radius: 8px; background: #fff8f7; color: #7e302c; font-size: 11px; font-weight: 700; }
+.compose-global-error { grid-column: 1; grid-row: 2; z-index: 8; align-self: start; margin: 8px 14px 0; padding: 9px 12px; border: 1px solid #e6aaa6; border-radius: 8px; background: #fff4f3; color: #963f3a; font-size: 11px; font-weight: 650; }
+.compose-layout { grid-column: 1; grid-row: 2; min-height: 0; }
+.compose-global-confirmation { grid-column: 1; grid-row: 2; z-index: 9; align-self: start; margin: 8px 14px 0; padding: 9px 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid #e6aaa6; border-radius: 8px; background: #fff8f7; color: #7e302c; font-size: 11px; font-weight: 700; }
 .compose-global-confirmation > div { display: flex; gap: 6px; }
 .compose-global-confirmation button { min-height: 28px; padding: 0 10px; border: 1px solid var(--line); border-radius: 6px; background: #fff; cursor: pointer; }
 .compose-global-confirmation .compose-global-confirmation__delete { border-color: #b54036; background: #b54036; color: #fff; }

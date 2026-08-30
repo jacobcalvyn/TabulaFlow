@@ -20,7 +20,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "3.2.2", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "3.2.3", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -165,7 +165,7 @@ test("qualitative coding WebMCP uses one bounded dispatcher and keeps approval h
   assert.equal(coding.inputSchema.properties.action.enum.includes("approve"), false);
 });
 
-test("WebMCP 3.2.2 registers one small stable dispatcher surface", () => {
+test("WebMCP 3.2.3 registers one small stable dispatcher surface", () => {
   const { ref } = createContext();
   const stable = createWebMcpStableTools(ref);
   assert.deepEqual(stable.map((tool) => tool.name), WEBMCP_STABLE_TOOL_NAMES);
@@ -232,7 +232,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "3.2.2");
+  assert.equal(capabilities.structuredContent.contractVersion, "3.2.3");
   assert.deepEqual(capabilities.structuredContent.operationLifecycle.terminalStates, ["succeeded", "failed", "cancelled"]);
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
@@ -403,6 +403,69 @@ test("registered tools reject schema-invalid input before an application action 
   controller.abort();
 });
 
+test("stable recipe dispatcher accepts protected values returned by recipe reads", async () => {
+  const { calls, ref } = createContext();
+  const registry = new Map();
+  const controller = new AbortController();
+  await registerWebMcpTools({
+    async registerTool(tool) { registry.set(tool.name, tool); },
+  }, createWebMcpStableTools(ref), controller.signal);
+  const expression = {
+    __tabulaflowProtectedValue: true,
+    binding: {
+      scope: "recipe",
+      stepId: "formula-a",
+      stepType: "calculated-field",
+      key: "expression",
+      outputColumn: "weight_band",
+      expressionVersion: 1,
+    },
+    referencedColumns: ["weight"],
+  };
+  const recipe = [{
+    id: "formula-a",
+    type: "calculated-field",
+    enabled: true,
+    params: { outputColumn: "weight_band", expression, expressionVersion: 1 },
+  }];
+
+  await registry.get("tabulaflow_prepare_mutate").execute({
+    action: "replace_recipe",
+    input: {
+      preparedId: "prepared-a",
+      recipe,
+      expectedRecipeRevision: 1,
+      ...mutation("protected-recipe-roundtrip-001"),
+      executionMode: "wait",
+    },
+  });
+
+  const call = calls.find((item) => item[0] === "replace-recipe");
+  assert.deepEqual(call[2][0].params.expression, expression);
+  controller.abort();
+});
+
+test("context-blocked actions stay registered but are not advertised as executable", async () => {
+  const { ref } = createContext();
+  ref.current.actions.getAvailableActions = async () => ({
+    targetId: "operation-a",
+    actions: ["inspect", "preview"],
+    actionStatus: [
+      { action: "inspect", registered: true, callable: true, executable: true, blockedReason: null },
+      { action: "preview", registered: true, callable: true, executable: false, blockedReason: "SOURCE_RELINK_REQUIRED" },
+    ],
+  });
+  const result = await toolByName(
+    createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true }),
+    "tabulaflow_get_available_actions",
+  ).execute({ targetId: "operation-a" });
+
+  assert.deepEqual(result.structuredContent.actions, ["inspect"]);
+  assert.equal(result.structuredContent.actionStatus.find((item) => item.action === "preview").callable, true);
+  assert.equal(result.structuredContent.actionStatus.find((item) => item.action === "preview").executable, false);
+  assert.ok(result.structuredContent.unavailableActions.some((item) => item.action === "preview" && item.reason === "SOURCE_RELINK_REQUIRED"));
+});
+
 test("WebMCP registration is sequential, uses one lifecycle signal, and skips unsupported browsers", async () => {
   const { ref } = createContext();
   const tools = createWebMcpTools(ref, { hasDataset: false, hasPrepared: false, hasComposeNodes: false });
@@ -473,6 +536,40 @@ test("registered WebMCP tools never expose raw failure literals", async () => {
   } finally {
     console.warn = previousWarn;
   }
+});
+
+test("registered WebMCP tools preserve safe recovery metadata", async () => {
+  const controller = new AbortController();
+  let registered;
+  await registerWebMcpTools({ async registerTool(tool) { registered = tool; } }, [{
+    name: "tabulaflow_blocked_source",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    execute() {
+      const error = new Error("private source detail");
+      Object.assign(error, {
+        code: "SOURCE_RELINK_REQUIRED",
+        targetId: "operation-a",
+        requiredAction: "relink-source",
+        recommendedWorkspace: "source",
+        retryable: true,
+        sourceAssetIds: ["source-a"],
+        blockedDependencyIds: ["prepared-a"],
+      });
+      throw error;
+    },
+  }], controller.signal);
+
+  await assert.rejects(
+    () => registered.execute({}),
+    (error) => error.code === "SOURCE_RELINK_REQUIRED"
+      && error.targetId === "operation-a"
+      && error.requiredAction === "relink-source"
+      && error.recommendedWorkspace === "source"
+      && error.retryable === true
+      && error.sourceAssetIds[0] === "source-a"
+      && error.blockedDependencyIds[0] === "prepared-a"
+      && !error.message.includes("private source detail"),
+  );
 });
 
 test("runtime health stops advertising actions whose execution path is degraded", async () => {

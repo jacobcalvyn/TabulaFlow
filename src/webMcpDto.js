@@ -4,7 +4,7 @@ function finiteCount(value) {
   return Number.isFinite(Number(value)) ? Number(value) : null;
 }
 
-export function composeNodeSummaryForAgent(node, nodeType = node?.kind === "dataset" ? "dataset" : "operation") {
+export function composeNodeSummaryForAgent(node, nodeType = node?.kind === "dataset" ? "dataset" : "operation", executionState = null) {
   return {
     id: node.id,
     name: node.name,
@@ -12,7 +12,12 @@ export function composeNodeSummaryForAgent(node, nodeType = node?.kind === "data
     kind: nodeType === "dataset" ? "dataset" : node.kind,
     inputIds: nodeType === "dataset" ? [] : [...(node.inputIds ?? [])],
     position: node.position ? { x: Number(node.position.x) || 0, y: Number(node.position.y) || 0 } : null,
-    status: nodeType === "dataset" ? "ready" : node.dataStatus ?? "ready",
+    status: executionState?.status ?? (nodeType === "dataset" ? "ready" : node.dataStatus ?? "ready"),
+    executable: executionState?.executable ?? true,
+    blockedReason: executionState?.blockedReason ?? null,
+    ...(executionState?.requiredAction ? { requiredAction: executionState.requiredAction } : {}),
+    ...(executionState?.sourceAssetIds?.length ? { sourceAssetIds: [...executionState.sourceAssetIds] } : {}),
+    ...(executionState?.blockedDependencyIds?.length ? { blockedDependencyIds: [...executionState.blockedDependencyIds] } : {}),
     validationStatus: nodeType === "dataset" ? null : node.validationStatus ?? null,
     rowCount: finiteCount(node.rowCount),
     columnCount: Array.isArray(node.schema) ? node.schema.length : finiteCount(node.columnCount),

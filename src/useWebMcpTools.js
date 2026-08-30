@@ -33,7 +33,7 @@ const ACTION_TOOL_DEPENDENCIES = Object.freeze({
 
 function applyRuntimeHealthToActions(result, health) {
   const degradedNames = new Set((health.degradedTools ?? []).map((item) => item.tool));
-  const unavailableActions = [];
+  const unavailableActions = [...(result.unavailableActions ?? [])];
   const registrationBlocked = ["registering", "stale", "limit-exceeded"].includes(health.status);
   const actions = (result.actions ?? []).filter((action) => {
     const failedTools = (ACTION_TOOL_DEPENDENCIES[action] ?? []).filter((name) => degradedNames.has(name));
@@ -47,17 +47,20 @@ function applyRuntimeHealthToActions(result, health) {
   });
   const statusByAction = new Map((result.actionStatus ?? []).map((item) => [item.action, item]));
   const actionStatus = (result.actions ?? []).map((action) => {
-    const base = statusByAction.get(action) ?? { action, registered: true, callable: true, blockedReason: null };
+    const base = statusByAction.get(action) ?? { action, registered: true, callable: true, executable: true, blockedReason: null };
     const unavailable = unavailableActions.find((item) => item.action === action);
     return unavailable
       ? { ...base, callable: false, blockedReason: unavailable.reason }
       : base;
   });
   for (const item of actionStatus) {
-    if (item.callable !== false || unavailableActions.some((entry) => entry.action === item.action)) continue;
+    if ((item.callable !== false && item.executable !== false) || unavailableActions.some((entry) => entry.action === item.action)) continue;
     unavailableActions.push({ action: item.action, reason: item.blockedReason ?? "blocked-by-context" });
   }
-  const callableActions = actions.filter((action) => actionStatus.find((item) => item.action === action)?.callable !== false);
+  const callableActions = actions.filter((action) => {
+    const status = actionStatus.find((item) => item.action === action);
+    return status?.callable !== false && status?.executable !== false;
+  });
   return { ...result, actions: callableActions, actionStatus, unavailableActions, runtimeHealth: health };
 }
 
@@ -165,8 +168,10 @@ const VALUE_SCHEMA = {
 };
 
 const PROTECTED_AGENT_VALUE_SCHEMA = strictObject({
-  __tabulaflowProtectedValue: { const: true, description: "Protected value returned by a Compose read. Preserve it unchanged when updating the existing operation." },
-}, ["__tabulaflowProtectedValue"]);
+  __tabulaflowProtectedValue: { const: true, description: "Protected value returned by a WebMCP read. Preserve it unchanged during an unrelated update." },
+  binding: { type: "object", description: "Opaque binding metadata. Preserve it unchanged.", additionalProperties: true },
+  referencedColumns: { type: "array", items: { type: "string" }, uniqueItems: true },
+}, ["__tabulaflowProtectedValue", "binding"]);
 
 const COMPOSE_VALUE_SCHEMA = {
   oneOf: [...VALUE_SCHEMA.oneOf, PROTECTED_AGENT_VALUE_SCHEMA],

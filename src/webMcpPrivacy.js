@@ -39,6 +39,8 @@ export function sanitizeWebMcpError(cause) {
     OPERATION_NOT_FOUND: "The requested operation status is unavailable.",
     IDEMPOTENCY_KEY_REUSED: "The idempotency key was already used for another mutation.",
     SOURCE_RELINK_REQUIRED: "The local source must be re-linked by the user before data operations can continue.",
+    SOURCE_RESTORE_IN_PROGRESS: "The local source is still being restored. Retry after source restoration finishes.",
+    SOURCE_DATA_UNAVAILABLE: "The target data cannot be materialized from its current source dependencies.",
     SOURCE_NOT_UNLINKED: "The source is already linked and does not need a Re-link interaction.",
     FILE_HANDLE_UNAVAILABLE: "The requested local source handle is unavailable.",
     USER_GESTURE_REQUIRED: "The user must complete the requested browser file interaction.",
@@ -47,6 +49,7 @@ export function sanitizeWebMcpError(cause) {
     WEBMCP_INVALID_INPUT: "The tool input does not match the registered WebMCP schema.",
     INTERACTION_NOT_FOUND: "The requested user interaction is unavailable or expired.",
     WRONG_WORKSPACE: "Open the required TabulaFlow workspace before requesting this action.",
+    PREPARED_NOT_ACTIVE: "Open the required prepared dataset before running this action.",
   };
   return {
     code,
@@ -63,6 +66,12 @@ export function webMcpErrorForAgent(cause, metadata = {}) {
     tool: metadata.tool ?? cause?.tool,
     ...(metadata.requestId || cause?.requestId ? { requestId: metadata.requestId ?? cause.requestId } : {}),
     ...(cause?.refreshRequired === true ? { refreshRequired: true } : {}),
+    ...(cause?.targetId ? { targetId: cause.targetId } : {}),
+    ...(cause?.requiredAction ? { requiredAction: cause.requiredAction } : {}),
+    ...(cause?.recommendedWorkspace ? { recommendedWorkspace: cause.recommendedWorkspace } : {}),
+    ...(typeof cause?.retryable === "boolean" ? { retryable: cause.retryable } : {}),
+    ...(Array.isArray(cause?.sourceAssetIds) ? { sourceAssetIds: [...cause.sourceAssetIds] } : {}),
+    ...(Array.isArray(cause?.blockedDependencyIds) ? { blockedDependencyIds: [...cause.blockedDependencyIds] } : {}),
     ...(Number.isInteger(metadata.generation) ? { generation: metadata.generation } : {}),
   });
   return error;

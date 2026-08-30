@@ -26,6 +26,7 @@ import {
   updateNodePosition,
   validateFlowGraph,
 } from "../src/flowModel.js";
+import { assertNodeExecutable, resolveNodeExecutionState } from "../src/flowExecutionState.js";
 
 test("new flows include persistent qualitative coding projects", () => {
   const graph = createFlowGraph();
@@ -274,6 +275,52 @@ test("creates an independent prepared dataset from a Compose result", () => {
   assert.equal(created.graph.activeNodeId, created.preparedInput.id);
   assert.equal(isFlowFileSource(created.sourceAsset), false);
   assert.equal(isFlowFileSource(left.sourceAsset), true);
+});
+
+test("source executability propagates through Compose and promoted prepared results", () => {
+  const left = prepared("orders");
+  const right = prepared("customers");
+  let graph = addPreparedInput(createFlowGraph(), left.sourceAsset, left.preparedInput);
+  graph = addPreparedInput(graph, right.sourceAsset, right.preparedInput);
+  const joined = addComposeNode(graph, {
+    kind: "join",
+    name: "Orders joined",
+    inputIds: [left.preparedInput.id, right.preparedInput.id],
+    config: {},
+  });
+  const promoted = createPreparedFromCompose(joined.graph, joined.node.id);
+  const unavailable = {
+    ...promoted.graph,
+    sourceAssets: promoted.graph.sourceAssets.map((source) => source.id === left.sourceAsset.id
+      ? { ...source, status: "unlinked" }
+      : source),
+  };
+
+  const originalState = resolveNodeExecutionState(unavailable, left.preparedInput.id);
+  const joinState = resolveNodeExecutionState(unavailable, joined.node.id);
+  const promotedState = resolveNodeExecutionState(unavailable, promoted.preparedInput.id);
+
+  assert.equal(originalState.blockedReason, "SOURCE_RELINK_REQUIRED");
+  assert.equal(joinState.status, "blocked");
+  assert.equal(promotedState.executable, false);
+  assert.deepEqual(promotedState.sourceAssetIds, [left.sourceAsset.id]);
+  assert.ok(promotedState.blockedDependencyIds.includes(joined.node.id));
+  assert.ok(promotedState.blockedDependencyIds.includes(left.preparedInput.id));
+  assert.throws(
+    () => assertNodeExecutable(unavailable, promoted.preparedInput.id),
+    (error) => error.code === "SOURCE_RELINK_REQUIRED"
+      && error.targetId === promoted.preparedInput.id
+      && error.requiredAction === "relink-source",
+  );
+});
+
+test("restoring local sources are blocked with a retryable state", () => {
+  const created = prepared("orders");
+  const graph = addPreparedInput(createFlowGraph(), { ...created.sourceAsset, status: "restoring" }, created.preparedInput);
+  const state = resolveNodeExecutionState(graph, created.preparedInput.id);
+  assert.equal(state.executable, false);
+  assert.equal(state.blockedReason, "SOURCE_RESTORE_IN_PROGRESS");
+  assert.equal(state.retryable, true);
 });
 
 test("tracks ancestors and descendants in dependency order", () => {
