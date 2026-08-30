@@ -156,6 +156,24 @@ test("reuses one source asset when the same local file is opened again", () => {
   assert.equal(findMatchingFileSource(graph, { name: "orders.csv", size: 10, lastModified: 20 }, ["id"])?.id, first.sourceAsset.id);
 });
 
+test("agent-workspace sources preserve provenance and relink by content digest", () => {
+  const created = createPreparedInput(
+    { kind: "agent", size: 10, lastModified: 1, contentSha256: "digest-a", agentUploadId: "upload-a" },
+    { filename: "orders.csv", sourceColumns: ["id"], columns: ["id"], columnTypes: { id: "VARCHAR" } },
+  );
+  const graph = addPreparedInput(createFlowGraph(), created.sourceAsset, created.preparedInput);
+  assert.equal(created.sourceAsset.location, "agent-workspace");
+  assert.equal(created.sourceAsset.agentUploadId, "upload-a");
+  assert.equal(isFlowFileSource(created.sourceAsset), true);
+  assert.equal(findMatchingFileSource(
+    graph,
+    { name: "orders.csv", size: 10, lastModified: 2 },
+    ["id"],
+    { kind: "agent", contentSha256: "digest-a" },
+  )?.id, created.sourceAsset.id);
+  assert.equal(markSourcesUnlinked(graph).sourceAssets[0].status, "restoring");
+});
+
 test("consolidates duplicate persisted file sources without removing prepared branches", () => {
   const first = prepared("orders");
   const second = prepared("orders");

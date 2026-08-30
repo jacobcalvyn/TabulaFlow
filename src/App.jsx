@@ -87,6 +87,13 @@ import { activatePreparedForFlow } from "./preparedActivation.js";
 import { assertNodeExecutable, resolveNodeExecutionState } from "./flowExecutionState.js";
 import { getCloudAccount, getCloudFiles, openCloudFile, uploadCloudFile } from "./cloudFiles.js";
 import {
+  beginAgentUpload,
+  cancelAgentUpload,
+  completeAgentUpload,
+  getAgentUploadStatus,
+  openAgentUpload,
+} from "./agentUploads.js";
+import {
   PREPARED_RECIPE_STATUS,
   recipeForExecution,
 } from "./preparedRecipeState.js";
@@ -170,6 +177,7 @@ function contextualActionStatus(actions, executionState, executionActions) {
 }
 
 const ACCEPTED_FILES = ".xlsx,.xls,.csv,.json,.jsonl,.ndjson";
+const AGENT_UPLOAD_CONSENT_PREFIX = "tabulaflow-agent-upload-consent:";
 const WEBMCP_CONFIRMATION_TTL_MS = 10 * 60 * 1000;
 const PREVIEW_ROW_HEIGHT = 36;
 const PREVIEW_OVERSCAN = 4;
@@ -394,7 +402,7 @@ function AccountScreen({ onOpenFile, uploadRequestToken, onUploadRequestShown, a
     setBusy(true);
     setError("");
     try {
-      await onOpenFile(await openCloudFile(file));
+      await onOpenFile(await openCloudFile(file), file);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("cloudOpenFailed"));
     } finally {
@@ -503,7 +511,7 @@ function AccountScreen({ onOpenFile, uploadRequestToken, onUploadRequestShown, a
   );
 }
 
-export function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, onSourceInteractionCancelled, onResetAll, workerReady, openedSources, fileRequestToken, onFileRequestShown, relinkRequest, onRelinkRequestShown, resetRequest, onResetRequestShown, onResetRequestResolved }) {
+export function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSource, onSourceInteractionCancelled, onResetAll, workerReady, openedSources, fileRequestToken, onFileRequestShown, relinkRequest, onRelinkRequestShown, resetRequest, onResetRequestShown, onResetRequestResolved, agentUploadPermissionRequest, onAgentUploadPermissionResolved }) {
   const { formatNumber, t } = useI18n();
   const inputRef = useRef(null);
   const chooseFileButtonRef = useRef(null);
@@ -636,6 +644,22 @@ export function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSour
 
       {error && <p className="error-message" role="alert">{error}</p>}
 
+      {agentUploadPermissionRequest?.interactionId && (
+        <section className="agent-upload-consent" role="alertdialog" aria-labelledby="agent-upload-consent-title" aria-describedby="agent-upload-consent-description">
+          <div>
+            <span className="agent-upload-consent__icon"><Robot weight="duotone" /></span>
+            <div>
+              <strong id="agent-upload-consent-title">{t("agentUploadConsentTitle")}</strong>
+              <span id="agent-upload-consent-description">{t("agentUploadConsentDescription")}</span>
+            </div>
+          </div>
+          <div className="agent-upload-consent__actions">
+            <button type="button" onClick={() => onAgentUploadPermissionResolved?.("cancelled")}>{t("cancel")}</button>
+            <button className="agent-upload-consent__allow" type="button" onClick={() => onAgentUploadPermissionResolved?.("completed")}>{t("agentUploadAllow")}</button>
+          </div>
+        </section>
+      )}
+
       <section className="opened-sources" aria-labelledby="opened-sources-title">
         <header>
           <div className="file-heading__content">
@@ -671,7 +695,7 @@ export function InputScreen({ loading, error, onFile, onOpenSource, onRelinkSour
                 <button className="opened-source__main" type="button" onClick={() => onOpenSource(source.preparedId)} disabled={source.status !== "linked"}>
                   <strong title={source.name}>{source.name}</strong>
                   <span>
-                    {source.kind === "compose" ? t("composeResult") : t("localDevice")}
+                    {source.kind === "compose" ? t("composeResult") : source.kind === "agent" ? t("agentWorkspace") : source.kind === "cloud" ? t("tabulaFlowCloud") : t("localDevice")}
                     {source.size !== null && source.size !== undefined ? ` · ${formatNumber(source.size)} byte` : ""}
                   </span>
                 </button>
@@ -2178,6 +2202,8 @@ export function App() {
   const [webMcpFileRequestToken, setWebMcpFileRequestToken] = useState(0);
   const [webMcpRelinkRequest, setWebMcpRelinkRequest] = useState(null);
   const [webMcpCloudUploadToken, setWebMcpCloudUploadToken] = useState(0);
+  const [webMcpAgentUploadPermissionRequest, setWebMcpAgentUploadPermissionRequest] = useState(null);
+  const [agentUploadAllowed, setAgentUploadAllowed] = useState(false);
   const [webMcpDeleteRequest, setWebMcpDeleteRequest] = useState(null);
   const [webMcpResetRequest, setWebMcpResetRequest] = useState(null);
   const restoreStartedRef = useRef(false);
@@ -2200,6 +2226,9 @@ export function App() {
 
   useEffect(() => { flowRef.current = flow; }, [flow]);
   useEffect(() => { filtersRef.current = filters; }, [filters]);
+  useEffect(() => {
+    setAgentUploadAllowed(globalThis.sessionStorage?.getItem(`${AGENT_UPLOAD_CONSENT_PREFIX}${flow.id}`) === "allowed");
+  }, [flow.id]);
 
   useEffect(() => {
     if (!flowHydrated) return undefined;
@@ -2369,13 +2398,14 @@ export function App() {
       sourceAssetId: source.id,
       preparedId: prepared?.id ?? null,
       name: source.name,
-      kind: "local",
+      kind: source.location === "agent-workspace" ? "agent" : source.location === "cloud-file" ? "cloud" : "local",
       size: source.size,
       status: source.status ?? "unlinked",
     };
   }), [flow.preparedInputs, flow.sourceAssets]);
 
   const resetAll = useCallback(async () => {
+    const resetFlowId = flowRef.current.id;
     setLoading(true);
     setError("");
     try {
@@ -2413,6 +2443,9 @@ export function App() {
       setWebMcpFileRequestToken(0);
       setWebMcpRelinkRequest(null);
       setWebMcpCloudUploadToken(0);
+      globalThis.sessionStorage?.removeItem(`${AGENT_UPLOAD_CONSENT_PREFIX}${resetFlowId}`);
+      setAgentUploadAllowed(false);
+      setWebMcpAgentUploadPermissionRequest(null);
       setWebMcpDeleteRequest(null);
       setWebMcpResetRequest(null);
       return true;
@@ -2577,7 +2610,7 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [error, screen]);
 
-  const loadFile = async (nextFile, handle = null, throwOnError = false, beforeCommit = null, activityContext = null) => {
+  const loadFile = async (nextFile, handle = null, throwOnError = false, beforeCommit = null, activityContext = null, sourceMetadata = null) => {
     let transientPreparedId = null;
     setError("");
     if (!isSupportedFile(nextFile.name)) {
@@ -2591,7 +2624,7 @@ export function App() {
     setLoading(true);
     try {
       const inspected = await worker.inspectFile(nextFile, { signal: beforeCommit?.signal });
-      const matchingSource = findMatchingFileSource(flowRef.current, nextFile, inspected.sourceColumns);
+      const matchingSource = findMatchingFileSource(flowRef.current, nextFile, inspected.sourceColumns, sourceMetadata);
       if (matchingSource) {
         const storedHandle = await loadStoredSourceHandle(matchingSource.id);
         const sameEntry = !handle || !storedHandle || await isSameFileEntry(storedHandle, handle);
@@ -2605,13 +2638,16 @@ export function App() {
       transientPreparedId = result.preparedId;
       beforeCommit?.();
       await activateDataset(result, {
-        kind: "local",
+        kind: sourceMetadata?.kind ?? "local",
         size: nextFile.size,
         lastModified: nextFile.lastModified,
+        contentSha256: sourceMetadata?.contentSha256 ?? null,
+        cloudFileId: sourceMetadata?.cloudFileId ?? null,
+        agentUploadId: sourceMetadata?.agentUploadId ?? null,
       }, []);
       transientPreparedId = null;
       if (handle && result.sourceId) await saveStoredSourceHandle(result.sourceId, handle);
-      const activity = await recordActivity({ action: "source_imported", targetType: "source", targetId: result.sourceId, summary: { rowCount: result.rowCount, columnCount: result.columns.length } }, activityContext ?? undefined);
+      const activity = await recordActivity({ action: "source_imported", targetType: "source", targetId: result.sourceId, summary: { rowCount: result.rowCount, columnCount: result.columns.length, origin: sourceMetadata?.kind ?? "local" } }, activityContext ?? undefined);
       sourceInteractionsRef.current.resolveLatest("source-file", "completed");
       return { ok: true, sourceId: result.sourceId, preparedId: result.preparedId, activity };
     } catch (cause) {
@@ -3371,7 +3407,7 @@ export function App() {
     if (!metadata) throw new Error(`Cloud file not found: ${fileId}`);
     const file = await openCloudFile(metadata, { signal: assertCurrent.signal });
     setScreen("input");
-    await loadFile(file, null, true, assertCurrent, webMcpActivity(meta));
+    await loadFile(file, null, true, assertCurrent, webMcpActivity(meta), { kind: "cloud", cloudFileId: fileId });
     return { fileId, name: metadata.name, size: metadata.size };
   }, `cloud:open:${fileId}`);
 
@@ -3381,6 +3417,85 @@ export function App() {
     setScreen("account");
     setWebMcpCloudUploadToken((current) => current + 1);
   };
+
+  const beginAgentUploadFromTool = async ({ fileName, size, contentType, sha256, requestId }) => {
+    if (!worker.ready) {
+      const unavailable = new Error("The local data engine is still starting. Try again when workspace state reports ready.");
+      unavailable.code = "WORKER_NOT_READY";
+      throw unavailable;
+    }
+    if (!agentUploadAllowed) {
+      const existing = sourceInteractionsRef.current.list().find((item) => item.kind === "agent-upload-permission");
+      const interaction = existing ?? sourceInteractionsRef.current.create("agent-upload-permission", {
+        workspace: "source",
+        workspaceChanged: screen !== "input",
+      });
+      setScreen("input");
+      setWebMcpAgentUploadPermissionRequest(interaction);
+      return {
+        ...interaction,
+        requiredAction: "Allow AI uploads for this flow session in Source.",
+        blockedReason: "USER_GESTURE_REQUIRED",
+        workspaceRevision: workspaceRevisionRef.current,
+      };
+    }
+    const upload = await beginAgentUpload({ fileName, size, contentType, sha256, flowId: flowRef.current.id, requestId });
+    return { ...upload, flowId: flowRef.current.id, workspaceRevision: workspaceRevisionRef.current };
+  };
+
+  const getAgentUploadStatusFromTool = async (uploadId) => {
+    const upload = await getAgentUploadStatus(uploadId);
+    if (upload.flowId !== flowRef.current.id) {
+      const mismatch = new Error("Agent upload belongs to another flow.");
+      mismatch.code = "UPLOAD_FLOW_MISMATCH";
+      throw mismatch;
+    }
+    return { ...upload, workspaceRevision: workspaceRevisionRef.current };
+  };
+
+  const cancelAgentUploadFromTool = async (uploadId) => {
+    const upload = await cancelAgentUpload(uploadId);
+    return { ...upload, workspaceRevision: workspaceRevisionRef.current };
+  };
+
+  const commitAgentUploadFromTool = async (uploadId, meta) => runWebMcpMutation({
+    ...meta,
+    target: { type: "source", id: uploadId },
+  }, async (assertCurrent) => {
+    const upload = await getAgentUploadStatus(uploadId);
+    if (upload.flowId !== flowRef.current.id) {
+      const mismatch = new Error("Agent upload belongs to another flow.");
+      mismatch.code = "UPLOAD_FLOW_MISMATCH";
+      throw mismatch;
+    }
+    if (upload.status !== "uploaded") {
+      const unavailable = new Error(`Agent upload is ${upload.status}; upload the exact bytes before committing.`);
+      unavailable.code = upload.status === "expired" ? "UPLOAD_SESSION_EXPIRED" : "UPLOAD_NOT_READY";
+      throw unavailable;
+    }
+    const file = await openAgentUpload(uploadId, { signal: assertCurrent.signal });
+    setScreen("input");
+    const imported = await loadFile(file, null, true, assertCurrent, webMcpActivity(meta), {
+      kind: "agent",
+      contentSha256: upload.sha256,
+      agentUploadId: uploadId,
+    });
+    let cleanupStatus = "consumed";
+    try {
+      await completeAgentUpload(uploadId);
+    } catch {
+      cleanupStatus = "cleanup-pending";
+    }
+    return {
+      uploadId,
+      sourceId: imported.sourceId ?? null,
+      preparedId: imported.preparedId ?? null,
+      relinked: imported.relinked === true,
+      fileName: upload.fileName,
+      size: upload.size,
+      cleanupStatus,
+    };
+  }, `agent-upload:commit:${uploadId}`);
 
   const getPrepareDatasetFromTool = async (preparedId) => {
     const prepared = assertActivePreparedForTool(preparedId);
@@ -3608,7 +3723,7 @@ export function App() {
   const getAvailableActionsFromTool = async (targetId) => {
     if (!targetId) {
       const workspace = screen === "input" ? "source" : screen === "data" ? "prepare" : screen;
-      const actions = screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", "qualitative-coding", ...(recipeHistory.recipe.length ? ["request-delete-all-recipe-steps"] : []), "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", ...(flowRef.current.sourceAssets.length ? ["request-reset-all"] : []), "inspect-activity"];
+      const actions = screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", "qualitative-coding", ...(recipeHistory.recipe.length ? ["request-delete-all-recipe-steps"] : []), "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", "begin-agent-upload", "get-agent-upload-status", "commit-agent-upload", "cancel-agent-upload", ...(flowRef.current.sourceAssets.length ? ["request-reset-all"] : []), "inspect-activity"];
       const hasUnlinkedSource = flowRef.current.sourceAssets.some((source) => isFlowFileSource(source) && source.status === "unlinked");
       const activeTargetId = screen === "data" ? activePreparedIdRef.current : screen === "compose" ? flowRef.current.activeNodeId : null;
       const executionState = activeTargetId ? resolveNodeExecutionState(flowRef.current, activeTargetId) : null;
@@ -4123,6 +4238,11 @@ export function App() {
       activeOperationIds: webMcpMutationRunnerRef.current.getActiveOperationIds(),
       workspace: screen === "input" ? "source" : screen === "data" ? "prepare" : screen,
       worker: { ready: worker.ready, recovering: worker.recovering },
+      sourceImportModes: [
+        { mode: "local-user-picker", available: worker.ready, userGestureRequired: true },
+        { mode: "agent-upload", available: worker.ready, consentGranted: agentUploadAllowed, userGestureRequired: !agentUploadAllowed },
+        { mode: "cloud-file", available: true, authenticationRequired: true },
+      ],
       flowDirty,
       diagnostics: [
         ...(error ? [{ scope: "source-or-prepare", level: "error", message: error }] : []),
@@ -4189,7 +4309,7 @@ export function App() {
         project,
         flow.preparedInputs.find((item) => item.id === project.preparedId)?.rowCount ?? null,
       )),
-      sourceAssets: flow.sourceAssets.map((item) => ({ id: item.id, name: item.name, location: item.location, status: item.status, size: item.size ?? null })),
+      sourceAssets: flow.sourceAssets.map((item) => ({ id: item.id, name: item.name, location: item.location, status: item.status, size: item.size ?? null, provenance: item.location === "agent-workspace" ? "agent-vm" : item.location === "cloud-file" ? "cloud-account" : "user-local" })),
     },
     actions: {
       openWorkspace,
@@ -4200,7 +4320,11 @@ export function App() {
       getActiveOperationIds: () => webMcpMutationRunnerRef.current.getActiveOperationIds(),
       getPendingInteractions: () => sourceInteractionsRef.current.list(),
       cancelOperation: (operationId) => webMcpMutationRunnerRef.current.cancelOperation(operationId),
-      cancelInteraction: (interactionId) => sourceInteractionsRef.current.cancel(interactionId),
+      cancelInteraction: (interactionId) => {
+        const result = sourceInteractionsRef.current.cancel(interactionId);
+        if (result.kind === "agent-upload-permission") setWebMcpAgentUploadPermissionRequest(null);
+        return result;
+      },
       fenceMutations: () => webMcpMutationRunnerRef.current.fenceMutations(),
       getPendingConfirmations: getPendingConfirmationsFromTool,
       rejectConfirmation: rejectConfirmationFromTool,
@@ -4239,6 +4363,10 @@ export function App() {
       listCloudFiles: listCloudFilesFromTool,
       openCloudFile: openCloudFileFromTool,
       requestCloudUpload: requestCloudUploadFromTool,
+      beginAgentUpload: beginAgentUploadFromTool,
+      getAgentUploadStatus: getAgentUploadStatusFromTool,
+      commitAgentUpload: commitAgentUploadFromTool,
+      cancelAgentUpload: cancelAgentUploadFromTool,
       exportPrepare: exportPrepareFromTool,
       addRecipeStep: addRecipeStepFromTool,
       updateRecipeStep: updateRecipeStepFromTool,
@@ -4265,7 +4393,7 @@ export function App() {
       {activityOverrideNotice && <div className="activity-override-notice" role="status"><ClockCounterClockwise weight="bold" /><span>{t("activityOverrideNotice")}</span><button type="button" aria-label={t("closeForm")} onClick={() => setActivityOverrideNotice("")}><X weight="bold" /></button></div>}
       {screen === "account" ? (
         <AccountScreen
-          onOpenFile={async (file) => { setScreen("input"); await loadFile(file, null); }}
+          onOpenFile={async (file, metadata) => { setScreen("input"); await loadFile(file, null, false, null, null, { kind: "cloud", cloudFileId: metadata?.id ?? null }); }}
           uploadRequestToken={webMcpCloudUploadToken}
           onUploadRequestShown={(token) => setWebMcpCloudUploadToken((current) => current === token ? 0 : current)}
           activityEvents={activityEvents}
@@ -4292,6 +4420,18 @@ export function App() {
           resetRequest={webMcpResetRequest}
           onResetRequestShown={() => undefined}
           onResetRequestResolved={(token, outcome) => void resolveResetConfirmation(token, outcome)}
+          agentUploadPermissionRequest={webMcpAgentUploadPermissionRequest}
+          onAgentUploadPermissionResolved={(outcome) => {
+            const interaction = sourceInteractionsRef.current.resolveLatest("agent-upload-permission", outcome, {
+              reason: outcome === "completed" ? null : "USER_CANCELLED",
+            });
+            if (outcome === "completed" && interaction?.status === "completed") {
+              globalThis.sessionStorage?.setItem(`${AGENT_UPLOAD_CONSENT_PREFIX}${flowRef.current.id}`, "allowed");
+              setAgentUploadAllowed(true);
+            }
+            setWebMcpAgentUploadPermissionRequest(null);
+            return interaction;
+          }}
         />
       ) : screen === "compose" ? (
         <ComposeScreen

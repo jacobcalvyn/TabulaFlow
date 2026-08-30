@@ -20,6 +20,12 @@ const SAFE_OPERATION_RESULT_KEYS = new Set([
   "columnCount",
   "pendingConfirmation",
   "confirmed",
+  "uploadId",
+  "sourceId",
+  "fileName",
+  "size",
+  "cleanupStatus",
+  "relinked",
 ]);
 
 const SAFE_ERROR_RECOVERY = {
@@ -61,6 +67,19 @@ export function sanitizeWebMcpError(cause) {
     PROTECTED_VALUE_NOT_RESTORABLE: "The protected value no longer has a matching saved value in the current workspace state.",
     PROTECTED_VALUE_BINDING_MISMATCH: "The protected value binding does not match the current workspace state.",
     STALE_VALUE_REFERENCE: "The protected value reference expired after the data context changed. Query column values again and retry with the new valueRef.",
+    UPLOAD_NOT_FOUND: "The agent upload session is unavailable or expired.",
+    UPLOAD_SESSION_UNAVAILABLE: "The agent upload belongs to another browser session or has expired.",
+    UPLOAD_TOKEN_INVALID: "The agent upload capability is invalid.",
+    UPLOAD_FLOW_MISMATCH: "The agent upload belongs to another flow.",
+    UPLOAD_NOT_READY: "Upload the exact file bytes before committing this agent upload.",
+    UPLOAD_SESSION_EXPIRED: "The agent upload session expired. Start a new upload.",
+    UPLOAD_HASH_MISMATCH: "The uploaded bytes do not match the declared SHA-256 digest.",
+    UPLOAD_SIZE_MISMATCH: "The uploaded bytes do not match the declared size.",
+    UPLOAD_TYPE_UNSUPPORTED: "The agent upload file type is unsupported.",
+    UPLOAD_SIZE_EXCEEDED: "The agent upload exceeds the supported size limit.",
+    UPLOAD_QUOTA_EXCEEDED: "The agent upload rate or storage quota was exceeded.",
+    UPLOAD_CONTENT_INVALID: "The uploaded bytes do not match the declared file format.",
+    UPLOAD_STORAGE_UNAVAILABLE: "Agent upload storage is temporarily unavailable.",
   };
   const recovery = SAFE_ERROR_RECOVERY[code] ?? {};
   return {

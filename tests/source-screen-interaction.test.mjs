@@ -110,3 +110,16 @@ test("a WebMCP Reset all request opens the same visible confirmation and can be 
   assert.deepEqual(resolutions, [{ token: "reset-token", outcome: "cancelled" }]);
   view.unmount();
 });
+
+test("agent upload requires one visible session consent decision", () => {
+  const outcomes = [];
+  const view = renderSource({
+    agentUploadPermissionRequest: { interactionId: "interaction-agent-upload" },
+    onAgentUploadPermissionResolved: (outcome) => outcomes.push(outcome),
+  });
+  const dialog = view.getByRole("alertdialog", { name: "Allow AI uploads for this session?" });
+  assert.ok(dialog.textContent.includes("never grants access to files on your device"));
+  fireEvent.click(view.getByRole("button", { name: "Allow AI uploads" }));
+  assert.deepEqual(outcomes, ["completed"]);
+  view.unmount();
+});

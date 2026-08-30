@@ -23,7 +23,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "3.2.6", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "3.3.0", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -59,6 +59,10 @@ function createContext() {
         async listCloudFiles() { calls.push(["cloud-list"]); return { authenticated: true, files: [{ id: "cloud-a" }] }; },
         async openCloudFile(fileId, meta) { calls.push(["cloud-open", fileId, meta]); return result({ fileId, name: "orders.csv" }); },
         async requestCloudUpload() { calls.push(["cloud-upload"]); },
+        async beginAgentUpload(input) { calls.push(["agent-upload-begin", input]); return { uploadId: "upload-a", uploadUrl: "https://upload.test/a", status: "pending" }; },
+        async getAgentUploadStatus(uploadId) { calls.push(["agent-upload-status", uploadId]); return { uploadId, status: "uploaded" }; },
+        async commitAgentUpload(uploadId, meta) { calls.push(["agent-upload-commit", uploadId, meta]); return result({ uploadId, sourceId: "source-b", preparedId: "prepared-b" }); },
+        async cancelAgentUpload(uploadId) { calls.push(["agent-upload-cancel", uploadId]); return { uploadId, status: "cancelled" }; },
         async selectPrepared(preparedId, meta) { calls.push(["prepared", preparedId, meta]); },
         async getRecipe(preparedId) { calls.push(["recipe", preparedId]); return { preparedId, name: "Orders", recipe: [] }; },
         async getSemanticModel(targetId) { calls.push(["semantic", targetId]); return { targetId, revision: 0, fields: {} }; },
@@ -119,6 +123,7 @@ const GLOBAL_TOOL_NAMES = [
   "tabulaflow_get_pending_confirmations", "tabulaflow_reject_confirmation", "tabulaflow_open_workspace",
   "tabulaflow_request_source_file", "tabulaflow_request_source_relink", "tabulaflow_request_reset_all", "tabulaflow_list_cloud_files",
   "tabulaflow_open_cloud_file", "tabulaflow_request_cloud_upload",
+  "tabulaflow_begin_agent_upload", "tabulaflow_get_agent_upload_status", "tabulaflow_commit_agent_upload", "tabulaflow_cancel_agent_upload",
 ];
 
 const ALL_TOOL_NAMES = [
@@ -141,7 +146,7 @@ test("WebMCP exposes contextual Agent-Ready v2 tools", () => {
   assert.deepEqual(createWebMcpTools(ref, { hasDataset: false, hasPrepared: false, hasComposeNodes: false }).map((tool) => tool.name), GLOBAL_TOOL_NAMES);
   const allTools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   assert.deepEqual(allTools.map((tool) => tool.name), ALL_TOOL_NAMES);
-  assert.equal(new Set(ALL_TOOL_NAMES).size, 62);
+  assert.equal(new Set(ALL_TOOL_NAMES).size, 66);
 });
 
 test("WebMCP confirmation protocol is inspect-or-reject and never exposes agent confirmation", async () => {
@@ -178,13 +183,14 @@ test("qualitative coding WebMCP uses one bounded dispatcher and keeps approval h
   assert.equal(coding.inputSchema.properties.action.enum.includes("approve"), false);
 });
 
-test("WebMCP 3.2.6 registers one small stable dispatcher surface", () => {
+test("WebMCP 3.3.0 registers one small stable dispatcher surface", () => {
   const { ref } = createContext();
   const stable = createWebMcpStableTools(ref);
   assert.deepEqual(stable.map((tool) => tool.name), WEBMCP_STABLE_TOOL_NAMES);
   assert.deepEqual(stable.slice(0, WEBMCP_CORE_TOOL_NAMES.length).map((tool) => tool.name), WEBMCP_CORE_TOOL_NAMES);
   assert.equal(new Set(stable.map((tool) => tool.name)).size, stable.length);
   assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.source, "request_source_file"));
+  assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.source, "begin_agent_upload"));
   assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.prepareRead, "get_prepare_preview"));
   assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.prepareMutate, "add_recipe_step"));
   assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.composeRead, "get_compose_graph"));
@@ -215,6 +221,29 @@ test("stable dispatchers validate the selected action schema and route against c
     }),
     (error) => error.code === "WEBMCP_INVALID_INPUT" && error.phase === "input-validation",
   );
+});
+
+test("Source dispatcher exposes agent upload transport without adding a top-level tool", async () => {
+  const { calls, ref } = createContext();
+  const source = toolByName(createWebMcpStableTools(ref), "tabulaflow_source");
+  const sha256 = "a".repeat(64);
+  const begun = await source.execute({
+    action: "begin_agent_upload",
+    input: { fileName: "fixture.csv", size: 18, contentType: "text/csv", sha256, requestId: "agent-upload-begin-001" },
+  });
+  assert.equal(begun.structuredContent.uploadId, "upload-a");
+  assert.ok(calls.some((call) => call[0] === "agent-upload-begin"));
+
+  const status = await source.execute({ action: "get_agent_upload_status", input: { uploadId: "upload-a" } });
+  assert.equal(status.structuredContent.status, "uploaded");
+  await source.execute({
+    action: "commit_agent_upload",
+    input: { uploadId: "upload-a", ...mutation("agent-upload-commit-001") },
+  });
+  await source.execute({ action: "cancel_agent_upload", input: { uploadId: "upload-b" } });
+  assert.ok(calls.some((call) => call[0] === "agent-upload-commit" && call[1] === "upload-a"));
+  assert.ok(calls.some((call) => call[0] === "agent-upload-cancel" && call[1] === "upload-b"));
+  assert.equal(createWebMcpStableTools(ref).length, WEBMCP_STABLE_TOOL_NAMES.length);
 });
 
 test("WebMCP publishes and executes the expanded Formula column catalog through stable dispatchers", async () => {
@@ -330,7 +359,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "3.2.6");
+  assert.equal(capabilities.structuredContent.contractVersion, "3.3.0");
   assert.deepEqual(capabilities.structuredContent.operationLifecycle.terminalStates, ["succeeded", "failed", "cancelled"]);
   assert.deepEqual(capabilities.structuredContent.operationLifecycle.cancelOutcomes, ["CANCEL_ACCEPTED", "ALREADY_TERMINAL", "TOO_LATE_TO_CANCEL"]);
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);

@@ -433,6 +433,19 @@ const UPDATE_COMPOSE_OPERATION_SCHEMA = Object.freeze(strictObject({
 const SOURCE_RELINK_SCHEMA = Object.freeze(strictObject({ sourceAssetId: ID }));
 const RESET_ALL_SCHEMA = Object.freeze(strictObject({ ...MUTATION_META }));
 const CLOUD_FILE_SCHEMA = Object.freeze(strictObject({ fileId: ID, ...MUTATION_META }));
+const BEGIN_AGENT_UPLOAD_SCHEMA = Object.freeze(strictObject({
+  fileName: { type: "string", minLength: 1, maxLength: 180, description: "Filename in the agent workspace, including a supported extension." },
+  size: { type: "integer", minimum: 1, maximum: 52_428_800, description: "Exact file size in bytes." },
+  contentType: { type: "string", minLength: 1, maxLength: 120, description: "Declared MIME type. The server still validates the content." },
+  sha256: { type: "string", pattern: "^[a-f0-9]{64}$", description: "Lowercase SHA-256 digest of the exact bytes that will be uploaded." },
+  requestId: MUTATION_META.requestId,
+}, ["fileName", "size", "contentType", "sha256", "requestId"]));
+const AGENT_UPLOAD_SCHEMA = Object.freeze(strictObject({ uploadId: ID }));
+const COMMIT_AGENT_UPLOAD_SCHEMA = Object.freeze(strictObject({
+  uploadId: ID,
+  ...MUTATION_META,
+  executionMode: MUTATION_EXECUTION_MODE,
+}, ["uploadId", "expectedRevision", "requestId"]));
 
 const FILTER_MUTATION_SCHEMA = Object.freeze(strictObject({
   preparedId: ID,
@@ -514,6 +527,10 @@ export const WEBMCP_DISPATCH_ACTIONS = Object.freeze({
     "tabulaflow_list_cloud_files",
     "tabulaflow_open_cloud_file",
     "tabulaflow_request_cloud_upload",
+    "tabulaflow_begin_agent_upload",
+    "tabulaflow_get_agent_upload_status",
+    "tabulaflow_commit_agent_upload",
+    "tabulaflow_cancel_agent_upload",
   ]),
   prepareRead: dispatcherActions([
     "tabulaflow_get_calculation_catalog",
@@ -616,6 +633,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     "promote-compose-result",
     "request-source-relink",
     "cloud-file-access",
+    "agent-workspace-upload",
     "inspect-shared-activity",
     "inspect-changes-since-cursor",
     "inspect-mutation-operation",
@@ -641,6 +659,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     localFileSelection: "user-action-required",
     deletion: "visible-user-confirmation-required",
     cloudFiles: "chatgpt-sign-in-required",
+    agentUploads: "session-consent-and-short-lived-capability-required",
     dataExposure: "conservative-redaction-floor",
     semanticDeclassification: "visible-user-action-required",
     recipeLiterals: "opaque-preserve-only",
@@ -654,7 +673,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
 const WORKFLOW_GUIDE = Object.freeze({
   contractVersion: WEBMCP_CONTRACT_VERSION,
   flow: [
-    { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
+    { workspace: "source", purpose: "Open local, agent-workspace, or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture; agent bytes use a short-lived upload capability." },
     { workspace: "prepare", purpose: "Inspect one prepared dataset, maintain its recipe, and review optional qualitative coding suggestions against a human-owned codebook." },
     { workspace: "compose", purpose: "Create a dependency graph across prepared datasets and operation results without mutating upstream inputs." },
   ],
@@ -663,7 +682,7 @@ const WORKFLOW_GUIDE = Object.freeze({
     concurrency: "Pass the latest workspaceRevision as expectedRevision and a unique requestId with every mutation or export side effect. Operation and idempotency status persist for the active flow across page reloads.",
     visibility: "Every successful action updates the same visible state used by the user.",
     activity: "UI and WebMCP changes share one privacy-safe persistent ledger. Read it before continuing after user interaction.",
-    userControlled: ["local file selection", "source relinking", "cloud upload file selection", "deletion confirmation"],
+    userControlled: ["local file selection", "source relinking", "first agent-upload consent per flow session", "cloud upload file selection", "deletion confirmation"],
     qualitativeCoding: "AI receives only time-bounded pseudonymized batches and can submit suggestions; only human-accepted assignments can be materialized for Compose.",
   },
 });
@@ -918,6 +937,54 @@ export function createWebMcpTools(contextRef, availability) {
       const { actions } = activeContext(contextRef);
       await actions.requestCloudUpload();
       return webMcpResult("The cloud upload control is ready for the user.", { awaitingUser: true, workspace: "account" });
+    },
+  }, {
+    name: "tabulaflow_begin_agent_upload",
+    title: "Begin an agent-workspace file upload",
+    description: "Create a short-lived upload capability for a file that already exists in the agent's own workspace. The first request in a flow session requires visible user consent. File bytes are uploaded directly to the returned HTTP URL, never through WebMCP.",
+    inputSchema: BEGIN_AGENT_UPLOAD_SCHEMA,
+    annotations: { readOnlyHint: false, untrustedContentHint: true },
+    async execute(input) {
+      const { actions } = activeContext(contextRef);
+      const result = await actions.beginAgentUpload(input);
+      return webMcpResult(result.awaitingUser
+        ? "Agent upload requires one visible user approval for this flow session."
+        : `Created agent upload session ${result.uploadId}. Send the exact bytes to uploadUrl with HTTP PUT, then commit the upload.`, result);
+    },
+  }, {
+    name: "tabulaflow_get_agent_upload_status",
+    title: "Get agent upload status",
+    description: "Inspect one short-lived agent upload session without returning its capability token or file bytes.",
+    inputSchema: AGENT_UPLOAD_SCHEMA,
+    annotations: { readOnlyHint: true },
+    async execute({ uploadId }) {
+      const { actions } = activeContext(contextRef);
+      const result = await actions.getAgentUploadStatus(uploadId);
+      return webMcpResult(`Agent upload ${uploadId} is ${result.status}.`, result);
+    },
+  }, {
+    name: "tabulaflow_commit_agent_upload",
+    title: "Import an uploaded agent-workspace file",
+    description: "Verify and import an uploaded agent-workspace file through the same transactional Source and DuckDB pipeline used by the UI. Requires the latest workspace revision and an idempotency requestId.",
+    inputSchema: COMMIT_AGENT_UPLOAD_SCHEMA,
+    annotations: { readOnlyHint: false, untrustedContentHint: true },
+    async execute({ uploadId, expectedRevision, requestId, executionMode = "async" }) {
+      const { actions } = activeContext(contextRef);
+      const result = await actions.commitAgentUpload(uploadId, { expectedRevision, requestId, executionMode });
+      return webMcpResult(result.status === "accepted"
+        ? `Accepted agent upload import ${result.operationId}. Poll operation status for completion.`
+        : `Imported agent upload ${uploadId}.`, result);
+    },
+  }, {
+    name: "tabulaflow_cancel_agent_upload",
+    title: "Cancel an agent upload",
+    description: "Cancel one pending or uploaded agent-workspace file and delete its staged bytes. A committed Source is not deleted.",
+    inputSchema: AGENT_UPLOAD_SCHEMA,
+    annotations: { readOnlyHint: false, destructiveHint: true },
+    async execute({ uploadId }) {
+      const { actions } = activeContext(contextRef);
+      const result = await actions.cancelAgentUpload(uploadId);
+      return webMcpResult(`Agent upload ${uploadId} is ${result.status}.`, result);
     },
   }];
 

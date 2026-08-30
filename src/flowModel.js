@@ -140,12 +140,25 @@ export function hydrateComposeSchemas(graph) {
 }
 
 export function isFlowFileSource(sourceAsset) {
-  return sourceAsset?.location === "local-device";
+  return ["local-device", "agent-workspace", "cloud-file"].includes(sourceAsset?.location);
 }
 
 function fileSourceIdentity(sourceAsset) {
   if (!isFlowFileSource(sourceAsset)) return null;
+  if (sourceAsset.location === "agent-workspace") {
+    return JSON.stringify([
+      sourceAsset.location,
+      sourceAsset.name ?? null,
+      sourceAsset.size ?? null,
+      sourceAsset.contentSha256 ?? null,
+      sourceAsset.schemaFingerprint ?? null,
+    ]);
+  }
+  if (sourceAsset.location === "cloud-file" && sourceAsset.cloudFileId) {
+    return JSON.stringify([sourceAsset.location, sourceAsset.cloudFileId, sourceAsset.schemaFingerprint ?? null]);
+  }
   return JSON.stringify([
+    sourceAsset.location,
     sourceAsset.name ?? null,
     sourceAsset.size ?? null,
     sourceAsset.lastModified ?? null,
@@ -153,9 +166,22 @@ function fileSourceIdentity(sourceAsset) {
   ]);
 }
 
-export function findMatchingFileSource(graph, file, sourceColumns) {
+export function findMatchingFileSource(graph, file, sourceColumns, metadata = null) {
   const fingerprint = schemaFingerprint(sourceColumns);
+  if (metadata?.kind === "agent" && metadata.contentSha256) {
+    return graph.sourceAssets.find((source) => source.location === "agent-workspace"
+      && source.name === file.name
+      && source.size === file.size
+      && source.contentSha256 === metadata.contentSha256
+      && source.schemaFingerprint === fingerprint) ?? null;
+  }
+  if (metadata?.kind === "cloud" && metadata.cloudFileId) {
+    return graph.sourceAssets.find((source) => source.location === "cloud-file"
+      && source.cloudFileId === metadata.cloudFileId
+      && source.schemaFingerprint === fingerprint) ?? null;
+  }
   return graph.sourceAssets.find((source) => isFlowFileSource(source)
+    && source.location === "local-device"
     && source.name === file.name
     && source.size === file.size
     && source.lastModified === file.lastModified
@@ -201,7 +227,16 @@ export function createPreparedInput(fileMetadata, dataset, recipe = []) {
     name: dataset.filename,
     size: fileMetadata?.size ?? null,
     lastModified: fileMetadata?.lastModified ?? null,
-    location: fileMetadata?.kind === "demo" ? "built-in" : "local-device",
+    location: fileMetadata?.kind === "demo"
+      ? "built-in"
+      : fileMetadata?.kind === "agent"
+        ? "agent-workspace"
+        : fileMetadata?.kind === "cloud"
+          ? "cloud-file"
+          : "local-device",
+    contentSha256: fileMetadata?.contentSha256 ?? null,
+    cloudFileId: fileMetadata?.cloudFileId ?? null,
+    agentUploadId: fileMetadata?.agentUploadId ?? null,
     schemaFingerprint: schemaFingerprint(dataset.sourceColumns),
     sourceColumns: [...dataset.sourceColumns],
     status: "linked",
@@ -692,7 +727,7 @@ export function getDescendants(graph, nodeId) {
 export function markSourcesUnlinked(graph) {
   return {
     ...graph,
-    sourceAssets: graph.sourceAssets.map((source) => source.location === "local-device"
+    sourceAssets: graph.sourceAssets.map((source) => isFlowFileSource(source)
       ? { ...source, status: "restoring" }
       : source),
   };
@@ -747,7 +782,7 @@ export function removeBuiltInDemoData(graph) {
 export function matchesSourceReference(sourceAsset, file, sourceColumns) {
   return sourceAsset.name === file.name
     && sourceAsset.size === file.size
-    && sourceAsset.lastModified === file.lastModified
+    && (sourceAsset.location !== "local-device" || sourceAsset.lastModified === file.lastModified)
     && sourceAsset.schemaFingerprint === schemaFingerprint(sourceColumns);
 }
 

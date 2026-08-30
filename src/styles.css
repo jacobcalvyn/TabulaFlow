@@ -278,6 +278,15 @@ button { color: inherit; }
 .source-reset-confirmation__actions button { min-height: 29px; padding: 0 10px; border: 1px solid var(--line); border-radius: 5px; background: #fff; font-size: 10px; font-weight: 700; cursor: pointer; }
 .source-reset-confirmation__actions button:disabled { opacity: .55; cursor: wait; }
 .source-reset-confirmation__actions .source-reset-confirmation__confirm { border-color: #b54036; color: #fff; background: #b54036; }
+.agent-upload-consent { margin: 0; padding: 13px 16px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border: 1px solid #9ccfca; border-radius: 8px; background: #f3fbfa; color: #173c39; }
+.agent-upload-consent > div:first-child { min-width: 0; display: flex; align-items: center; gap: 10px; }
+.agent-upload-consent__icon { flex: 0 0 auto; width: 32px; height: 32px; display: grid; place-items: center; border-radius: 8px; background: #dff4f1; color: var(--accent); font-size: 18px; }
+.agent-upload-consent strong, .agent-upload-consent span { display: block; }
+.agent-upload-consent strong { font-size: 12px; }
+.agent-upload-consent span:not(.agent-upload-consent__icon) { margin-top: 3px; color: #55706d; font-size: 10px; line-height: 1.45; }
+.agent-upload-consent__actions { flex: 0 0 auto; display: flex; gap: 6px; }
+.agent-upload-consent__actions button { min-height: 30px; padding: 0 11px; border: 1px solid var(--line); border-radius: 6px; background: #fff; font-size: 10px; font-weight: 700; cursor: pointer; }
+.agent-upload-consent__actions .agent-upload-consent__allow { border-color: var(--accent); background: var(--accent); color: #fff; }
 .opened-sources ul { margin: 0; padding: 0; list-style: none; }
 .opened-sources li { min-height: 64px; padding: 10px 16px; display: flex; align-items: center; gap: 12px; border-top: 1px solid #edf0f0; }
 .opened-sources li:first-child { border-top: 0; }
@@ -295,8 +304,9 @@ button { color: inherit; }
 .opened-sources__empty { margin: 0; padding: 28px 16px; color: var(--muted); text-align: center; font-size: 12px; }
 
 @media (max-width: 680px) {
-  .opened-sources > header, .source-reset-confirmation { align-items: flex-start; flex-direction: column; }
+  .opened-sources > header, .source-reset-confirmation, .agent-upload-consent { align-items: flex-start; flex-direction: column; }
   .opened-sources__actions, .source-reset-confirmation__actions { width: 100%; justify-content: space-between; }
+  .agent-upload-consent__actions { width: 100%; justify-content: flex-end; }
 }
 
 .account-screen { min-width: 0; min-height: 0; padding: 42px clamp(20px, 5vw, 70px); overflow-y: auto; background: #f7f9f9; }
