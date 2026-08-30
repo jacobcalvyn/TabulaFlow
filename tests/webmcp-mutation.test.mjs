@@ -153,11 +153,32 @@ test("async failures replay their terminal failure instead of stale accepted sta
   const meta = { expectedRevision: 3, requestId: "async-failure-001", executionMode: "async" };
   const accepted = await run(meta, async () => { throw new Error("worker failed"); }, "recipe:replace");
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(run.getOperationStatus(accepted.operationId).status, "failed");
+  const failed = run.getOperationStatus(accepted.operationId);
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.diagnostics[0].code, "WEBMCP_OPERATION_FAILED");
+  assert.equal(failed.diagnostics[0].message.includes("worker failed"), false);
   await assert.rejects(
     () => run(meta, async () => ({ ok: true }), "recipe:replace"),
     (error) => error.code === "WEBMCP_OPERATION_FAILED" && !error.message.includes("worker failed"),
   );
+});
+
+test("async protected-value failures retain safe structured diagnostics", async () => {
+  const run = createWebMcpMutationRunner({ getRevision: () => 3 });
+  const accepted = await run({ expectedRevision: 3, requestId: "protected-failure-001", executionMode: "async" }, async () => {
+    const error = new Error("Protected formula person@example.com cannot be restored.");
+    error.code = "PROTECTED_VALUE_BINDING_MISMATCH";
+    error.stepId = "formula-a";
+    error.parameter = "expression";
+    throw error;
+  }, "recipe:replace");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const failed = run.getOperationStatus(accepted.operationId);
+  assert.equal(failed.error.code, "PROTECTED_VALUE_BINDING_MISMATCH");
+  assert.equal(failed.error.stepId, "formula-a");
+  assert.equal(failed.error.parameter, "expression");
+  assert.equal(failed.diagnostics[0].code, "PROTECTED_VALUE_BINDING_MISMATCH");
+  assert.equal(JSON.stringify(failed).includes("person@example.com"), false);
 });
 
 test("a cancelled confirmation remains terminal for the original request", async () => {

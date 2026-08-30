@@ -13,7 +13,24 @@ export function isProtectedAgentValue(value) {
 }
 
 function sameBinding(actual, expected) {
-  return JSON.stringify(actual ?? null) === JSON.stringify(expected ?? null);
+  if (Object.is(actual, expected)) return true;
+  if (Array.isArray(actual) || Array.isArray(expected)) {
+    return Array.isArray(actual)
+      && Array.isArray(expected)
+      && actual.length === expected.length
+      && actual.every((value, index) => sameBinding(value, expected[index]));
+  }
+  if (!actual || !expected || typeof actual !== "object" || typeof expected !== "object") return false;
+  const actualKeys = Object.keys(actual).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  return actualKeys.length === expectedKeys.length
+    && actualKeys.every((key, index) => key === expectedKeys[index] && sameBinding(actual[key], expected[key]));
+}
+
+function protectedValueError(code, message, details = {}) {
+  const error = new Error(message);
+  Object.assign(error, { code, ...details });
+  return error;
 }
 
 function recipeValueBinding(step, key) {
@@ -79,10 +96,18 @@ export function restoreProtectedRecipeValues(recipe = [], currentRecipe = []) {
     for (const [key, value] of Object.entries(params)) {
       if (!isProtectedAgentValue(value)) continue;
       if (!previous || !Object.hasOwn(previous.params ?? {}, key)) {
-        throw new Error(`Protected recipe value cannot be restored for step ${step.id}.`);
+        throw protectedValueError(
+          "PROTECTED_VALUE_NOT_RESTORABLE",
+          `Protected recipe value cannot be restored for step ${step.id}.`,
+          { stepId: step.id, parameter: key },
+        );
       }
       if (!sameBinding(value.binding, recipeValueBinding(step, key)) || !sameBinding(value.binding, recipeValueBinding(previous, key))) {
-        throw new Error(`Protected recipe value binding changed for step ${step.id}.`);
+        throw protectedValueError(
+          "PROTECTED_VALUE_BINDING_MISMATCH",
+          `Protected recipe value binding changed for step ${step.id}.`,
+          { stepId: step.id, parameter: key },
+        );
       }
       params[key] = structuredClone(previous.params[key]);
     }
@@ -127,7 +152,13 @@ export function restoreProtectedComposeOperation(operation, existingNode = null)
   const restored = structuredClone(operation);
   if (restored.kind === "filter-rows" && isProtectedAgentValue(restored.value)) {
     const previous = existingNode?.config?.conditions?.[0];
-    if (!previous || !Object.hasOwn(previous, "value")) throw new Error("Protected Compose filter value cannot be restored for a new operation.");
+    if (!previous || !Object.hasOwn(previous, "value")) {
+      throw protectedValueError(
+        "PROTECTED_VALUE_NOT_RESTORABLE",
+        "Protected Compose filter value cannot be restored for a new operation.",
+        { targetId: existingNode?.id, parameter: "value" },
+      );
+    }
     const expected = {
       scope: "compose",
       nodeId: existingNode.id,
@@ -141,7 +172,11 @@ export function restoreProtectedComposeOperation(operation, existingNode = null)
     if (!sameBinding(restored.value.binding, expected)
       || restored.column !== previous.column
       || restored.operator !== previous.operator) {
-      throw new Error("Protected Compose filter value binding changed.");
+      throw protectedValueError(
+        "PROTECTED_VALUE_BINDING_MISMATCH",
+        "Protected Compose filter value binding changed.",
+        { targetId: existingNode?.id, parameter: "value" },
+      );
     }
     restored.value = structuredClone(previous.value);
   }
@@ -149,7 +184,13 @@ export function restoreProtectedComposeOperation(operation, existingNode = null)
     restored.values = restored.values.map((value, index) => {
       if (!isProtectedAgentValue(value)) return value;
       const previous = existingNode?.config?.values?.[index];
-      if (previous === undefined) throw new Error("Protected Compose pivot value cannot be restored for a new operation.");
+      if (previous === undefined) {
+        throw protectedValueError(
+          "PROTECTED_VALUE_NOT_RESTORABLE",
+          "Protected Compose pivot value cannot be restored for a new operation.",
+          { targetId: existingNode?.id, parameter: `values[${index}]` },
+        );
+      }
       const expected = {
         scope: "compose",
         nodeId: existingNode.id,
@@ -165,7 +206,11 @@ export function restoreProtectedComposeOperation(operation, existingNode = null)
         || restored.pivotColumn !== existingNode.config?.pivotColumn
         || restored.valueColumn !== existingNode.config?.valueColumn
         || restored.aggregate !== existingNode.config?.aggregate) {
-        throw new Error("Protected Compose pivot value binding changed.");
+        throw protectedValueError(
+          "PROTECTED_VALUE_BINDING_MISMATCH",
+          "Protected Compose pivot value binding changed.",
+          { targetId: existingNode?.id, parameter: `values[${index}]` },
+        );
       }
       return structuredClone(previous);
     });

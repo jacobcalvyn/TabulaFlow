@@ -336,6 +336,7 @@ const RECIPE_PREVIEW_SCHEMA = Object.freeze(strictObject({
     items: strictObject({
       id: ID,
       type: ID,
+      version: { type: "integer", minimum: 1, description: "Recipe step contract version returned by recipe reads." },
       params: { type: "object", additionalProperties: true },
       enabled: { type: "boolean", default: true },
     }, ["id", "type", "params"]),
@@ -482,6 +483,12 @@ function dispatcherActions(toolNames) {
   return Object.freeze(Object.fromEntries(toolNames.map((toolName) => [toolName.replace(/^tabulaflow_/, ""), toolName])));
 }
 
+export const WEBMCP_ACTION_CONTRACT_ACTION = "get_action_contract";
+
+function dispatcherActionNames(actions) {
+  return [WEBMCP_ACTION_CONTRACT_ACTION, ...Object.keys(actions)];
+}
+
 export const WEBMCP_DISPATCH_ACTIONS = Object.freeze({
   source: dispatcherActions([
     "tabulaflow_request_source_file",
@@ -557,8 +564,9 @@ const WEBMCP_CAPABILITIES = Object.freeze({
   workspaces: ["source", "prepare", "compose", "account"],
   toolSurface: {
     lifecycle: "stable-page-dispatchers",
-    dispatchers: Object.fromEntries(Object.entries(WEBMCP_DISPATCH_ACTIONS).map(([name, actions]) => [name, Object.keys(actions)])),
+    dispatchers: Object.fromEntries(Object.entries(WEBMCP_DISPATCH_ACTIONS).map(([name, actions]) => [name, dispatcherActionNames(actions)])),
     actionPayload: "Pass action plus input. Each input is validated against the selected action contract before its handler runs.",
+    contractDiscovery: "Call any dispatcher with action=get_action_contract and input.action set to one of its other actions.",
   },
   actions: [
     "inspect-workspace",
@@ -1462,8 +1470,8 @@ export function createWebMcpTools(contextRef, availability) {
 
 function createDispatcherTool({ name, title, description, actions, toolsByName, readOnly, runtimeHealth }) {
   const inputSchema = strictObject({
-    action: { type: "string", enum: Object.keys(actions), description: "The exact dispatcher action to run." },
-    input: { type: "object", description: "Action-specific input. It is validated against the selected action contract before execution.", additionalProperties: true },
+    action: { type: "string", enum: dispatcherActionNames(actions), description: `The exact dispatcher action to run. Use ${WEBMCP_ACTION_CONTRACT_ACTION} to inspect another action's input contract.` },
+    input: { type: "object", description: `Action-specific input. For ${WEBMCP_ACTION_CONTRACT_ACTION}, pass { action: "target_action" }.`, additionalProperties: true },
   }, ["action"]);
   return {
     name,
@@ -1472,6 +1480,29 @@ function createDispatcherTool({ name, title, description, actions, toolsByName, 
     inputSchema,
     annotations: { readOnlyHint: readOnly, untrustedContentHint: readOnly },
     async execute({ action, input = {} }) {
+      if (action === WEBMCP_ACTION_CONTRACT_ACTION) {
+        const contractSchema = strictObject({
+          action: { type: "string", enum: Object.keys(actions), description: "The dispatcher action whose original strict input schema should be returned." },
+        }, ["action"]);
+        assertWebMcpInput(contractSchema, input);
+        const targetName = actions[input.action];
+        const target = toolsByName.get(targetName);
+        if (!target) {
+          const error = new Error(`Dispatcher action is unavailable: ${input.action}`);
+          error.code = "WEBMCP_ACTION_UNAVAILABLE";
+          throw error;
+        }
+        runtimeHealth.clear(name);
+        return webMcpResult(`Returned the strict input contract for ${input.action}.`, {
+          dispatcher: { tool: name, action: WEBMCP_ACTION_CONTRACT_ACTION },
+          targetAction: input.action,
+          targetTool: target.name,
+          title: target.title,
+          description: target.description,
+          inputSchema: structuredClone(target.inputSchema),
+          annotations: structuredClone(target.annotations ?? {}),
+        });
+      }
       const targetName = actions[action];
       const target = toolsByName.get(targetName);
       if (!target) {

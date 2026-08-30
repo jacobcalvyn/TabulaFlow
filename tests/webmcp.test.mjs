@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  WEBMCP_ACTION_CONTRACT_ACTION,
   WEBMCP_CORE_TOOL_NAMES,
   WEBMCP_DISPATCH_ACTIONS,
   WEBMCP_STABLE_TOOL_NAMES,
@@ -8,6 +9,7 @@ import {
   createWebMcpTools,
   registerWebMcpTools,
 } from "../src/useWebMcpTools.js";
+import { protectRecipeForAgent, restoreProtectedRecipeValues } from "../src/agentDataProtection.js";
 import { WEBMCP_REGISTRATION_BUDGET, measureWebMcpToolset } from "../src/webMcpRuntime.js";
 
 const REVISION = 7;
@@ -20,7 +22,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "3.2.3", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "3.2.4", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -165,7 +167,7 @@ test("qualitative coding WebMCP uses one bounded dispatcher and keeps approval h
   assert.equal(coding.inputSchema.properties.action.enum.includes("approve"), false);
 });
 
-test("WebMCP 3.2.3 registers one small stable dispatcher surface", () => {
+test("WebMCP 3.2.4 registers one small stable dispatcher surface", () => {
   const { ref } = createContext();
   const stable = createWebMcpStableTools(ref);
   assert.deepEqual(stable.map((tool) => tool.name), WEBMCP_STABLE_TOOL_NAMES);
@@ -176,6 +178,8 @@ test("WebMCP 3.2.3 registers one small stable dispatcher surface", () => {
   assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.prepareMutate, "add_recipe_step"));
   assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.composeRead, "get_compose_graph"));
   assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.composeMutate, "create_compose_operation"));
+  assert.ok(stable.filter((tool) => tool.name.endsWith("_read") || tool.name.endsWith("_mutate") || tool.name === "tabulaflow_source")
+    .every((tool) => tool.inputSchema.properties.action.enum.includes(WEBMCP_ACTION_CONTRACT_ACTION)));
   const metrics = measureWebMcpToolset(stable);
   assert.ok(metrics.schemaBytes <= WEBMCP_REGISTRATION_BUDGET.maxSchemaBytes * 0.7, "stable WebMCP schema must retain 30 percent host headroom");
 });
@@ -232,7 +236,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "3.2.3");
+  assert.equal(capabilities.structuredContent.contractVersion, "3.2.4");
   assert.deepEqual(capabilities.structuredContent.operationLifecycle.terminalStates, ["succeeded", "failed", "cancelled"]);
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
@@ -403,31 +407,35 @@ test("registered tools reject schema-invalid input before an application action 
   controller.abort();
 });
 
-test("stable recipe dispatcher accepts protected values returned by recipe reads", async () => {
+test("stable recipe dispatcher round-trips protected recipe reads across JSON transport", async () => {
   const { calls, ref } = createContext();
+  const storedRecipe = [{
+    id: "formula-a",
+    type: "calculated-field",
+    version: 1,
+    enabled: true,
+    params: { outputColumn: "weight_band", expression: "if([weight] >= 1, 'Heavy', 'Light')", expressionVersion: 1 },
+  }];
+  ref.current.actions.getRecipe = async (preparedId) => ({
+    preparedId,
+    recipeRevision: 1,
+    recipe: protectRecipeForAgent(storedRecipe, [{ name: "weight", type: "DOUBLE", semantic: { sensitivity: "internal" } }]),
+  });
+  ref.current.actions.replaceRecipe = async (preparedId, recipe, expectedRecipeRevision, meta) => {
+    const restored = restoreProtectedRecipeValues(recipe, storedRecipe);
+    calls.push(["replace-recipe", preparedId, restored, expectedRecipeRevision, meta]);
+    return { status: "succeeded", workspaceRevision: REVISION + 1, recipeRevision: expectedRecipeRevision + 1 };
+  };
   const registry = new Map();
   const controller = new AbortController();
   await registerWebMcpTools({
     async registerTool(tool) { registry.set(tool.name, tool); },
   }, createWebMcpStableTools(ref), controller.signal);
-  const expression = {
-    __tabulaflowProtectedValue: true,
-    binding: {
-      scope: "recipe",
-      stepId: "formula-a",
-      stepType: "calculated-field",
-      key: "expression",
-      outputColumn: "weight_band",
-      expressionVersion: 1,
-    },
-    referencedColumns: ["weight"],
-  };
-  const recipe = [{
-    id: "formula-a",
-    type: "calculated-field",
-    enabled: true,
-    params: { outputColumn: "weight_band", expression, expressionVersion: 1 },
-  }];
+  const read = await registry.get("tabulaflow_prepare_read").execute({
+    action: "get_recipe",
+    input: { preparedId: "prepared-a" },
+  });
+  const recipe = JSON.parse(JSON.stringify(read.structuredContent.recipe));
 
   await registry.get("tabulaflow_prepare_mutate").execute({
     action: "replace_recipe",
@@ -441,8 +449,43 @@ test("stable recipe dispatcher accepts protected values returned by recipe reads
   });
 
   const call = calls.find((item) => item[0] === "replace-recipe");
-  assert.deepEqual(call[2][0].params.expression, expression);
+  assert.deepEqual(call[2], storedRecipe);
+
+  const withoutReadOnlyVersion = recipe.map(({ version: _version, ...step }) => step);
+  await registry.get("tabulaflow_prepare_mutate").execute({
+    action: "replace_recipe",
+    input: {
+      preparedId: "prepared-a",
+      recipe: withoutReadOnlyVersion,
+      expectedRecipeRevision: 1,
+      ...mutation("protected-recipe-roundtrip-002"),
+      executionMode: "wait",
+    },
+  });
+  assert.deepEqual(calls.filter((item) => item[0] === "replace-recipe").at(-1)[2], storedRecipe.map(({ version: _version, ...step }) => step));
   controller.abort();
+});
+
+test("stable dispatchers expose strict action contracts on demand", async () => {
+  const { ref } = createContext();
+  const stable = createWebMcpStableTools(ref);
+  const composeRead = toolByName(stable, "tabulaflow_compose_read");
+  const composeMutate = toolByName(stable, "tabulaflow_compose_mutate");
+
+  const validation = await composeRead.execute({
+    action: WEBMCP_ACTION_CONTRACT_ACTION,
+    input: { action: "validate_compose_operation" },
+  });
+  assert.equal(validation.structuredContent.targetAction, "validate_compose_operation");
+  assert.deepEqual(validation.structuredContent.inputSchema.required, ["operation"]);
+  assert.equal(new Set(validation.structuredContent.inputSchema.properties.operation.oneOf.map((branch) => branch.properties.kind.const)).size, 8);
+
+  const creation = await composeMutate.execute({
+    action: WEBMCP_ACTION_CONTRACT_ACTION,
+    input: { action: "create_compose_operation" },
+  });
+  assert.deepEqual(creation.structuredContent.inputSchema.required, ["operation", "expectedRevision", "requestId"]);
+  assert.equal(new Set(creation.structuredContent.inputSchema.properties.operation.oneOf.map((branch) => branch.properties.kind.const)).size, 8);
 });
 
 test("context-blocked actions stay registered but are not advertised as executable", async () => {
@@ -531,7 +574,9 @@ test("registered WebMCP tools never expose raw failure literals", async () => {
       () => registered.execute({}),
       (error) => error.code === "WEBMCP_EXECUTION_FAILED"
         && !error.message.includes("person@example.com")
-        && !error.message.includes("9900000"),
+        && !error.message.includes("9900000")
+        && error.diagnostics?.[0]?.code === "WEBMCP_EXECUTION_FAILED"
+        && !JSON.stringify(error.diagnostics).includes("person@example.com"),
     );
   } finally {
     console.warn = previousWarn;

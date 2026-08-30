@@ -50,10 +50,15 @@ export function sanitizeWebMcpError(cause) {
     INTERACTION_NOT_FOUND: "The requested user interaction is unavailable or expired.",
     WRONG_WORKSPACE: "Open the required TabulaFlow workspace before requesting this action.",
     PREPARED_NOT_ACTIVE: "Open the required prepared dataset before running this action.",
+    PROTECTED_VALUE_NOT_RESTORABLE: "The protected value no longer has a matching saved value in the current workspace state.",
+    PROTECTED_VALUE_BINDING_MISMATCH: "The protected value binding does not match the current workspace state.",
   };
   return {
     code,
-    message: safeMessages[code] ?? "The operation failed. Inspect the visible TabulaFlow diagnostics for details.",
+    message: safeMessages[code] ?? "The operation failed with a structured WebMCP error.",
+    ...(cause?.targetId ? { targetId: cause.targetId } : {}),
+    ...(cause?.stepId ? { stepId: cause.stepId } : {}),
+    ...(cause?.parameter ? { parameter: cause.parameter } : {}),
   };
 }
 
@@ -67,12 +72,22 @@ export function webMcpErrorForAgent(cause, metadata = {}) {
     ...(metadata.requestId || cause?.requestId ? { requestId: metadata.requestId ?? cause.requestId } : {}),
     ...(cause?.refreshRequired === true ? { refreshRequired: true } : {}),
     ...(cause?.targetId ? { targetId: cause.targetId } : {}),
+    ...(cause?.stepId ? { stepId: cause.stepId } : {}),
+    ...(cause?.parameter ? { parameter: cause.parameter } : {}),
     ...(cause?.requiredAction ? { requiredAction: cause.requiredAction } : {}),
     ...(cause?.recommendedWorkspace ? { recommendedWorkspace: cause.recommendedWorkspace } : {}),
     ...(typeof cause?.retryable === "boolean" ? { retryable: cause.retryable } : {}),
     ...(Array.isArray(cause?.sourceAssetIds) ? { sourceAssetIds: [...cause.sourceAssetIds] } : {}),
     ...(Array.isArray(cause?.blockedDependencyIds) ? { blockedDependencyIds: [...cause.blockedDependencyIds] } : {}),
     ...(Number.isInteger(metadata.generation) ? { generation: metadata.generation } : {}),
+    diagnostics: [{
+      scope: "webmcp",
+      level: "error",
+      code: safe.code,
+      ...(cause?.stepId ? { stepId: cause.stepId } : {}),
+      ...(cause?.parameter ? { parameter: cause.parameter } : {}),
+      message: safe.message,
+    }],
   });
   return error;
 }
@@ -83,6 +98,7 @@ export function sanitizeWebMcpDiagnostic(diagnostic = {}) {
     level: diagnostic.level ?? "error",
     code: diagnostic.code ?? "OPERATIONAL_DIAGNOSTIC",
     ...(diagnostic.stepId ? { stepId: diagnostic.stepId } : {}),
+    ...(diagnostic.parameter ? { parameter: diagnostic.parameter } : {}),
     message: diagnostic.code
       ? "A structured TabulaFlow diagnostic is available for this code."
       : "An operational diagnostic is available in the visible TabulaFlow UI.",
@@ -97,6 +113,7 @@ export function sanitizeWebMcpOperationResult(result) {
 
 export function operationStatusForAgent(operation) {
   const safeResult = sanitizeWebMcpOperationResult(operation.result);
+  const safeError = operation.error ? sanitizeWebMcpError(operation.error) : null;
   const artifact = safeResult?.filename
     ? { type: "file", id: null, name: safeResult.filename, format: safeResult.format ?? null }
     : safeResult?.preparedInputId || safeResult?.preparedId
@@ -119,7 +136,15 @@ export function operationStatusForAgent(operation) {
     target: operation.target ?? null,
     result: safeResult,
     artifact,
-    error: operation.error ? sanitizeWebMcpError(operation.error) : null,
+    error: safeError,
+    diagnostics: safeError ? [{
+      scope: "webmcp",
+      level: "error",
+      code: safeError.code,
+      ...(safeError.stepId ? { stepId: safeError.stepId } : {}),
+      ...(safeError.parameter ? { parameter: safeError.parameter } : {}),
+      message: safeError.message,
+    }] : [],
   };
 }
 

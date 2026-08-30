@@ -214,10 +214,21 @@ test("agent recipe reads protect formula and legacy calculation literals while p
   assert.equal(isProtectedAgentValue(protectedRecipe[1].params.thenValue), true);
   assert.equal(isProtectedAgentValue(protectedRecipe[1].params.elseValue), true);
   assert.deepEqual(restoreProtectedRecipeValues(protectedRecipe, recipe), recipe);
+  const transportedRecipe = JSON.parse(JSON.stringify(protectedRecipe));
+  transportedRecipe[0].params.expression.binding = Object.fromEntries(
+    Object.entries(transportedRecipe[0].params.expression.binding).reverse(),
+  );
+  assert.deepEqual(restoreProtectedRecipeValues(transportedRecipe, recipe), recipe);
   const movedMarker = structuredClone(protectedRecipe);
   movedMarker[1].params.column = "public_status";
-  assert.throws(() => restoreProtectedRecipeValues(movedMarker, recipe), /binding changed/);
-  assert.throws(() => restoreProtectedRecipeValues(protectedRecipe, []), /cannot be restored/);
+  assert.throws(
+    () => restoreProtectedRecipeValues(movedMarker, recipe),
+    (error) => error.code === "PROTECTED_VALUE_BINDING_MISMATCH" && error.stepId === "legacy-a" && error.parameter === "value",
+  );
+  assert.throws(
+    () => restoreProtectedRecipeValues(protectedRecipe, []),
+    (error) => error.code === "PROTECTED_VALUE_NOT_RESTORABLE" && error.stepId === "formula-a" && error.parameter === "expression",
+  );
 });
 
 test("Join recommendations rank semantic names and data quality instead of returning every type-compatible pair", () => {

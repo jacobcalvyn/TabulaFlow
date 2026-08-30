@@ -1,4 +1,4 @@
-export const WEBMCP_CONTRACT_VERSION = "3.2.3";
+export const WEBMCP_CONTRACT_VERSION = "3.2.4";
 
 export const WEBMCP_REGISTRATION_BUDGET = Object.freeze({
   maxToolCount: 48,
