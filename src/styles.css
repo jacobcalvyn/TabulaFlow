@@ -17,7 +17,7 @@
 }
 
 * { box-sizing: border-box; }
-html, body, #root { width: 100%; min-width: 320px; min-height: 100%; margin: 0; }
+html, body, #root { width: 100%; height: 100%; min-width: 0; min-height: 0; margin: 0; overflow: hidden; }
 
 body {
   min-height: 100vh;
@@ -29,7 +29,8 @@ button, input { font: inherit; }
 button { color: inherit; }
 
 .app-shell {
-  width: 100vw;
+  width: 100%;
+  max-width: 100%;
   height: 100vh;
   min-height: 640px;
   display: grid;
@@ -376,6 +377,7 @@ button { color: inherit; }
 
 .compose-screen { min-width: 0; min-height: 0; display: grid; grid-template-rows: 72px minmax(0, 1fr); overflow: hidden; background: #f7f9f9; }
 .compose-toolbar { padding: 0 22px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border-bottom: 1px solid var(--line); background: #fff; }
+.compose-toolbar > div:first-child { min-width: 0; }
 .compose-toolbar h1 { margin: 0; font-size: 19px; }
 .compose-toolbar p { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
 .compose-global-error { grid-row: 2; z-index: 8; align-self: start; margin: 8px 14px 0; padding: 9px 12px; border: 1px solid #e6aaa6; border-radius: 8px; background: #fff4f3; color: #963f3a; font-size: 11px; font-weight: 650; }
@@ -389,6 +391,7 @@ button { color: inherit; }
 .compose-zoom-controls { height: 34px; display: inline-flex; align-items: center; border: 1px solid var(--line-strong); border-radius: 5px; overflow: hidden; color: #536167; background: #fff; }
 .compose-zoom-controls button { width: 32px; height: 32px; padding: 0; display: grid; place-items: center; border: 0; color: inherit; background: transparent; cursor: pointer; }
 .compose-zoom-controls button:hover { color: var(--accent-strong); background: #f3fbfa; }
+.compose-zoom-controls button:disabled { color: #aeb8bb; background: transparent; cursor: not-allowed; }
 .compose-zoom-controls span { min-width: 42px; font-size: 9px; font-weight: 750; text-align: center; }
 .compose-fit-graph, .compose-auto-arrange { min-height: 34px; padding: 0 10px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line-strong); border-radius: 5px; color: #445258; background: #fff; font-size: 10px; font-weight: 700; cursor: pointer; }
 .compose-fit-graph:hover, .compose-auto-arrange:hover { color: var(--accent-strong); border-color: #9ccbc8; background: #f3fbfa; }

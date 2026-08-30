@@ -1,6 +1,7 @@
 import { PREPARED_RECIPE_STATUS } from "./preparedRecipeState.js";
 import { compileComposeOperation } from "./composeSql.js";
 import { applySemanticModelToSchema, createSemanticModel, reconcileSemanticModel } from "./semanticModel.js";
+import { normalizeCanvasPosition } from "./composeViewport.js";
 
 export const FLOW_SCHEMA_VERSION = 3;
 
@@ -23,10 +24,7 @@ function cloneRecipe(recipe = [], { newStepIds = false } = {}) {
 }
 
 function normalizedPosition(position, fallback = INITIAL_PREPARED_POSITION) {
-  return {
-    x: Math.max(24, Math.round(Number(position?.x) || fallback.x)),
-    y: Math.max(24, Math.round(Number(position?.y) || fallback.y)),
-  };
+  return normalizeCanvasPosition(position, fallback);
 }
 
 function positionsOverlap(left, right) {
@@ -254,10 +252,11 @@ export function repairOverlappingNodePositions(graph) {
   let changed = false;
 
   const repair = (node, fallback) => {
+    const original = node.position;
     const current = normalizedPosition(node.position, fallback);
     const position = nextAvailablePosition(current, occupied);
     occupied.push(position);
-    if (position.x === current.x && position.y === current.y) return node;
+    if (position.x === original?.x && position.y === original?.y) return node;
     changed = true;
     return { ...node, position };
   };
@@ -348,7 +347,7 @@ export function duplicatePreparedInput(graph, preparedInputId) {
     name: `${source.name} copy`,
     recipe: cloneRecipe(source.recipe, { newStepIds: true }),
     schema: source.schema.map((column) => ({ ...column })),
-    position: { x: source.position.x + 320, y: source.position.y },
+    position: normalizedPosition({ x: source.position.x + 320, y: source.position.y }),
   };
   const sourceModel = reconcileSemanticModel(graph.semanticModels?.[source.id], source.id, source.schema);
   const copyModel = { ...structuredClone(sourceModel), targetId: copy.id, revision: 0 };
@@ -411,7 +410,7 @@ export function createPreparedFromCompose(graph, composeNodeId) {
     recipeStatus: PREPARED_RECIPE_STATUS.APPLIED,
     rowCount: sourceNode.rowCount ?? null,
     schema,
-    position: { x: sourceNode.position.x + 320, y: sourceNode.position.y },
+    position: normalizedPosition({ x: sourceNode.position.x + 320, y: sourceNode.position.y }),
   };
   const semanticModel = createSemanticModel(preparedInputId, schema);
   semanticModel.fields = Object.fromEntries(schema.map((column) => [column.name, { ...semanticModel.fields[column.name], ...(column.semantic ?? {}), provenance: column.semantic?.provenance ?? { kind: "compose-result", nodeId: sourceNode.id, column: column.name } }]));
@@ -491,7 +490,7 @@ export function addComposeNode(graph, node) {
   const next = {
     ...node,
     id: node.id ?? createId(node.kind),
-    position: node.position ?? { x: 560, y: 80 + graph.composeNodes.length * 120 },
+    position: normalizedPosition(node.position, { x: 560, y: 80 + graph.composeNodes.length * 120 }),
   };
   const candidate = {
     ...graph,
@@ -512,6 +511,7 @@ export function updateComposeNode(graph, nodeId, changes) {
     ...changes,
     id: current.id,
     config: changes.config ? structuredClone(changes.config) : current.config,
+    position: changes.position ? normalizedPosition(changes.position, current.position) : current.position,
   };
   const candidate = {
     ...graph,
@@ -583,9 +583,8 @@ export function removePreparedInput(graph, preparedInputId) {
 }
 
 export function updateNodePosition(graph, nodeId, position) {
-  const x = Math.max(24, Math.round(Number(position?.x) || 0));
-  const y = Math.max(24, Math.round(Number(position?.y) || 0));
-  const move = (node) => node.id === nodeId ? { ...node, position: { x, y } } : node;
+  const nextPosition = normalizedPosition(position);
+  const move = (node) => node.id === nodeId ? { ...node, position: nextPosition } : node;
   if (!graph.preparedInputs.some((node) => node.id === nodeId) && !graph.composeNodes.some((node) => node.id === nodeId)) {
     throw new Error("Flow node tidak ditemukan.");
   }

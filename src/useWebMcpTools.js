@@ -398,7 +398,7 @@ const DUPLICATE_PREPARED_SCHEMA = Object.freeze(strictObject({ preparedId: ID, .
 const PROMOTE_COMPOSE_SCHEMA = Object.freeze(strictObject({ nodeId: ID, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["nodeId", "expectedRevision", "requestId"]));
 const MOVE_COMPOSE_SCHEMA = Object.freeze(strictObject({
   nodeId: ID,
-  position: strictObject({ x: { type: "number", minimum: 0 }, y: { type: "number", minimum: 0 } }),
+  position: strictObject({ x: { type: "number", minimum: 0, maximum: 32000 }, y: { type: "number", minimum: 0, maximum: 32000 } }),
   ...MUTATION_META,
 }));
 const UPDATE_COMPOSE_OPERATION_SCHEMA = Object.freeze(strictObject({

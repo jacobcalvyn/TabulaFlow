@@ -468,6 +468,9 @@ test("updates operation configuration and persists canvas positions", () => {
   const movedOperation = updateNodePosition(movedDataset, joined.node.id, { x: 612, y: 174 });
   assert.deepEqual(movedOperation.preparedInputs.find((node) => node.id === left.preparedInput.id).position, { x: 151, y: 89 });
   assert.deepEqual(movedOperation.composeNodes.find((node) => node.id === joined.node.id).position, { x: 612, y: 174 });
+
+  const clamped = updateNodePosition(movedOperation, joined.node.id, { x: Number.POSITIVE_INFINITY, y: 1000000 });
+  assert.deepEqual(clamped.composeNodes.find((node) => node.id === joined.node.id).position, { x: 40, y: 32000 });
 });
 
 test("deletes only leaf Compose operations", () => {

@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { CaretDown, CaretUp, CheckCircle, Copy, CornersOut, Database, DownloadSimple, FileXls, Intersect, LinkSimple, MagnifyingGlassMinus, MagnifyingGlassPlus, PencilSimple, PlugsConnected, Plus, SlidersHorizontal, Trash, TreeStructure, X } from "@phosphor-icons/react";
 import { MdJoinFull, MdJoinInner, MdJoinLeft, MdJoinRight } from "react-icons/md";
-import { calculateGraphFit } from "./composeViewport.js";
+import { calculateGraphFit, MIN_MANUAL_SCALE, normalizeCanvasPosition } from "./composeViewport.js";
 import { useI18n } from "./i18n.jsx";
 
 const NODE_WIDTH = 230;
@@ -436,6 +436,7 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
   };
   const [isMobile, setIsMobile] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 580px)").matches);
   const [viewScale, setViewScale] = useState(1);
+  const [pendingViewport, setPendingViewport] = useState(null);
   const canvasRef = useRef(null);
   const fittedGraphRef = useRef("");
   const previousCanvasSizeRef = useRef({ width: 0, height: 0 });
@@ -460,12 +461,12 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
   useEffect(() => {
     if (!dragging) return undefined;
     const move = (event) => {
-      const next = { x: Math.max(24, dragging.origin.x + (event.clientX - dragging.start.x) / dragging.scale), y: Math.max(24, dragging.origin.y + (event.clientY - dragging.start.y) / dragging.scale) };
+      const next = normalizeCanvasPosition({ x: dragging.origin.x + (event.clientX - dragging.start.x) / dragging.scale, y: dragging.origin.y + (event.clientY - dragging.start.y) / dragging.scale }, dragging.origin);
       positionsRef.current = { ...positionsRef.current, [dragging.id]: next };
       setPositions(positionsRef.current);
     };
     const stop = (event) => {
-      const next = { x: Math.max(24, dragging.origin.x + (event.clientX - dragging.start.x) / dragging.scale), y: Math.max(24, dragging.origin.y + (event.clientY - dragging.start.y) / dragging.scale) };
+      const next = normalizeCanvasPosition({ x: dragging.origin.x + (event.clientX - dragging.start.x) / dragging.scale, y: dragging.origin.y + (event.clientY - dragging.start.y) / dragging.scale }, dragging.origin);
       setDragging(null);
       onMoveNode(dragging.id, next);
     };
@@ -662,8 +663,15 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
       nodeHeight: NODE_HEIGHT,
     });
     setViewScale(viewport.scale);
-    window.requestAnimationFrame(() => canvas.scrollTo?.({ left: viewport.scrollLeft, top: viewport.scrollTop, behavior }));
+    setPendingViewport({ ...viewport, behavior });
   }, []);
+
+  useLayoutEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !pendingViewport) return;
+    canvas.scrollTo?.({ left: pendingViewport.scrollLeft, top: pendingViewport.scrollTop, behavior: pendingViewport.behavior });
+    setPendingViewport(null);
+  }, [canvasHeight, canvasWidth, pendingViewport, viewScale]);
 
   const graphIdentity = nodes.map((node) => node.id).sort().join(":");
 
@@ -695,7 +703,13 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
       observer.disconnect();
     };
   }, [fitGraph]);
-  const zoomBy = (delta) => setViewScale((current) => Math.max(0.3, Math.min(1.5, Number((current + delta).toFixed(2)))));
+  const zoomBy = (delta) => {
+    setPendingViewport(null);
+    setViewScale((current) => {
+      if (delta < 0 && current <= MIN_MANUAL_SCALE) return current;
+      return Math.max(MIN_MANUAL_SCALE, Math.min(1.5, Number((current + delta).toFixed(2))));
+    });
+  };
   const autoArrange = async () => {
     setOperation(null);
     setPendingPair(null);
@@ -707,15 +721,14 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
     const next = Object.fromEntries(arrangedNodes.map((node, index) => [node.id, nodePosition(node, index)]));
     positionsRef.current = next;
     setPositions(next);
-    setViewScale(1);
-    canvasRef.current?.scrollTo({ left: 0, top: 0, behavior: "smooth" });
+    fitGraph("smooth");
   };
 
   return (
     <main className="compose-screen">
       <header className="compose-toolbar">
         <div><h1>{t("compose")}</h1><p>{connectingFrom ? t("chooseSecondDataset") : t("composeCanvasHint")} {dirty && <span className="compose-dirty">· {t("unsavedChanges")}</span>}</p></div>
-        <div className="compose-toolbar__actions"><div className="compose-zoom-controls" role="group" aria-label={t("canvasZoom")}><button type="button" onClick={() => zoomBy(-0.15)} aria-label={t("zoomOut")} title={t("zoomOut")}><MagnifyingGlassMinus /></button><span>{Math.round(viewScale * 100)}%</span><button type="button" onClick={() => zoomBy(0.15)} aria-label={t("zoomIn")} title={t("zoomIn")}><MagnifyingGlassPlus /></button></div><button className="compose-auto-arrange" type="button" onClick={autoArrange}><TreeStructure />{t("autoArrange")}</button><button className="compose-fit-graph" type="button" onClick={() => fitGraph()}><CornersOut />{t("fitGraph")}</button>{connectingFrom && <button className="compose-cancel-connect" type="button" onClick={dismissConnection}><X />{t("cancelConnection")}</button>}</div>
+        <div className="compose-toolbar__actions"><div className="compose-zoom-controls" role="group" aria-label={t("canvasZoom")}><button type="button" onClick={() => zoomBy(-0.15)} disabled={viewScale <= MIN_MANUAL_SCALE} aria-label={t("zoomOut")} title={t("zoomOut")}><MagnifyingGlassMinus /></button><span>{Math.round(viewScale * 100)}%</span><button type="button" onClick={() => zoomBy(0.15)} aria-label={t("zoomIn")} title={t("zoomIn")}><MagnifyingGlassPlus /></button></div><button className="compose-auto-arrange" type="button" onClick={autoArrange}><TreeStructure />{t("autoArrange")}</button><button className="compose-fit-graph" type="button" onClick={() => fitGraph()}><CornersOut />{t("fitGraph")}</button>{connectingFrom && <button className="compose-cancel-connect" type="button" onClick={dismissConnection}><X />{t("cancelConnection")}</button>}</div>
       </header>
       {error && <div className="compose-global-error" role="alert">{error}</div>}
       {confirmingMetricDeleteId && <div className="compose-global-confirmation" role="alertdialog" aria-label={t("confirmDeleteMetricDefinition")}>
