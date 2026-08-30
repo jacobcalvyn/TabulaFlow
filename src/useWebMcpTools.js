@@ -20,14 +20,14 @@ function runtimeHealthFor(contextRef) {
 }
 
 const ACTION_TOOL_DEPENDENCIES = Object.freeze({
-  "formula-column": ["tabulaflow_preview_recipe_change", "tabulaflow_add_recipe_step", "tabulaflow_replace_recipe"],
-  recipe: ["tabulaflow_preview_recipe_change", "tabulaflow_add_recipe_step", "tabulaflow_replace_recipe"],
-  duplicate: ["tabulaflow_duplicate_prepared_dataset"],
-  export: ["tabulaflow_export_prepare", "tabulaflow_export_compose"],
-  "create-operation": ["tabulaflow_create_compose_operation"],
-  "create-unary-operation": ["tabulaflow_create_compose_operation"],
-  "connect-binary-operation": ["tabulaflow_create_compose_operation"],
-  update: ["tabulaflow_update_compose_operation"],
+  "formula-column": ["tabulaflow_prepare_read", "tabulaflow_prepare_mutate", "tabulaflow_preview_recipe_change", "tabulaflow_add_recipe_step", "tabulaflow_replace_recipe"],
+  recipe: ["tabulaflow_prepare_read", "tabulaflow_prepare_mutate", "tabulaflow_preview_recipe_change", "tabulaflow_add_recipe_step", "tabulaflow_replace_recipe"],
+  duplicate: ["tabulaflow_prepare_mutate", "tabulaflow_duplicate_prepared_dataset"],
+  export: ["tabulaflow_prepare_mutate", "tabulaflow_compose_mutate", "tabulaflow_export_prepare", "tabulaflow_export_compose"],
+  "create-operation": ["tabulaflow_compose_mutate", "tabulaflow_create_compose_operation"],
+  "create-unary-operation": ["tabulaflow_compose_mutate", "tabulaflow_create_compose_operation"],
+  "connect-binary-operation": ["tabulaflow_compose_mutate", "tabulaflow_create_compose_operation"],
+  update: ["tabulaflow_compose_mutate", "tabulaflow_update_compose_operation"],
   "qualitative-coding": ["tabulaflow_qualitative_coding"],
 });
 
@@ -473,10 +473,88 @@ function filterSelection(raw) {
   };
 }
 
+function dispatcherActions(toolNames) {
+  return Object.freeze(Object.fromEntries(toolNames.map((toolName) => [toolName.replace(/^tabulaflow_/, ""), toolName])));
+}
+
+export const WEBMCP_DISPATCH_ACTIONS = Object.freeze({
+  source: dispatcherActions([
+    "tabulaflow_request_source_file",
+    "tabulaflow_request_source_relink",
+    "tabulaflow_request_reset_all",
+    "tabulaflow_list_cloud_files",
+    "tabulaflow_open_cloud_file",
+    "tabulaflow_request_cloud_upload",
+  ]),
+  prepareRead: dispatcherActions([
+    "tabulaflow_get_calculation_catalog",
+    "tabulaflow_get_recipe",
+    "tabulaflow_get_semantic_model",
+    "tabulaflow_list_metric_definitions",
+    "tabulaflow_get_prepare_dataset",
+    "tabulaflow_get_data_profile",
+    "tabulaflow_query_column_values",
+    "tabulaflow_get_prepare_preview",
+    "tabulaflow_preview_recipe_change",
+  ]),
+  prepareMutate: dispatcherActions([
+    "tabulaflow_select_prepared_dataset",
+    "tabulaflow_update_semantic_field",
+    "tabulaflow_upsert_metric_definition",
+    "tabulaflow_delete_metric_definition",
+    "tabulaflow_replace_recipe",
+    "tabulaflow_duplicate_prepared_dataset",
+    "tabulaflow_set_aggregate_columns",
+    "tabulaflow_set_preview_filter",
+    "tabulaflow_remove_preview_filter",
+    "tabulaflow_clear_preview_filters",
+    "tabulaflow_export_prepare",
+    "tabulaflow_add_recipe_step",
+    "tabulaflow_request_delete_all_recipe_steps",
+    "tabulaflow_update_recipe_step",
+    "tabulaflow_set_recipe_step_enabled",
+    "tabulaflow_move_recipe_step",
+    "tabulaflow_undo_recipe",
+    "tabulaflow_redo_recipe",
+    "tabulaflow_apply_value_action",
+    "tabulaflow_request_delete",
+  ]),
+  composeRead: dispatcherActions([
+    "tabulaflow_describe_operation",
+    "tabulaflow_get_semantic_model",
+    "tabulaflow_list_metric_definitions",
+    "tabulaflow_get_compose_graph",
+    "tabulaflow_get_compose_node",
+    "tabulaflow_get_node_schema",
+    "tabulaflow_get_node_preview",
+    "tabulaflow_get_compose_node_quality",
+    "tabulaflow_validate_compose_operation",
+    "tabulaflow_get_connection_options",
+  ]),
+  composeMutate: dispatcherActions([
+    "tabulaflow_update_semantic_field",
+    "tabulaflow_upsert_metric_definition",
+    "tabulaflow_delete_metric_definition",
+    "tabulaflow_select_compose_node",
+    "tabulaflow_auto_arrange_compose",
+    "tabulaflow_move_compose_node",
+    "tabulaflow_export_compose",
+    "tabulaflow_create_compose_operation",
+    "tabulaflow_update_compose_operation",
+    "tabulaflow_promote_compose_result",
+    "tabulaflow_request_delete",
+  ]),
+});
+
 const WEBMCP_CAPABILITIES = Object.freeze({
   contractVersion: WEBMCP_CONTRACT_VERSION,
   authenticationRequired: false,
   workspaces: ["source", "prepare", "compose", "account"],
+  toolSurface: {
+    lifecycle: "stable-page-dispatchers",
+    dispatchers: Object.fromEntries(Object.entries(WEBMCP_DISPATCH_ACTIONS).map(([name, actions]) => [name, Object.keys(actions)])),
+    actionPayload: "Pass action plus input. Each input is validated against the selected action contract before its handler runs.",
+  },
   actions: [
     "inspect-workspace",
     "navigate-workspace",
@@ -581,73 +659,17 @@ export const WEBMCP_CORE_TOOL_NAMES = Object.freeze([
   "tabulaflow_get_pending_confirmations",
   "tabulaflow_reject_confirmation",
   "tabulaflow_open_workspace",
-  "tabulaflow_request_source_file",
-  "tabulaflow_request_source_relink",
-  "tabulaflow_request_reset_all",
 ]);
 
-const WEBMCP_WORKSPACE_TOOL_NAMES = Object.freeze({
-  source: Object.freeze([]),
-  prepare: Object.freeze([
-    "tabulaflow_get_calculation_catalog",
-    "tabulaflow_select_prepared_dataset",
-    "tabulaflow_get_recipe",
-    "tabulaflow_get_semantic_model",
-    "tabulaflow_update_semantic_field",
-    "tabulaflow_list_metric_definitions",
-    "tabulaflow_upsert_metric_definition",
-    "tabulaflow_replace_recipe",
-    "tabulaflow_duplicate_prepared_dataset",
-    "tabulaflow_get_prepare_dataset",
-    "tabulaflow_get_data_profile",
-    "tabulaflow_query_column_values",
-    "tabulaflow_get_prepare_preview",
-    "tabulaflow_qualitative_coding",
-    "tabulaflow_preview_recipe_change",
-    "tabulaflow_set_aggregate_columns",
-    "tabulaflow_set_preview_filter",
-    "tabulaflow_remove_preview_filter",
-    "tabulaflow_clear_preview_filters",
-    "tabulaflow_export_prepare",
-    "tabulaflow_add_recipe_step",
-    "tabulaflow_request_delete_all_recipe_steps",
-    "tabulaflow_update_recipe_step",
-    "tabulaflow_set_recipe_step_enabled",
-    "tabulaflow_move_recipe_step",
-    "tabulaflow_undo_recipe",
-    "tabulaflow_redo_recipe",
-    "tabulaflow_apply_value_action",
-    "tabulaflow_request_delete",
-  ]),
-  compose: Object.freeze([
-    "tabulaflow_describe_operation",
-    "tabulaflow_get_semantic_model",
-    "tabulaflow_update_semantic_field",
-    "tabulaflow_list_metric_definitions",
-    "tabulaflow_upsert_metric_definition",
-    "tabulaflow_delete_metric_definition",
-    "tabulaflow_get_compose_graph",
-    "tabulaflow_get_compose_node",
-    "tabulaflow_get_node_schema",
-    "tabulaflow_get_node_preview",
-    "tabulaflow_get_compose_node_quality",
-    "tabulaflow_validate_compose_operation",
-    "tabulaflow_get_connection_options",
-    "tabulaflow_select_compose_node",
-    "tabulaflow_auto_arrange_compose",
-    "tabulaflow_move_compose_node",
-    "tabulaflow_export_compose",
-    "tabulaflow_create_compose_operation",
-    "tabulaflow_update_compose_operation",
-    "tabulaflow_promote_compose_result",
-    "tabulaflow_request_delete",
-  ]),
-  account: Object.freeze([
-    "tabulaflow_list_cloud_files",
-    "tabulaflow_open_cloud_file",
-    "tabulaflow_request_cloud_upload",
-  ]),
-});
+export const WEBMCP_STABLE_TOOL_NAMES = Object.freeze([
+  ...WEBMCP_CORE_TOOL_NAMES,
+  "tabulaflow_source",
+  "tabulaflow_prepare_read",
+  "tabulaflow_prepare_mutate",
+  "tabulaflow_compose_read",
+  "tabulaflow_compose_mutate",
+  "tabulaflow_qualitative_coding",
+]);
 
 export function createWebMcpTools(contextRef, availability) {
   const runtimeHealth = runtimeHealthFor(contextRef);
@@ -796,12 +818,8 @@ export function createWebMcpTools(contextRef, availability) {
     annotations: { readOnlyHint: false },
     async execute({ workspace }) {
       const { actions } = activeContext(contextRef);
-      const before = runtimeHealth.snapshot();
       const result = await actions.openWorkspace(workspace);
-      const publication = result.workspaceChanged && before.status !== "unavailable"
-        ? await runtimeHealth.waitForStableGeneration(before.generation, { workspace })
-        : runtimeHealth.snapshot();
-      return webMcpResult(`Opened the ${workspace} workspace.`, { ...result, generation: publication.generation });
+      return webMcpResult(`Opened the ${workspace} workspace.`, { ...result, generation: runtimeHealth.snapshot().generation });
     },
   }, {
     name: "tabulaflow_request_source_file",
@@ -811,12 +829,8 @@ export function createWebMcpTools(contextRef, availability) {
     annotations: { readOnlyHint: false },
     async execute() {
       const { actions } = activeContext(contextRef);
-      const before = runtimeHealth.snapshot();
       const result = await actions.requestSourceFileSelection();
-      const publication = result.workspaceChanged && before.status !== "unavailable"
-        ? await runtimeHealth.waitForStableGeneration(before.generation, { workspace: "source" })
-        : runtimeHealth.snapshot();
-      return webMcpResult("The Source file chooser is ready for the user.", { ...result, generation: publication.generation });
+      return webMcpResult("The Source file chooser is ready for the user.", { ...result, generation: runtimeHealth.snapshot().generation });
     },
   }, {
     name: "tabulaflow_request_source_relink",
@@ -826,12 +840,8 @@ export function createWebMcpTools(contextRef, availability) {
     annotations: { readOnlyHint: false },
     async execute({ sourceAssetId }) {
       const { actions } = activeContext(contextRef);
-      const before = runtimeHealth.snapshot();
       const result = await actions.requestSourceRelink(sourceAssetId);
-      const publication = result.workspaceChanged && before.status !== "unavailable"
-        ? await runtimeHealth.waitForStableGeneration(before.generation, { workspace: "source" })
-        : runtimeHealth.snapshot();
-      return webMcpResult("The source Re-link control is ready for the user.", { ...result, generation: publication.generation });
+      return webMcpResult("The source Re-link control is ready for the user.", { ...result, generation: runtimeHealth.snapshot().generation });
     },
   }, {
     name: "tabulaflow_request_reset_all",
@@ -1445,14 +1455,97 @@ export function createWebMcpTools(contextRef, availability) {
   }));
 }
 
-export function createWebMcpToolBundles(contextRef, availability) {
-  const allTools = createWebMcpTools(contextRef, availability);
-  const coreNames = new Set(WEBMCP_CORE_TOOL_NAMES);
-  const workspaceNames = new Set(WEBMCP_WORKSPACE_TOOL_NAMES[availability.workspace] ?? []);
+function createDispatcherTool({ name, title, description, actions, toolsByName, readOnly, runtimeHealth }) {
+  const inputSchema = strictObject({
+    action: { type: "string", enum: Object.keys(actions), description: "The exact dispatcher action to run." },
+    input: { type: "object", description: "Action-specific input. It is validated against the selected action contract before execution.", additionalProperties: true },
+  }, ["action"]);
   return {
-    core: allTools.filter((tool) => coreNames.has(tool.name)),
-    workspace: allTools.filter((tool) => workspaceNames.has(tool.name)),
+    name,
+    title,
+    description,
+    inputSchema,
+    annotations: { readOnlyHint: readOnly, untrustedContentHint: readOnly },
+    async execute({ action, input = {} }) {
+      const targetName = actions[action];
+      const target = toolsByName.get(targetName);
+      if (!target) {
+        const error = new Error(`Dispatcher action is unavailable: ${action}`);
+        error.code = "WEBMCP_ACTION_UNAVAILABLE";
+        throw error;
+      }
+      try {
+        assertWebMcpInput(target.inputSchema, input);
+        const result = await target.execute(input);
+        runtimeHealth.clear(name);
+        return result?.structuredContent && typeof result.structuredContent === "object"
+          ? { ...result, structuredContent: { ...result.structuredContent, dispatcher: { tool: name, action } } }
+          : result;
+      } catch (cause) {
+        if (cause && typeof cause === "object") cause.dispatcherAction ??= action;
+        runtimeHealth.record(name, cause);
+        throw cause;
+      }
+    },
   };
+}
+
+export function createWebMcpStableTools(contextRef) {
+  const runtimeHealth = runtimeHealthFor(contextRef);
+  const granularTools = createWebMcpTools(contextRef, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
+  const toolsByName = new Map(granularTools.map((tool) => [tool.name, tool]));
+  const core = WEBMCP_CORE_TOOL_NAMES.map((name) => toolsByName.get(name));
+  const dispatchers = [
+    createDispatcherTool({
+      name: "tabulaflow_source",
+      title: "Use TabulaFlow Source",
+      description: "Request local Source interactions or use signed-in cloud files through one stable Source dispatcher.",
+      actions: WEBMCP_DISPATCH_ACTIONS.source,
+      toolsByName,
+      readOnly: false,
+      runtimeHealth,
+    }),
+    createDispatcherTool({
+      name: "tabulaflow_prepare_read",
+      title: "Read TabulaFlow Prepare",
+      description: "Inspect Prepare data, recipes, semantics, metrics, profiles, values, previews, and dry-runs without changing workspace data.",
+      actions: WEBMCP_DISPATCH_ACTIONS.prepareRead,
+      toolsByName,
+      readOnly: true,
+      runtimeHealth,
+    }),
+    createDispatcherTool({
+      name: "tabulaflow_prepare_mutate",
+      title: "Change TabulaFlow Prepare",
+      description: "Run guarded Prepare selections, filters, recipe mutations, exports, duplication, semantic changes, metrics, and deletion requests.",
+      actions: WEBMCP_DISPATCH_ACTIONS.prepareMutate,
+      toolsByName,
+      readOnly: false,
+      runtimeHealth,
+    }),
+    createDispatcherTool({
+      name: "tabulaflow_compose_read",
+      title: "Read TabulaFlow Compose",
+      description: "Inspect Compose operations, graph state, schemas, previews, quality, validation, semantics, metrics, and connection options.",
+      actions: WEBMCP_DISPATCH_ACTIONS.composeRead,
+      toolsByName,
+      readOnly: true,
+      runtimeHealth,
+    }),
+    createDispatcherTool({
+      name: "tabulaflow_compose_mutate",
+      title: "Change TabulaFlow Compose",
+      description: "Run guarded Compose selection, layout, export, operation, promotion, semantic, metric, and deletion-request actions.",
+      actions: WEBMCP_DISPATCH_ACTIONS.composeMutate,
+      toolsByName,
+      readOnly: false,
+      runtimeHealth,
+    }),
+  ];
+  const qualitativeCoding = toolsByName.get("tabulaflow_qualitative_coding");
+  const stableTools = [...core, ...dispatchers, qualitativeCoding];
+  if (stableTools.some((tool) => !tool)) throw new Error("The stable WebMCP surface references an unavailable handler.");
+  return stableTools;
 }
 
 export async function registerWebMcpTools(modelContext, tools, signal, {
@@ -1468,6 +1561,11 @@ export async function registerWebMcpTools(modelContext, tools, signal, {
     await modelContext.registerTool({
       ...tool,
       async execute(input = {}) {
+        const requestId = typeof input?.requestId === "string"
+          ? input.requestId
+          : typeof input?.input?.requestId === "string"
+            ? input.input.requestId
+            : undefined;
         runtimeHealth?.assertExecutable(generation, {
           core,
           mutation: tool.annotations?.readOnlyHint !== true,
@@ -1478,7 +1576,7 @@ export async function registerWebMcpTools(modelContext, tools, signal, {
             cause.code ??= cause instanceof SyntaxError ? "WEBMCP_EXECUTION_SYNTAX_ERROR" : "WEBMCP_EXECUTION_FAILED";
             cause.phase ??= "handler";
             cause.tool ??= tool.name;
-            if (typeof input?.requestId === "string") cause.requestId ??= input.requestId;
+            if (requestId) cause.requestId ??= requestId;
           }
           onExecutionFailure?.(tool.name, cause);
           if (!hadCode || cause instanceof SyntaxError) console.warn(`WebMCP tool execution failed: ${tool.name}`, {
@@ -1488,7 +1586,7 @@ export async function registerWebMcpTools(modelContext, tools, signal, {
           return webMcpErrorForAgent(cause, {
             tool: tool.name,
             phase: cause?.phase ?? "handler",
-            requestId: typeof input?.requestId === "string" ? input.requestId : undefined,
+            requestId,
             generation: runtimeHealth?.snapshot().generation ?? generation,
           });
         };
@@ -1517,24 +1615,12 @@ export function useWebMcpTools(context) {
   const contextRef = useRef(context);
   contextRef.current = context;
   const runtimeHealth = runtimeHealthFor(contextRef);
-  const coreControllerRef = useRef(null);
-  const coreToolsRef = useRef([]);
-  const coreReadyRef = useRef(Promise.resolve(false));
-  const workspacePublicationRef = useRef({ controller: null, tools: [], workspace: null, generation: 0 });
-  const publicationQueueRef = useRef(Promise.resolve());
-  const desiredPublicationRef = useRef({ workspace: context.state.workspace, request: 0 });
-  const unmountedRef = useRef(false);
-  const availability = {
-    workspace: context.state.workspace,
-    // Keep each workspace contract stable. Runtime preconditions report when a
-    // dataset or node is unavailable instead of churning registrations.
-    hasDataset: true,
-    hasPrepared: true,
-    hasComposeNodes: true,
-  };
 
   useEffect(() => {
-    unmountedRef.current = false;
+    runtimeHealth.setWorkspace(context.state.workspace);
+  }, [context.state.workspace, runtimeHealth]);
+
+  useEffect(() => {
     let modelContext;
     try {
       modelContext = document.modelContext;
@@ -1544,134 +1630,49 @@ export function useWebMcpTools(context) {
     if (typeof modelContext?.registerTool !== "function") return undefined;
 
     const controller = new AbortController();
-    coreControllerRef.current = controller;
-    const { core } = createWebMcpToolBundles(contextRef, {
-      workspace: "source",
-      hasDataset: false,
-      hasPrepared: false,
-      hasComposeNodes: false,
+    let disposed = false;
+    const stableTools = createWebMcpStableTools(contextRef);
+    const metrics = measureWebMcpToolset(stableTools);
+    try {
+      assertWebMcpRegistrationBudget(metrics);
+    } catch (cause) {
+      runtimeHealth.failRegistration(cause, { generation: 0, metrics });
+      console.warn("WebMCP stable tool surface exceeds its registration budget.", { code: cause?.code ?? "WEBMCP_REGISTRATION_FAILED" });
+      return undefined;
+    }
+
+    runtimeHealth.beginRegistration({
+      generation: 1,
+      workspace: contextRef.current.state.workspace,
+      registeredToolCount: 0,
+      expectedToolCount: stableTools.length,
+      metrics,
     });
-    coreToolsRef.current = core;
-    const metrics = measureWebMcpToolset(core);
-    coreReadyRef.current = registerWebMcpTools(modelContext, core, controller.signal, {
+
+    registerWebMcpTools(modelContext, stableTools, controller.signal, {
       runtimeHealth,
-      generation: 0,
-      core: true,
+      generation: 1,
     }).then((registered) => {
-      if (!registered) runtimeHealth.markUnavailable();
-      return registered;
-    }).catch((error) => {
+      if (!registered || disposed) return;
+      runtimeHealth.completeRegistration({
+        generation: 1,
+        workspace: contextRef.current.state.workspace,
+        registeredToolCount: stableTools.length,
+        expectedToolCount: stableTools.length,
+        metrics,
+      });
+    }).catch((cause) => {
       if (!controller.signal.aborted) {
         controller.abort();
-        runtimeHealth.failRegistration(error, { generation: 0, metrics });
-        console.warn("WebMCP core tool registration failed.", { code: error?.code ?? "WEBMCP_REGISTRATION_FAILED" });
+        runtimeHealth.failRegistration(cause, { generation: 1, metrics });
+        console.warn("WebMCP stable tool registration failed.", { code: cause?.code ?? "WEBMCP_REGISTRATION_FAILED" });
       }
-      return false;
     });
+
     return () => {
-      unmountedRef.current = true;
+      disposed = true;
       controller.abort();
-      workspacePublicationRef.current.controller?.abort();
       runtimeHealth.markUnavailable();
     };
   }, [runtimeHealth]);
-
-  useEffect(() => {
-    let modelContext;
-    try {
-      modelContext = document.modelContext;
-    } catch {
-      return undefined;
-    }
-    if (typeof modelContext?.registerTool !== "function") return undefined;
-
-    const { workspace } = createWebMcpToolBundles(contextRef, availability);
-    const request = desiredPublicationRef.current.request + 1;
-    desiredPublicationRef.current = { workspace: availability.workspace, request };
-    publicationQueueRef.current = publicationQueueRef.current.then(async () => {
-      const coreReady = await coreReadyRef.current;
-      if (!coreReady || unmountedRef.current || desiredPublicationRef.current.request !== request) return;
-
-      const previous = workspacePublicationRef.current;
-      const nextGeneration = previous.generation + 1;
-      const combinedMetrics = measureWebMcpToolset([...coreToolsRef.current, ...workspace]);
-      try {
-        assertWebMcpRegistrationBudget(combinedMetrics);
-      } catch (cause) {
-        runtimeHealth.failRegistration(cause, { generation: previous.generation, metrics: combinedMetrics, restored: Boolean(previous.tools.length) });
-        return;
-      }
-
-      runtimeHealth.beginRegistration({
-        generation: nextGeneration,
-        workspace: availability.workspace,
-        registeredToolCount: coreToolsRef.current.length,
-        expectedToolCount: coreToolsRef.current.length + workspace.length,
-        metrics: combinedMetrics,
-      });
-      if (previous.tools.length) contextRef.current.actions?.fenceMutations?.();
-      previous.controller?.abort();
-      const controller = new AbortController();
-      try {
-        const registered = await registerWebMcpTools(modelContext, workspace, controller.signal, {
-          runtimeHealth,
-          generation: nextGeneration,
-        });
-        if (!registered || unmountedRef.current || desiredPublicationRef.current.request !== request) {
-          controller.abort();
-          return;
-        }
-        workspacePublicationRef.current = {
-          controller,
-          tools: workspace,
-          workspace: availability.workspace,
-          generation: nextGeneration,
-        };
-        runtimeHealth.completeRegistration({
-          generation: nextGeneration,
-          workspace: availability.workspace,
-          registeredToolCount: coreToolsRef.current.length + workspace.length,
-          expectedToolCount: coreToolsRef.current.length + workspace.length,
-          metrics: combinedMetrics,
-        });
-      } catch (cause) {
-        controller.abort();
-        if (unmountedRef.current) return;
-        let restored = false;
-        if (previous.tools.length) {
-          const restoreController = new AbortController();
-          try {
-            restored = await registerWebMcpTools(modelContext, previous.tools, restoreController.signal, {
-              runtimeHealth,
-              generation: nextGeneration,
-            });
-            if (restored) {
-              workspacePublicationRef.current = {
-                ...previous,
-                controller: restoreController,
-                generation: nextGeneration,
-              };
-            }
-          } catch {
-            restoreController.abort();
-            restored = false;
-          }
-        }
-        runtimeHealth.failRegistration(cause, { generation: nextGeneration, metrics: combinedMetrics, restored });
-        if (restored) {
-          const restoredMetrics = measureWebMcpToolset([...coreToolsRef.current, ...previous.tools]);
-          runtimeHealth.completeRegistration({
-            generation: nextGeneration,
-            workspace: previous.workspace,
-            registeredToolCount: coreToolsRef.current.length + previous.tools.length,
-            expectedToolCount: coreToolsRef.current.length + previous.tools.length,
-            metrics: restoredMetrics,
-            degraded: true,
-          });
-        }
-        console.warn(`WebMCP ${availability.workspace} tool publication failed.`, { code: cause?.code ?? "WEBMCP_REGISTRATION_FAILED", restored });
-      }
-    });
-    publicationQueueRef.current.catch(() => undefined);
-  }, [availability.workspace, runtimeHealth]);
 }

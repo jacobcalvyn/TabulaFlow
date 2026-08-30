@@ -1,4 +1,4 @@
-export const WEBMCP_CONTRACT_VERSION = "3.2.1";
+export const WEBMCP_CONTRACT_VERSION = "3.2.2";
 
 export const WEBMCP_REGISTRATION_BUDGET = Object.freeze({
   maxToolCount: 48,
@@ -155,6 +155,9 @@ export function createWebMcpRuntimeHealth() {
     },
     markUnavailable() {
       update({ status: "unavailable", registeredToolCount: 0, callableToolCount: 0, blockedToolCount: 0, refreshRequired: false });
+    },
+    setWorkspace(workspace) {
+      update({ workspace });
     },
     record(toolName, cause) {
       if (!(cause instanceof SyntaxError) && cause?.code !== "WEBMCP_EXECUTION_SYNTAX_ERROR") return;

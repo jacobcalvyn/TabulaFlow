@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   WEBMCP_CORE_TOOL_NAMES,
-  createWebMcpToolBundles,
+  WEBMCP_DISPATCH_ACTIONS,
+  WEBMCP_STABLE_TOOL_NAMES,
+  createWebMcpStableTools,
   createWebMcpTools,
   registerWebMcpTools,
 } from "../src/useWebMcpTools.js";
@@ -18,7 +20,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "3.2.1", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "3.2.2", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -163,33 +165,41 @@ test("qualitative coding WebMCP uses one bounded dispatcher and keeps approval h
   assert.equal(coding.inputSchema.properties.action.enum.includes("approve"), false);
 });
 
-test("WebMCP registers a small permanent core and only the active workspace bundle", () => {
+test("WebMCP 3.2.2 registers one small stable dispatcher surface", () => {
   const { ref } = createContext();
-  const availability = { hasDataset: true, hasPrepared: true, hasComposeNodes: true };
-  const expectedWorkspaceTools = {
-    source: [],
-    account: ["tabulaflow_list_cloud_files", "tabulaflow_open_cloud_file", "tabulaflow_request_cloud_upload"],
-  };
+  const stable = createWebMcpStableTools(ref);
+  assert.deepEqual(stable.map((tool) => tool.name), WEBMCP_STABLE_TOOL_NAMES);
+  assert.deepEqual(stable.slice(0, WEBMCP_CORE_TOOL_NAMES.length).map((tool) => tool.name), WEBMCP_CORE_TOOL_NAMES);
+  assert.equal(new Set(stable.map((tool) => tool.name)).size, stable.length);
+  assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.source, "request_source_file"));
+  assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.prepareRead, "get_prepare_preview"));
+  assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.prepareMutate, "add_recipe_step"));
+  assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.composeRead, "get_compose_graph"));
+  assert.ok(Object.hasOwn(WEBMCP_DISPATCH_ACTIONS.composeMutate, "create_compose_operation"));
+  const metrics = measureWebMcpToolset(stable);
+  assert.ok(metrics.schemaBytes <= WEBMCP_REGISTRATION_BUDGET.maxSchemaBytes * 0.7, "stable WebMCP schema must retain 30 percent host headroom");
+});
 
-  for (const workspace of ["source", "prepare", "compose", "account"]) {
-    const bundles = createWebMcpToolBundles(ref, { ...availability, workspace });
-    assert.deepEqual(bundles.core.map((tool) => tool.name), WEBMCP_CORE_TOOL_NAMES);
-    assert.ok(bundles.core.some((tool) => tool.name === "tabulaflow_request_source_file"));
-    assert.equal(new Set([...bundles.core, ...bundles.workspace].map((tool) => tool.name)).size, bundles.core.length + bundles.workspace.length);
-    const metrics = measureWebMcpToolset([...bundles.core, ...bundles.workspace]);
-    assert.ok(metrics.schemaBytes <= WEBMCP_REGISTRATION_BUDGET.maxSchemaBytes, `${workspace} WebMCP bundle exceeded its configuration budget`);
-    if (expectedWorkspaceTools[workspace]) assert.deepEqual(bundles.workspace.map((tool) => tool.name), expectedWorkspaceTools[workspace]);
-  }
-
-  const prepare = createWebMcpToolBundles(ref, { ...availability, workspace: "prepare" }).workspace.map((tool) => tool.name);
-  assert.ok(prepare.includes("tabulaflow_get_prepare_preview"));
-  assert.ok(prepare.includes("tabulaflow_add_recipe_step"));
-  assert.equal(prepare.includes("tabulaflow_get_compose_graph"), false);
-
-  const compose = createWebMcpToolBundles(ref, { ...availability, workspace: "compose" }).workspace.map((tool) => tool.name);
-  assert.ok(compose.includes("tabulaflow_get_compose_graph"));
-  assert.ok(compose.includes("tabulaflow_create_compose_operation"));
-  assert.equal(compose.includes("tabulaflow_add_recipe_step"), false);
+test("stable dispatchers validate the selected action schema and route against current context", async () => {
+  const { calls, ref } = createContext();
+  const stable = createWebMcpStableTools(ref);
+  const prepareRead = toolByName(stable, "tabulaflow_prepare_read");
+  const prepareMutate = toolByName(stable, "tabulaflow_prepare_mutate");
+  const recipe = await prepareRead.execute({ action: "get_recipe", input: { preparedId: "prepared-a" } });
+  assert.equal(recipe.structuredContent.preparedId, "prepared-a");
+  assert.deepEqual(recipe.structuredContent.dispatcher, { tool: "tabulaflow_prepare_read", action: "get_recipe" });
+  await prepareMutate.execute({
+    action: "set_preview_filter",
+    input: { preparedId: "prepared-a", column: "status", value: "open", ...mutation("dispatcher-filter-001") },
+  });
+  assert.ok(calls.some((call) => call[0] === "filters"));
+  await assert.rejects(
+    () => prepareMutate.execute({
+      action: "set_preview_filter",
+      input: { preparedId: "prepared-a", column: "status", values: ["open"], ...mutation("dispatcher-filter-invalid") },
+    }),
+    (error) => error.code === "WEBMCP_INVALID_INPUT" && error.phase === "input-validation",
+  );
 });
 
 test("WebMCP read plane observes workflow, Prepare data, and Compose data", async () => {
@@ -222,7 +232,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "3.2.1");
+  assert.equal(capabilities.structuredContent.contractVersion, "3.2.2");
   assert.deepEqual(capabilities.structuredContent.operationLifecycle.terminalStates, ["succeeded", "failed", "cancelled"]);
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));

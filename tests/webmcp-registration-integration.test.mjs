@@ -8,7 +8,7 @@ import { createWebMcpMutationRunner } from "../src/webMcpMutation.js";
 
 function state(revision, { compose = true, workspace = "prepare" } = {}) {
   return {
-    contractVersion: "3.2.1",
+    contractVersion: "3.2.2",
     workspaceRevision: revision,
     workspace,
     worker: { ready: true, recovering: false },
@@ -32,7 +32,33 @@ function Harness({ context }) {
   return null;
 }
 
-test("React WebMCP registration keeps core stable and rotates only the active workspace bundle", async (t) => {
+function createAbortAwareHost({ failOn } = {}) {
+  const registrations = [];
+  const registry = new Map();
+  const namesBySignal = new WeakMap();
+  return {
+    registrations,
+    registry,
+    modelContext: {
+      async registerTool(tool, options) {
+        registrations.push({ name: tool.name, signal: options.signal });
+        if (tool.name === failOn) throw new Error("configuration limit exceeded");
+        registry.set(tool.name, tool);
+        let names = namesBySignal.get(options.signal);
+        if (!names) {
+          names = new Set();
+          namesBySignal.set(options.signal, names);
+          options.signal.addEventListener("abort", () => {
+            for (const name of names) registry.delete(name);
+          }, { once: true });
+        }
+        names.add(tool.name);
+      },
+    },
+  };
+}
+
+test("React WebMCP registers one stable surface and the host removes it only on lifecycle abort", async (t) => {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "https://example.test" });
   const previousWindow = globalThis.window;
   const previousDocument = globalThis.document;
@@ -45,14 +71,9 @@ test("React WebMCP registration keeps core stable and rotates only the active wo
     globalThis.document = previousDocument;
   });
 
-  const registrations = [];
-  const registry = new Map();
-  document.modelContext = {
-    async registerTool(tool, options) {
-      registrations.push({ name: tool.name, signal: options.signal });
-      registry.set(tool.name, tool);
-    },
-  };
+  const host = createAbortAwareHost();
+  const { registrations, registry } = host;
+  document.modelContext = host.modelContext;
 
   let revision = 7;
   let exportExecutions = 0;
@@ -65,41 +86,38 @@ test("React WebMCP registration keeps core stable and rotates only the active wo
   const actions = { exportPrepare };
 
   const view = render(React.createElement(Harness, { context: { state: state(revision), actions } }));
-  await waitFor(() => assert.ok(registry.has("tabulaflow_export_prepare")));
-  const coreSignal = registrations.find(({ name }) => name === "tabulaflow_get_workspace_state").signal;
-  const sourceRequestSignal = registrations.find(({ name }) => name === "tabulaflow_request_source_file").signal;
-  const prepareSignal = registrations.find(({ name }) => name === "tabulaflow_export_prepare").signal;
-  assert.notEqual(coreSignal, prepareSignal);
-  assert.equal(sourceRequestSignal, coreSignal);
-  assert.equal(registry.has("tabulaflow_export_compose"), false);
-  const exportTool = registry.get("tabulaflow_export_prepare");
+  await waitFor(() => assert.ok(registry.has("tabulaflow_prepare_mutate")));
+  const initialRegistrationCount = registrations.length;
+  const lifecycleSignal = registrations.find(({ name }) => name === "tabulaflow_get_workspace_state").signal;
+  assert.ok(registrations.every(({ signal }) => signal === lifecycleSignal));
+  assert.equal(registry.has("tabulaflow_export_prepare"), false);
+  assert.equal(registry.has("tabulaflow_compose_read"), true);
+  const exportTool = registry.get("tabulaflow_prepare_mutate");
   const args = { preparedId: "prepared-a", format: "csv", expectedRevision: 7, requestId: "registered-export-001", executionMode: "wait" };
-  await exportTool.execute(args);
-  await exportTool.execute(args);
+  await exportTool.execute({ action: "export_prepare", input: args });
+  await exportTool.execute({ action: "export_prepare", input: args });
   assert.equal(exportExecutions, 1);
 
   revision = 8;
   view.rerender(React.createElement(Harness, { context: { state: state(revision), actions } }));
-  assert.equal(coreSignal.aborted, false);
-  assert.equal(prepareSignal.aborted, false);
+  assert.equal(lifecycleSignal.aborted, false);
+  assert.equal(registrations.length, initialRegistrationCount);
   assert.equal((await registry.get("tabulaflow_get_workspace_state").execute({})).structuredContent.workspaceRevision, 8);
   await assert.rejects(
-    () => exportTool.execute({ ...args, requestId: "registered-export-stale-001" }),
+    () => exportTool.execute({ action: "export_prepare", input: { ...args, requestId: "registered-export-stale-001" } }),
     (error) => error.code === "STALE_STATE",
   );
 
   view.rerender(React.createElement(Harness, { context: { state: state(revision, { workspace: "compose" }), actions } }));
-  await waitFor(() => assert.ok(registry.has("tabulaflow_export_compose")));
-  assert.equal(prepareSignal.aborted, true);
-  assert.equal(coreSignal.aborted, false);
-  assert.equal(sourceRequestSignal.aborted, false);
-  const composeSignal = registrations.find(({ name }) => name === "tabulaflow_export_compose").signal;
+  await waitFor(async () => assert.equal((await registry.get("tabulaflow_get_workspace_state").execute({})).structuredContent.workspace, "compose"));
+  assert.equal(registrations.length, initialRegistrationCount);
+  assert.equal(lifecycleSignal.aborted, false);
   view.unmount();
-  assert.equal(coreSignal.aborted, true);
-  assert.equal(composeSignal.aborted, true);
+  assert.equal(lifecycleSignal.aborted, true);
+  assert.equal(registry.size, 0);
 });
 
-test("a workspace registration failure does not disable the WebMCP core", async (t) => {
+test("a host registration failure aborts and removes the partial stable surface", async (t) => {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "https://example.test" });
   const previousWindow = globalThis.window;
   const previousDocument = globalThis.document;
@@ -116,21 +134,14 @@ test("a workspace registration failure does not disable the WebMCP core", async 
     console.warn = previousWarn;
   });
 
-  const registrations = [];
-  document.modelContext = {
-    async registerTool(tool, options) {
-      registrations.push({ name: tool.name, signal: options.signal });
-      if (tool.name === "tabulaflow_get_prepare_dataset") throw new Error("configuration limit exceeded");
-    },
-  };
+  const host = createAbortAwareHost({ failOn: "tabulaflow_prepare_read" });
+  const { registrations, registry } = host;
+  document.modelContext = host.modelContext;
 
   const view = render(React.createElement(Harness, { context: { state: state(7), actions: {} } }));
   await waitFor(() => assert.ok(warnings.length > 0));
-  const coreSignal = registrations.find(({ name }) => name === "tabulaflow_get_workspace_state").signal;
-  const workspaceSignal = registrations.find(({ name }) => name === "tabulaflow_get_prepare_dataset").signal;
-  assert.equal(coreSignal.aborted, false);
-  assert.equal(workspaceSignal.aborted, true);
-  assert.match(warnings[0][0], /prepare tool publication failed/);
+  assert.ok(registrations.every(({ signal }) => signal.aborted));
+  assert.equal(registry.size, 0);
+  assert.match(warnings[0][0], /stable tool registration failed/);
   view.unmount();
-  assert.equal(coreSignal.aborted, true);
 });

@@ -6,17 +6,15 @@ import {
   createWebMcpRuntimeHealth,
   measureWebMcpToolset,
 } from "../src/webMcpRuntime.js";
-import { createWebMcpToolBundles } from "../src/useWebMcpTools.js";
+import { createWebMcpStableTools } from "../src/useWebMcpTools.js";
 
 const contextRef = { current: { state: { workspace: "prepare" }, actions: {} } };
 
-test("every contextual WebMCP bundle stays inside the measured registration budget", () => {
-  for (const workspace of ["source", "prepare", "compose", "account"]) {
-    const bundles = createWebMcpToolBundles(contextRef, { workspace, hasDataset: true, hasPrepared: true, hasComposeNodes: true });
-    const metrics = measureWebMcpToolset([...bundles.core, ...bundles.workspace]);
-    assert.doesNotThrow(() => assertWebMcpRegistrationBudget(metrics));
-    assert.ok(metrics.schemaBytes <= WEBMCP_REGISTRATION_BUDGET.maxSchemaBytes);
-  }
+test("the permanent WebMCP dispatcher surface stays inside the measured registration budget", () => {
+  const metrics = measureWebMcpToolset(createWebMcpStableTools(contextRef));
+  assert.doesNotThrow(() => assertWebMcpRegistrationBudget(metrics));
+  assert.ok(metrics.schemaBytes <= WEBMCP_REGISTRATION_BUDGET.maxSchemaBytes * 0.7);
+  assert.ok(metrics.toolCount < WEBMCP_REGISTRATION_BUDGET.maxToolCount / 2);
 });
 
 test("registration budget rejects an oversized toolset before publication", () => {
