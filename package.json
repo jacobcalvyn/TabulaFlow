@@ -2,12 +2,13 @@
   "name": "tabula-flow",
   "version": "0.0.0",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "preview": "vite preview",
-    "test": "node --test tests/activity-model.test.mjs tests/data.test.mjs tests/import-export-integration.test.mjs tests/transformations.test.mjs tests/formula-engine.test.mjs tests/qualitative-coding.test.mjs tests/recipe-history.test.mjs tests/filter-state.test.mjs tests/flow-model.test.mjs tests/compose-sql.test.mjs tests/compose-screen-interaction.test.mjs tests/compose-viewport.test.mjs tests/source-screen-interaction.test.mjs tests/source-file-handles.test.mjs tests/clean-build-catalog.test.mjs tests/recipe-storage.test.mjs tests/worker-recovery.test.mjs tests/data-worker-cancellation.test.mjs tests/prepared-activation.test.mjs tests/sites-worker.test.mjs tests/cloud-api.test.mjs tests/webmcp.test.mjs tests/webmcp-runtime.test.mjs tests/webmcp-registration-integration.test.mjs tests/webmcp-mutation.test.mjs tests/webmcp-interactions.test.mjs tests/webmcp-dto.test.mjs tests/webmcp-safety.test.mjs",
+    "test": "node --test tests/activity-model.test.mjs tests/data.test.mjs tests/hackathon-readiness.test.mjs tests/import-export-integration.test.mjs tests/transformations.test.mjs tests/formula-engine.test.mjs tests/qualitative-coding.test.mjs tests/recipe-history.test.mjs tests/filter-state.test.mjs tests/flow-model.test.mjs tests/compose-sql.test.mjs tests/compose-screen-interaction.test.mjs tests/compose-viewport.test.mjs tests/source-screen-interaction.test.mjs tests/source-file-handles.test.mjs tests/clean-build-catalog.test.mjs tests/recipe-storage.test.mjs tests/worker-recovery.test.mjs tests/data-worker-cancellation.test.mjs tests/prepared-activation.test.mjs tests/sites-worker.test.mjs tests/cloud-api.test.mjs tests/webmcp.test.mjs tests/webmcp-runtime.test.mjs tests/webmcp-registration-integration.test.mjs tests/webmcp-mutation.test.mjs tests/webmcp-interactions.test.mjs tests/webmcp-dto.test.mjs tests/webmcp-safety.test.mjs",
     "test:sites": "node --test tests/sites-worker.test.mjs tests/cloud-api.test.mjs"
   },
   "dependencies": {
