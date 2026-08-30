@@ -62,6 +62,20 @@ test("Formula column is grouped beside Choose columns in the aggregate heading",
   assert.doesNotMatch(appSource, /className="toolbar-actions"/);
 });
 
+test("creating a Formula column uses the same accessible modal surface as editing one", () => {
+  const formulaPortal = appSource.slice(
+    appSource.indexOf("{formulaEditorOpen && createPortal("),
+    appSource.indexOf("{codingPanelOpen && createPortal("),
+  );
+
+  assert.match(formulaPortal, /className="formula-step-modal-backdrop"/);
+  assert.match(formulaPortal, /className="formula-step-modal"/);
+  assert.match(formulaPortal, /role="dialog"/);
+  assert.match(formulaPortal, /aria-modal="true"/);
+  assert.match(formulaPortal, /onKeyDown=\{keepFormulaFocusInside\}/);
+  assert.doesNotMatch(stylesSource, /\.formula-column-popover\s*\{/);
+});
+
 test("embedded Steps keeps its header fixed and scrolls only the recipe list", () => {
   assert.match(stylesSource, /\.sidebar-steps-host\s*\{[^}]*height:\s*0;[^}]*flex:\s*1 1 0;/s);
   assert.match(stylesSource, /\.steps-panel--embedded\s*\{[^}]*min-height:\s*0;[^}]*max-height:\s*100%;/s);

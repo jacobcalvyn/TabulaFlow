@@ -1424,8 +1424,10 @@ function DataScreen({
   const preparedSelectorRef = useRef(null);
   const columnPickerRef = useRef(null);
   const transformPopoverRef = useRef(null);
-  const formulaPopoverRef = useRef(null);
+  const formulaModalRef = useRef(null);
   const formulaTriggerRef = useRef(null);
+  const formulaApplyingRef = useRef(false);
+  formulaApplyingRef.current = formulaApplying;
   const [sidebarStepsTarget, setSidebarStepsTarget] = useState(null);
   const activeFilterCount = Object.keys(filters).length;
   const filterSignature = JSON.stringify(filters);
@@ -1521,24 +1523,38 @@ function DataScreen({
 
   useEffect(() => {
     if (!formulaEditorOpen) return undefined;
-    const closeOnOutsideClick = (event) => {
-      if (formulaPopoverRef.current?.contains(event.target) || formulaTriggerRef.current?.contains(event.target)) return;
-      setFormulaEditorOpen(false);
-      setFormulaError("");
-    };
     const closeOnEscape = (event) => {
-      if (event.key === "Escape") {
+      if (event.key === "Escape" && !event.defaultPrevented && !formulaApplyingRef.current) {
         setFormulaEditorOpen(false);
         setFormulaError("");
       }
     };
-    document.addEventListener("pointerdown", closeOnOutsideClick, true);
     document.addEventListener("keydown", closeOnEscape);
     return () => {
-      document.removeEventListener("pointerdown", closeOnOutsideClick, true);
       document.removeEventListener("keydown", closeOnEscape);
+      formulaTriggerRef.current?.focus();
     };
   }, [formulaEditorOpen]);
+
+  const keepFormulaFocusInside = (event) => {
+    if (event.key !== "Tab") return;
+    const focusable = [...event.currentTarget.querySelectorAll(
+      'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+    )].filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true");
+    if (!focusable.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
 
   const applyFilters = useCallback(async (nextFilters, nextAggregateColumns = aggregateColumns) => {
     setStepPreview(null);
@@ -1867,18 +1883,36 @@ function DataScreen({
       </header>
 
       {formulaEditorOpen && createPortal(
-        <section ref={formulaPopoverRef} className="formula-column-popover" aria-label={t("formulaColumn")}>
-          <FormulaColumnEditor
-            schema={dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] ?? "UNKNOWN" }))}
-            title={t("formulaColumn")}
-            submitLabel={t("add")}
-            applying={formulaApplying}
-            error={formulaError}
-            onPreview={(params, referencedColumns) => previewFormulaStep(params, referencedColumns)}
-            onSubmit={addFormulaColumn}
-            onCancel={() => { setFormulaEditorOpen(false); setFormulaError(""); }}
-          />
-        </section>,
+        <div
+          className="formula-step-modal-backdrop"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget && !formulaApplying) {
+              setFormulaEditorOpen(false);
+              setFormulaError("");
+            }
+          }}
+        >
+          <section
+            ref={formulaModalRef}
+            className="formula-step-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t("formulaColumn")}
+            tabIndex={-1}
+            onKeyDown={keepFormulaFocusInside}
+          >
+            <FormulaColumnEditor
+              schema={dataset.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] ?? "UNKNOWN" }))}
+              title={t("formulaColumn")}
+              submitLabel={t("add")}
+              applying={formulaApplying}
+              error={formulaError}
+              onPreview={(params, referencedColumns) => previewFormulaStep(params, referencedColumns)}
+              onSubmit={addFormulaColumn}
+              onCancel={() => { setFormulaEditorOpen(false); setFormulaError(""); }}
+            />
+          </section>
+        </div>,
         document.body,
       )}
 
