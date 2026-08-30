@@ -1,7 +1,23 @@
+import {
+  operationStatusForAgent,
+  persistedOperationForStorage,
+  sanitizeWebMcpError,
+} from "./webMcpPrivacy.js";
+
 function mutationError(message, code) {
   const error = new Error(message);
   error.code = code;
   return error;
+}
+
+function digestFingerprint(value) {
+  const bytes = new TextEncoder().encode(String(value));
+  let hash = 1469598103934665603n;
+  for (const byte of bytes) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * 1099511628211n);
+  }
+  return `fnv1a64:${hash.toString(16).padStart(16, "0")}`;
 }
 
 export function createWebMcpMutationRunner({
@@ -14,10 +30,12 @@ export function createWebMcpMutationRunner({
   const cache = new Map();
   const operations = new Map();
   let mutationQueue = Promise.resolve();
+  let writeEpoch = 0;
+  let activeWriterOperationId = null;
 
   const persist = (operation) => {
     if (typeof persistOperation !== "function" || !operation?.flowId) return;
-    Promise.resolve(persistOperation(structuredClone(operation))).catch(() => undefined);
+    Promise.resolve(persistOperation(persistedOperationForStorage(operation))).catch(() => undefined);
   };
 
   const evictTerminalEntries = () => {
@@ -30,18 +48,20 @@ export function createWebMcpMutationRunner({
     const expectedRevision = Number(meta?.expectedRevision);
     if (!requestId) throw mutationError("A WebMCP mutation requires requestId.", "REQUEST_ID_REQUIRED");
     if (!fingerprint) throw mutationError("A WebMCP mutation requires an internal fingerprint.", "MUTATION_FINGERPRINT_REQUIRED");
+    const fingerprintHash = digestFingerprint(fingerprint);
 
     const cached = cache.get(requestId);
     if (cached) {
-      if (cached.fingerprint !== fingerprint) {
+      if (cached.fingerprintHash !== fingerprintHash) {
         throw mutationError(`The idempotency key ${requestId} was already used for another mutation.`, "IDEMPOTENCY_KEY_REUSED");
       }
       const operation = operations.get(cached.operationId);
       if (operation?.status === "failed") {
-        throw mutationError(operation.error?.message ?? "Mutation failed.", operation.error?.code ?? "MUTATION_FAILED");
+        const safeError = sanitizeWebMcpError(operation.error);
+        throw mutationError(safeError.message, safeError.code);
       }
       if (operation?.status === "committed" || operation?.status === "cancelled") return structuredClone(operation.result);
-      if (operation && (operation.status === "accepted" || operation.status === "running")) {
+      if (operation && ["accepted", "running", "cancelling", "committing"].includes(operation.status)) {
         if (cached.executionMode === "wait") return cached.promise;
         return { operationId: operation.operationId, requestId, status: operation.status, workspaceRevision: getRevision() };
       }
@@ -53,9 +73,14 @@ export function createWebMcpMutationRunner({
     const operation = {
       operationId,
       requestId,
-      fingerprint,
+      fingerprintHash,
       flowId: getFlowId(),
       executionMode,
+      operationClass: meta?.operationClass === "snapshot-compute" ? "snapshot-compute" : "workspace-writer",
+      baseRevision: expectedRevision,
+      phase: "queued",
+      writeEpoch: null,
+      cancelRequested: false,
       status: "accepted",
       acceptedAt: new Date().toISOString(),
       startedAt: null,
@@ -66,39 +91,63 @@ export function createWebMcpMutationRunner({
     operations.set(operationId, operation);
     persist(operation);
     const promise = mutationQueue.then(async () => {
+      if (operation.cancelRequested) throw mutationError("The operation was cancelled before it started.", "OPERATION_CANCELLED");
+      operation.writeEpoch = ++writeEpoch;
+      activeWriterOperationId = operation.operationId;
       operation.status = "running";
+      operation.phase = "executing";
       operation.startedAt = new Date().toISOString();
       persist(operation);
       const currentRevision = getRevision();
       if (!Number.isInteger(expectedRevision) || expectedRevision !== currentRevision) {
         throw mutationError(`Workspace state is stale. Expected revision ${currentRevision}, received ${meta?.expectedRevision}.`, "STALE_STATE");
       }
+      let checkpointCount = 0;
       const assertCurrent = () => {
+        if (operation.cancelRequested || operation.writeEpoch !== writeEpoch) {
+          throw mutationError("The operation was cancelled before its commit boundary.", "OPERATION_CANCELLED");
+        }
         const latestRevision = getRevision();
         if (latestRevision !== expectedRevision) {
           throw mutationError(`Workspace state changed while the mutation was running. Expected revision ${expectedRevision}, current revision ${latestRevision}.`, "STALE_STATE");
         }
+        checkpointCount += 1;
+        if (checkpointCount > 1) {
+          operation.status = "committing";
+          operation.phase = "committing";
+          persist(operation);
+        }
       };
       const result = await execute(assertCurrent);
+      if (operation.cancelRequested || operation.writeEpoch !== writeEpoch) {
+        throw mutationError("The operation was cancelled before its commit boundary.", "OPERATION_CANCELLED");
+      }
       const normalized = result && typeof result === "object" ? result : { result };
       const committed = { ...normalized, workspaceRevision: getRevision() };
       operation.status = "committed";
+      operation.phase = "completed";
       operation.completedAt = new Date().toISOString();
       operation.result = committed;
       persist(operation);
       return committed;
     }).catch((cause) => {
-      operation.status = "failed";
+      operation.status = cause?.code === "OPERATION_CANCELLED" ? "cancelled" : "failed";
+      operation.phase = operation.status === "cancelled" ? "cancelled" : "failed";
       operation.completedAt = new Date().toISOString();
-      operation.error = { code: cause?.code ?? "MUTATION_FAILED", message: cause instanceof Error ? cause.message : "Mutation failed." };
+      operation.error = operation.status === "cancelled" ? null : sanitizeWebMcpError(cause);
+      operation.result = operation.status === "cancelled"
+        ? { operationId, requestId, status: "cancelled", workspaceRevision: getRevision() }
+        : null;
       persist(operation);
       throw cause;
+    }).finally(() => {
+      if (activeWriterOperationId === operation.operationId) activeWriterOperationId = null;
     });
     mutationQueue = promise.then(() => undefined, () => undefined);
     const response = executionMode === "async"
       ? Promise.resolve({ operationId, requestId, status: "accepted", workspaceRevision: getRevision() })
       : promise;
-    cache.set(requestId, { fingerprint, response, promise, operationId, executionMode });
+    cache.set(requestId, { fingerprintHash, response, promise, operationId, executionMode });
     promise.then(evictTerminalEntries, evictTerminalEntries);
     if (executionMode === "async") promise.catch(() => undefined);
 
@@ -113,7 +162,39 @@ export function createWebMcpMutationRunner({
   runWebMcpMutation.getOperationStatus = (operationId) => {
     const operation = operations.get(String(operationId ?? ""));
     if (!operation) throw mutationError(`Mutation operation not found: ${operationId}`, "OPERATION_NOT_FOUND");
-    return structuredClone(operation);
+    return operationStatusForAgent(operation);
+  };
+
+  runWebMcpMutation.getActiveOperationIds = () => [...operations.values()]
+    .filter((operation) => ["accepted", "running", "cancelling", "committing"].includes(operation.status))
+    .map((operation) => operation.operationId);
+
+  runWebMcpMutation.cancelOperation = (operationId) => {
+    const operation = operations.get(String(operationId ?? ""));
+    if (!operation) throw mutationError(`Mutation operation not found: ${operationId}`, "OPERATION_NOT_FOUND");
+    if (["committed", "failed", "cancelled"].includes(operation.status)) return operationStatusForAgent(operation);
+    if (operation.status === "committing") throw mutationError("The operation has crossed its commit boundary.", "TOO_LATE_TO_CANCEL");
+    operation.cancelRequested = true;
+    operation.status = "cancelling";
+    operation.phase = "cancelling";
+    if (activeWriterOperationId === operation.operationId) writeEpoch += 1;
+    persist(operation);
+    return operationStatusForAgent(operation);
+  };
+
+  runWebMcpMutation.fenceMutations = () => {
+    const cancellable = [...operations.values()].filter((operation) => (
+      ["accepted", "running", "cancelling"].includes(operation.status)
+    ));
+    if (!cancellable.length) return [];
+    writeEpoch += 1;
+    for (const operation of cancellable) {
+      operation.cancelRequested = true;
+      operation.status = "cancelling";
+      operation.phase = "cancelling";
+      persist(operation);
+    }
+    return cancellable.map((operation) => operation.operationId);
   };
 
   runWebMcpMutation.setRequestTerminalStatus = (requestId, status, result = {}) => {
@@ -129,12 +210,15 @@ export function createWebMcpMutationRunner({
     return true;
   };
 
-  runWebMcpMutation.hydrate = (records = []) => {
+  runWebMcpMutation.hydrate = async (records = []) => {
     for (const stored of records.slice(0, maximumEntries * 2)) {
-      if (!stored?.operationId || !stored?.requestId || !stored?.fingerprint) continue;
+      if (!stored?.operationId || !stored?.requestId || (!stored?.fingerprintHash && !stored?.fingerprint)) continue;
       const operation = structuredClone(stored);
-      if (operation.status === "accepted" || operation.status === "running") {
+      operation.fingerprintHash ??= digestFingerprint(operation.fingerprint);
+      delete operation.fingerprint;
+      if (["accepted", "running", "cancelling", "committing"].includes(operation.status)) {
         operation.status = "failed";
+        operation.phase = "failed";
         operation.completedAt = new Date().toISOString();
         operation.error = {
           code: "OPERATION_INTERRUPTED_BY_RELOAD",
@@ -144,7 +228,7 @@ export function createWebMcpMutationRunner({
       }
       operations.set(operation.operationId, operation);
       cache.set(operation.requestId, {
-        fingerprint: operation.fingerprint,
+        fingerprintHash: operation.fingerprintHash,
         operationId: operation.operationId,
         executionMode: operation.executionMode ?? "wait",
         response: operation.result,

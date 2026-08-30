@@ -228,6 +228,7 @@ test("dry-run schema deltas contain metadata only", () => {
     added: [{ name: "total", type: "DOUBLE" }],
     removed: [{ name: "status", type: "VARCHAR" }],
     typeChanged: [{ name: "id", before: "BIGINT", after: "VARCHAR" }],
+    renamed: [],
   });
 });
 

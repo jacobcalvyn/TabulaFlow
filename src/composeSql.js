@@ -137,6 +137,7 @@ export function compileAppendSql(inputs, config = {}) {
       return {
         name,
         type: outputTypes.get(name),
+        provenance: { kind: "append", columns: sources.map((column) => column.name) },
         semantic: mergeFieldSemantics(sources, { kind: "append", columns: sources.map((column) => column.name) }),
       };
     }),
@@ -197,6 +198,7 @@ export function compileJoinSql(left, right, config = {}) {
     schema: output.map(({ name, type, semantic, side, source }) => ({
       name,
       type,
+      provenance: { kind: "join", side, column: source },
       semantic: { ...semantic, provenance: { kind: "join", side, column: source } },
     })),
     keyPairs,

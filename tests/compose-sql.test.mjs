@@ -10,6 +10,7 @@ import {
   compilePivotSql,
   compileUnpivotSql,
 } from "../src/composeSql.js";
+import { composeSchemaDelta } from "../src/schemaDelta.js";
 
 const relation = (sql, columns) => ({ sql, schema: columns.map(([name, type]) => ({ name, type })) });
 
@@ -64,6 +65,25 @@ test("join includes every visible input column by default", () => {
     },
   );
   assert.deepEqual(result.schema.map((column) => column.name), ["id_left", "left_value", "id_right", "right_value"]);
+});
+
+test("wide Join schema delta uses normalized provenance instead of reporting every field twice", () => {
+  const leftColumns = Array.from({ length: 305 }, (_, index) => [`field_${index}`, index === 0 ? "BIGINT" : "VARCHAR"]);
+  const rightColumns = Array.from({ length: 305 }, (_, index) => [`field_${index}`, index === 0 ? "BIGINT" : "VARCHAR"]);
+  const left = relation("left_table", leftColumns);
+  const right = relation("right_table", rightColumns);
+  const compiled = compileJoinSql(left, right, {
+    joinType: "inner",
+    collisionPolicy: "suffix",
+    keyPairs: [{ left: "field_0", right: "field_0" }],
+  });
+  const delta = composeSchemaDelta("join", [left.schema, right.schema], compiled.schema);
+  assert.equal(compiled.schema.length, 610);
+  assert.equal(delta.added.length, 0);
+  assert.equal(delta.removed.length, 0);
+  assert.equal(delta.renamed.length, 610);
+  assert.equal(delta.baseline, "normalized-binary-input");
+  assert.deepEqual(compiled.schema[0].provenance, { kind: "join", side: "left", column: "field_0" });
 });
 
 test("append and join reject an explicitly empty output selection", () => {

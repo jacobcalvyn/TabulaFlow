@@ -8,7 +8,7 @@ import { createWebMcpMutationRunner } from "../src/webMcpMutation.js";
 
 function state(revision, { compose = true, workspace = "prepare" } = {}) {
   return {
-    contractVersion: "3.0",
+    contractVersion: "3.1",
     workspaceRevision: revision,
     workspace,
     worker: { ready: true, recovering: false },
@@ -71,7 +71,7 @@ test("React WebMCP registration keeps core stable and rotates only the active wo
   assert.notEqual(coreSignal, prepareSignal);
   assert.equal(registry.has("tabulaflow_export_compose"), false);
   const exportTool = registry.get("tabulaflow_export_prepare");
-  const args = { preparedId: "prepared-a", format: "csv", expectedRevision: 7, requestId: "registered-export-001" };
+  const args = { preparedId: "prepared-a", format: "csv", expectedRevision: 7, requestId: "registered-export-001", executionMode: "wait" };
   await exportTool.execute(args);
   await exportTool.execute(args);
   assert.equal(exportExecutions, 1);
@@ -127,7 +127,7 @@ test("a workspace registration failure does not disable the WebMCP core", async 
   const workspaceSignal = registrations.find(({ name }) => name === "tabulaflow_get_prepare_dataset").signal;
   assert.equal(coreSignal.aborted, false);
   assert.equal(workspaceSignal.aborted, true);
-  assert.match(warnings[0][0], /prepare tool registration failed/);
+  assert.match(warnings[0][0], /prepare tool publication failed/);
   view.unmount();
   assert.equal(coreSignal.aborted, true);
 });

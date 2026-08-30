@@ -46,7 +46,7 @@ import {
   saveStoredWebMcpOperation,
 } from "./recipeStorage.js";
 import { createActivityEvent, findSupersededActivity, pageActivityEvents } from "./activityModel.js";
-import { schemaDelta } from "./schemaDelta.js";
+import { composeSchemaDelta, schemaDelta } from "./schemaDelta.js";
 import { nextWorkspaceRevision } from "./workspaceRevision.js";
 import { resolveColumnSemantics, shouldRedactAgentValues } from "./dataPrivacy.js";
 import {
@@ -111,6 +111,7 @@ function protectFiltersForAgent(filters = {}, schema = []) {
 }
 
 const ACCEPTED_FILES = ".xlsx,.xls,.csv,.json,.jsonl,.ndjson";
+const WEBMCP_CONFIRMATION_TTL_MS = 10 * 60 * 1000;
 const PREVIEW_ROW_HEIGHT = 36;
 const PREVIEW_OVERSCAN = 4;
 const PREVIEW_COLUMN_WIDTH = 150;
@@ -2173,7 +2174,7 @@ export function App() {
         setFlow(restored);
         try {
           const storedOperations = await loadStoredWebMcpOperations(restored.id);
-          webMcpMutationRunnerRef.current.hydrate(storedOperations);
+          await webMcpMutationRunnerRef.current.hydrate(storedOperations);
         } catch {
           // Operation-status recovery is best effort and must not block flow restoration.
         }
@@ -3398,11 +3399,11 @@ export function App() {
         agentMode: true,
         ...(includeRows ? { columns: previewColumns, limit: previewLimit } : {}),
       }));
-      const inputSchema = draft.inputIds.flatMap((inputId) => findComposeNodeForTool(inputId)?.node.schema ?? []);
+      const inputSchemas = draft.inputIds.map((inputId) => findComposeNodeForTool(inputId)?.node.schema ?? []);
       return {
         valid: true,
         output: { rowCount: preview.rowCount, columnCount: preview.schema.length },
-        schemaDelta: schemaDelta(inputSchema, preview.schema),
+        schemaDelta: composeSchemaDelta(draft.kind, inputSchemas, preview.schema),
         diagnostics: [],
         ...(includeRows ? { preview: { columns: preview.columns, rowCount: preview.previewRowCount, rows: preview.preview } } : {}),
         workspaceRevision: workspaceRevisionRef.current,
@@ -3446,11 +3447,23 @@ export function App() {
       if (!currentPreparedRecipe(targetId).length) throw new Error(`Prepare recipe has no steps: ${targetId}`);
     }
     setScreen(target === "recipe-step" || target === "prepare-recipe" ? "data" : "compose");
-    const token = `${Date.now()}-${Math.random()}`;
-    setWebMcpDeleteRequest({ target, targetId, token, requestId: meta.requestId });
+    const confirmationId = `confirmation-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+    const expiresAt = new Date(Date.now() + WEBMCP_CONFIRMATION_TTL_MS).toISOString();
+    const workspace = target === "recipe-step" || target === "prepare-recipe" ? "prepare" : "compose";
     const activity = await recordActivity({ action: "delete_requested", targetType: target, targetId, status: "pending-confirmation", summary: { targetKind: target } }, webMcpActivity(meta));
-    pendingDeleteConfirmationsRef.current.set(`${target}:${targetId}`, { target, targetId, requestId: meta.requestId, activityEventId: activity?.eventId ?? null });
-    return { target, targetId, confirmationToken: token, pendingConfirmation: true, activity };
+    pendingDeleteConfirmationsRef.current.set(`${target}:${targetId}`, {
+      confirmationId,
+      target,
+      targetId,
+      flowId: flowRef.current.id,
+      workspaceRevision: workspaceRevisionRef.current,
+      workspace,
+      requestId: meta.requestId,
+      expiresAt,
+      activityEventId: activity?.eventId ?? null,
+    });
+    setWebMcpDeleteRequest({ target, targetId, token: confirmationId, confirmationId, expiresAt, requestId: meta.requestId, workspace });
+    return { target, targetId, confirmationId, confirmationToken: confirmationId, expiresAt, pendingConfirmation: true, activity };
   }, `delete:request:${target}:${targetId}`);
 
   const requestResetAllFromTool = async (meta) => runWebMcpMutation(meta, async () => {
@@ -3464,9 +3477,9 @@ export function App() {
       throw emptyError;
     }
     setScreen("input");
-    const token = `${Date.now()}-${Math.random()}`;
-    const request = { token, requestId: meta.requestId, flowId: currentFlow.id };
-    setWebMcpResetRequest(request);
+    const confirmationId = `confirmation-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+    const expiresAt = new Date(Date.now() + WEBMCP_CONFIRMATION_TTL_MS).toISOString();
+    const request = { token: confirmationId, confirmationId, expiresAt, requestId: meta.requestId, flowId: currentFlow.id, workspace: "source" };
     const activity = await recordActivity({
       action: "reset_all_requested",
       targetType: "flow",
@@ -3474,8 +3487,14 @@ export function App() {
       status: "pending-confirmation",
       summary: { scope: "source-prepare-compose" },
     }, webMcpActivity(meta));
-    pendingResetConfirmationRef.current = { ...request, activityEventId: activity?.eventId ?? null };
-    return { confirmationToken: token, pendingConfirmation: true, workspace: "source", activity };
+    pendingResetConfirmationRef.current = {
+      ...request,
+      workspace: "source",
+      workspaceRevision: workspaceRevisionRef.current,
+      activityEventId: activity?.eventId ?? null,
+    };
+    setWebMcpResetRequest(request);
+    return { confirmationId, confirmationToken: confirmationId, expiresAt, pendingConfirmation: true, workspace: "source", activity };
   }, "flow:request-reset-all");
 
   const getActivityLogFromTool = async ({ limit = 50, targetId = null, actor = null } = {}) => {
@@ -3492,7 +3511,7 @@ export function App() {
     setWebMcpDeleteRequest((current) => current?.token === token ? null : current);
   }, []);
 
-  const resolveDeleteConfirmation = useCallback(async (target, targetId, outcome) => {
+  const resolveDeleteConfirmation = useCallback(async (target, targetId, outcome, context = { actor: "user", origin: "ui" }) => {
     const key = `${target}:${targetId}`;
     const pending = pendingDeleteConfirmationsRef.current.get(key);
     if (!pending) return null;
@@ -3509,10 +3528,10 @@ export function App() {
       status: outcome === "cancelled" ? "cancelled" : "committed",
       summary: { targetKind: target },
       supersedesEventId: pending.activityEventId,
-    }, { actor: "user", origin: "ui", requestId: pending.requestId });
+    }, { ...context, requestId: pending.requestId });
   }, [recordActivity]);
 
-  const resolveResetConfirmation = useCallback(async (token, outcome) => {
+  const resolveResetConfirmation = useCallback(async (token, outcome, context = { actor: "user", origin: "ui" }) => {
     const pending = pendingResetConfirmationRef.current;
     if (!pending || pending.token !== token) return null;
     if (outcome === "confirmed") return null;
@@ -3531,8 +3550,87 @@ export function App() {
       status: "cancelled",
       summary: { scope: "source-prepare-compose" },
       supersedesEventId: pending.activityEventId,
-    }, { actor: "user", origin: "ui", requestId: pending.requestId });
+    }, { ...context, requestId: pending.requestId });
   }, [recordActivity]);
+
+  const getPendingConfirmationsFromTool = async () => {
+    const now = Date.now();
+    const confirmations = [...pendingDeleteConfirmationsRef.current.values()]
+      .filter((item) => item.flowId === flowRef.current.id && Date.parse(item.expiresAt) > now)
+      .map(({ confirmationId, target, targetId, workspace, workspaceRevision: targetRevision, expiresAt }) => ({
+        confirmationId,
+        target,
+        targetId,
+        workspace,
+        targetRevision,
+        expiresAt,
+        userActionRequired: true,
+      }));
+    const reset = pendingResetConfirmationRef.current;
+    if (reset?.flowId === flowRef.current.id && Date.parse(reset.expiresAt) > now) {
+      confirmations.push({
+        confirmationId: reset.confirmationId,
+        target: "flow",
+        targetId: reset.flowId,
+        workspace: "source",
+        targetRevision: reset.workspaceRevision,
+        expiresAt: reset.expiresAt,
+        userActionRequired: true,
+      });
+    }
+    return { confirmations, workspaceRevision: workspaceRevisionRef.current };
+  };
+
+  const rejectConfirmationFromTool = async (confirmationId) => {
+    const pendingDelete = [...pendingDeleteConfirmationsRef.current.values()].find((item) => item.confirmationId === confirmationId);
+    if (pendingDelete) {
+      await resolveDeleteConfirmation(pendingDelete.target, pendingDelete.targetId, "cancelled", { actor: "agent", origin: "webmcp" });
+      setWebMcpDeleteRequest((current) => current?.confirmationId === confirmationId ? null : current);
+      return { confirmationId, status: "cancelled", destructiveActionPerformed: false };
+    }
+    const pendingReset = pendingResetConfirmationRef.current;
+    if (pendingReset?.confirmationId === confirmationId) {
+      await resolveResetConfirmation(pendingReset.token, "cancelled", { actor: "agent", origin: "webmcp" });
+      return { confirmationId, status: "cancelled", destructiveActionPerformed: false };
+    }
+    const error = new Error(`Pending confirmation not found or expired: ${confirmationId}`);
+    error.code = "CONFIRMATION_NOT_FOUND";
+    throw error;
+  };
+
+  useEffect(() => {
+    if (!webMcpDeleteRequest?.expiresAt) return undefined;
+    const delay = Math.max(0, Date.parse(webMcpDeleteRequest.expiresAt) - Date.now());
+    const timer = window.setTimeout(() => {
+      void resolveDeleteConfirmation(webMcpDeleteRequest.target, webMcpDeleteRequest.targetId, "cancelled", { actor: "system", origin: "webmcp" });
+      setWebMcpDeleteRequest((current) => current?.confirmationId === webMcpDeleteRequest.confirmationId ? null : current);
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [resolveDeleteConfirmation, webMcpDeleteRequest]);
+
+  useEffect(() => {
+    if (!webMcpDeleteRequest?.workspace) return;
+    const workspace = screen === "input" ? "source" : screen === "data" ? "prepare" : screen;
+    if (workspace === webMcpDeleteRequest.workspace) return;
+    void resolveDeleteConfirmation(webMcpDeleteRequest.target, webMcpDeleteRequest.targetId, "cancelled", { actor: "system", origin: "webmcp" });
+    setWebMcpDeleteRequest((current) => current?.confirmationId === webMcpDeleteRequest.confirmationId ? null : current);
+  }, [resolveDeleteConfirmation, screen, webMcpDeleteRequest]);
+
+  useEffect(() => {
+    if (!webMcpResetRequest?.expiresAt) return undefined;
+    const delay = Math.max(0, Date.parse(webMcpResetRequest.expiresAt) - Date.now());
+    const timer = window.setTimeout(() => {
+      void resolveResetConfirmation(webMcpResetRequest.token, "cancelled", { actor: "system", origin: "webmcp" });
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [resolveResetConfirmation, webMcpResetRequest]);
+
+  useEffect(() => {
+    if (!webMcpResetRequest?.workspace) return;
+    const workspace = screen === "input" ? "source" : screen === "data" ? "prepare" : screen;
+    if (workspace === webMcpResetRequest.workspace) return;
+    void resolveResetConfirmation(webMcpResetRequest.token, "cancelled", { actor: "system", origin: "webmcp" });
+  }, [resolveResetConfirmation, screen, webMcpResetRequest]);
 
   const activeAgentSchema = flow.preparedInputs.find((item) => item.id === activePreparedId)?.schema
     ?? dataset?.columns.map((name) => ({ name, type: dataset.columnTypes?.[name] }))
@@ -3540,11 +3638,12 @@ export function App() {
 
   useWebMcpTools({
     state: {
-      contractVersion: "3.0",
+      contractVersion: "3.1",
       workspaceRevision,
       flowId: flow.id,
       flowRevision: flow.revision,
       activityCursor: activityEvents[0]?.sequence ?? 0,
+      activeOperationIds: webMcpMutationRunnerRef.current.getActiveOperationIds(),
       workspace: screen === "input" ? "source" : screen === "data" ? "prepare" : screen,
       worker: { ready: worker.ready, recovering: worker.recovering },
       flowDirty,
@@ -3603,6 +3702,11 @@ export function App() {
       getActivityLog: getActivityLogFromTool,
       getChangesSince: getChangesSinceFromTool,
       getOperationStatus: (operationId) => webMcpMutationRunnerRef.current.getOperationStatus(operationId),
+      getActiveOperationIds: () => webMcpMutationRunnerRef.current.getActiveOperationIds(),
+      cancelOperation: (operationId) => webMcpMutationRunnerRef.current.cancelOperation(operationId),
+      fenceMutations: () => webMcpMutationRunnerRef.current.fenceMutations(),
+      getPendingConfirmations: getPendingConfirmationsFromTool,
+      rejectConfirmation: rejectConfirmationFromTool,
       selectPrepared: selectPreparedFromTool,
       getRecipe: getRecipeFromTool,
       getSemanticModel: getSemanticModelFromTool,

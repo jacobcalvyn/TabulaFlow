@@ -6,6 +6,7 @@ import {
   createWebMcpTools,
   registerWebMcpTools,
 } from "../src/useWebMcpTools.js";
+import { WEBMCP_REGISTRATION_BUDGET, measureWebMcpToolset } from "../src/webMcpRuntime.js";
 
 const REVISION = 7;
 const mutation = (requestId) => ({ expectedRevision: REVISION, requestId });
@@ -17,7 +18,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "3.0", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "3.1", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -42,6 +43,9 @@ function createContext() {
         async getActivityLog(options) { calls.push(["activity", options]); return { events: [{ sequence: 12, actor: "agent" }], cursor: 12, hasMore: false }; },
         async getChangesSince(cursor, options) { calls.push(["changes", cursor, options]); return { events: [], cursor, hasMore: false }; },
         async getOperationStatus(operationId) { calls.push(["operation-status", operationId]); return { operationId, status: "committed" }; },
+        async cancelOperation(operationId) { calls.push(["cancel-operation", operationId]); return { operationId, status: "cancelling" }; },
+        async getPendingConfirmations() { calls.push(["pending-confirmations"]); return { confirmations: [] }; },
+        async rejectConfirmation(confirmationId) { calls.push(["reject-confirmation", confirmationId]); return { confirmationId, status: "cancelled" }; },
         async openWorkspace(workspace) { calls.push(["workspace", workspace]); return { workspace, workspaceRevision: REVISION, activityCursor: 12, activePreparedId: "prepared-a", activeNodeId: "operation-a" }; },
         async requestSourceFileSelection() { calls.push(["file"]); },
         async requestSourceRelink(sourceAssetId) { calls.push(["relink", sourceAssetId]); },
@@ -101,7 +105,8 @@ function toolByName(tools, name) {
 const GLOBAL_TOOL_NAMES = [
   "tabulaflow_get_workspace_state", "tabulaflow_get_capabilities", "tabulaflow_get_workflow_guide", "tabulaflow_get_calculation_catalog",
   "tabulaflow_describe_operation", "tabulaflow_get_available_actions", "tabulaflow_get_activity_log",
-  "tabulaflow_get_changes_since", "tabulaflow_get_operation_status", "tabulaflow_open_workspace",
+  "tabulaflow_get_changes_since", "tabulaflow_get_operation_status", "tabulaflow_cancel_operation",
+  "tabulaflow_get_pending_confirmations", "tabulaflow_reject_confirmation", "tabulaflow_open_workspace",
   "tabulaflow_request_source_file", "tabulaflow_request_source_relink", "tabulaflow_request_reset_all", "tabulaflow_list_cloud_files",
   "tabulaflow_open_cloud_file", "tabulaflow_request_cloud_upload",
 ];
@@ -126,7 +131,18 @@ test("WebMCP exposes contextual Agent-Ready v2 tools", () => {
   assert.deepEqual(createWebMcpTools(ref, { hasDataset: false, hasPrepared: false, hasComposeNodes: false }).map((tool) => tool.name), GLOBAL_TOOL_NAMES);
   const allTools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   assert.deepEqual(allTools.map((tool) => tool.name), ALL_TOOL_NAMES);
-  assert.equal(new Set(ALL_TOOL_NAMES).size, 58);
+  assert.equal(new Set(ALL_TOOL_NAMES).size, 61);
+});
+
+test("WebMCP confirmation protocol is inspect-or-reject and never exposes agent confirmation", async () => {
+  const { calls, ref } = createContext();
+  ref.current.actions.getPendingConfirmations = async () => ({ confirmations: [{ confirmationId: "confirmation-a", target: "flow", userActionRequired: true }] });
+  const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
+  const pending = await toolByName(tools, "tabulaflow_get_pending_confirmations").execute({});
+  assert.equal(pending.structuredContent.confirmations[0].userActionRequired, true);
+  await toolByName(tools, "tabulaflow_reject_confirmation").execute({ confirmationId: "confirmation-a" });
+  assert.ok(calls.some((call) => call[0] === "reject-confirmation" && call[1] === "confirmation-a"));
+  assert.equal(tools.some((tool) => /confirm.*delet|resolve.*confirm/i.test(tool.name)), false);
 });
 
 test("WebMCP registers a small permanent core and only the active workspace bundle", () => {
@@ -141,7 +157,8 @@ test("WebMCP registers a small permanent core and only the active workspace bund
     const bundles = createWebMcpToolBundles(ref, { ...availability, workspace });
     assert.deepEqual(bundles.core.map((tool) => tool.name), WEBMCP_CORE_TOOL_NAMES);
     assert.equal(new Set([...bundles.core, ...bundles.workspace].map((tool) => tool.name)).size, bundles.core.length + bundles.workspace.length);
-    assert.ok(Buffer.byteLength(JSON.stringify([...bundles.core, ...bundles.workspace])) < 32 * 1024, `${workspace} WebMCP bundle exceeded its configuration budget`);
+    const metrics = measureWebMcpToolset([...bundles.core, ...bundles.workspace]);
+    assert.ok(metrics.schemaBytes <= WEBMCP_REGISTRATION_BUDGET.maxSchemaBytes, `${workspace} WebMCP bundle exceeded its configuration budget`);
     if (expectedWorkspaceTools[workspace]) assert.deepEqual(bundles.workspace.map((tool) => tool.name), expectedWorkspaceTools[workspace]);
   }
 
@@ -186,7 +203,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "3.0");
+  assert.equal(capabilities.structuredContent.contractVersion, "3.1");
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");
@@ -292,7 +309,7 @@ test("WebMCP mutation schemas require collaboration metadata and conditional val
   const aggregates = branches.filter((branch) => branch.properties.kind.const === "aggregate");
   assert.equal(aggregates.length, 1);
   assert.ok(aggregates.some((branch) => branch.required.includes("metrics")));
-  assert.equal(toolByName(tools, "tabulaflow_replace_recipe").inputSchema.properties.executionMode.default, "wait");
+  assert.equal(toolByName(tools, "tabulaflow_replace_recipe").inputSchema.properties.executionMode.default, "async");
   const previewStep = toolByName(tools, "tabulaflow_preview_recipe_change").inputSchema.properties.recipe.items;
   assert.ok(previewStep.required.includes("id"));
   assert.equal(toolByName(tools, "tabulaflow_preview_recipe_change").inputSchema.properties.previewLimit.maximum, 20);
@@ -373,6 +390,28 @@ test("registered WebMCP tools annotate unexpected syntax failures at the handler
     await assert.rejects(
       () => registered.execute({}),
       (error) => error.code === "WEBMCP_EXECUTION_SYNTAX_ERROR" && error.phase === "handler" && error.tool === "tabulaflow_test_failure",
+    );
+  } finally {
+    console.warn = previousWarn;
+  }
+});
+
+test("registered WebMCP tools never expose raw failure literals", async () => {
+  const controller = new AbortController();
+  let registered;
+  const previousWarn = console.warn;
+  console.warn = () => undefined;
+  try {
+    await registerWebMcpTools({ async registerTool(tool) { registered = tool; } }, [{
+      name: "tabulaflow_private_failure",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute() { throw new Error("person@example.com 9900000"); },
+    }], controller.signal);
+    await assert.rejects(
+      () => registered.execute({}),
+      (error) => error.code === "WEBMCP_EXECUTION_FAILED"
+        && !error.message.includes("person@example.com")
+        && !error.message.includes("9900000"),
     );
   } finally {
     console.warn = previousWarn;

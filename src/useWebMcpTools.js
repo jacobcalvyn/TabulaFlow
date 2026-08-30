@@ -1,36 +1,19 @@
 import { useEffect, useRef } from "react";
 import { CALCULATION_CATALOG, FORMULA_EXPRESSION_VERSION } from "./formulaEngine.js";
+import { sanitizeWebMcpDiagnostic, webMcpErrorForAgent } from "./webMcpPrivacy.js";
+import {
+  WEBMCP_CONTRACT_VERSION,
+  assertWebMcpRegistrationBudget,
+  createWebMcpRuntimeHealth,
+  measureWebMcpToolset,
+} from "./webMcpRuntime.js";
 
 const WEBMCP_RUNTIME_HEALTH = new WeakMap();
 
 function runtimeHealthFor(contextRef) {
   let health = WEBMCP_RUNTIME_HEALTH.get(contextRef);
   if (health) return health;
-  const failures = new Map();
-  health = {
-    record(toolName, cause) {
-      if (!(cause instanceof SyntaxError) && cause?.code !== "WEBMCP_EXECUTION_SYNTAX_ERROR") return;
-      const previous = failures.get(toolName);
-      failures.set(toolName, {
-        tool: toolName,
-        code: "WEBMCP_EXECUTION_SYNTAX_ERROR",
-        phase: cause?.phase ?? "handler",
-        count: (previous?.count ?? 0) + 1,
-        firstSeenAt: previous?.firstSeenAt ?? new Date().toISOString(),
-        lastSeenAt: new Date().toISOString(),
-      });
-    },
-    clear(toolName) {
-      failures.delete(toolName);
-    },
-    snapshot() {
-      const degradedTools = [...failures.values()].sort((left, right) => left.tool.localeCompare(right.tool));
-      return {
-        status: degradedTools.length ? "degraded" : "available",
-        degradedTools,
-      };
-    },
-  };
+  health = createWebMcpRuntimeHealth();
   WEBMCP_RUNTIME_HEALTH.set(contextRef, health);
   return health;
 }
@@ -115,10 +98,10 @@ const COMPOSE_NODE_INPUT_SCHEMA = Object.freeze({
 
 const OPERATION_KINDS = ["append", "join", "difference", "aggregate", "filter-rows", "distinct-rows", "pivot", "unpivot"];
 const MUTATION_META = {
-  expectedRevision: { type: "integer", minimum: 0, description: "Workspace revision returned by the latest workspace-state read." },
-  requestId: { type: "string", minLength: 8, maxLength: 160, description: "Unique idempotency key for this logical mutation." },
+  expectedRevision: { type: "integer", minimum: 0, description: "Latest workspace revision." },
+  requestId: { type: "string", minLength: 8, maxLength: 160, description: "Unique idempotency key." },
 };
-const MUTATION_EXECUTION_MODE = { type: "string", enum: ["wait", "async"], default: "wait", description: "Use async for long-running work, then poll tabulaflow_get_operation_status." };
+const MUTATION_EXECUTION_MODE = { type: "string", enum: ["wait", "async"], default: "async", description: "Long work defaults to async; poll operation status." };
 
 const VALUE_SCHEMA = {
   oneOf: [
@@ -157,7 +140,8 @@ const COMPOSE_EXPORT_SCHEMA = Object.freeze(strictObject({
   nodeId: { type: "string", minLength: 1, description: "The dataset or operation node to export." },
   format: { type: "string", enum: ["csv", "xlsx"], description: "The download file format." },
   ...MUTATION_META,
-}));
+  executionMode: MUTATION_EXECUTION_MODE,
+}, ["nodeId", "format", "expectedRevision", "requestId"]));
 
 function strictObject(properties, required = Object.keys(properties)) {
   return { type: "object", properties, required, additionalProperties: false };
@@ -320,6 +304,7 @@ const COMPOSE_SCHEMA_PAGE_SCHEMA = Object.freeze(strictObject({
   limit: { type: "integer", minimum: 1, maximum: 100, default: 100 },
 }, ["nodeId"]));
 const OPERATION_STATUS_SCHEMA = Object.freeze(strictObject({ operationId: ID }));
+const CONFIRMATION_SCHEMA = Object.freeze(strictObject({ confirmationId: ID }));
 const SEMANTIC_MODEL_SCHEMA = Object.freeze(strictObject({ targetId: ID }));
 const UPDATE_SEMANTIC_FIELD_SCHEMA = Object.freeze(strictObject({
   targetId: ID,
@@ -351,8 +336,8 @@ const VALIDATE_COMPOSE_OPERATION_SCHEMA = Object.freeze(strictObject({
   previewColumns: { type: "array", items: ID, maxItems: 20, uniqueItems: true, description: "Optional explicit columns for a bounded row preview. Omit for metadata-only validation." },
   previewLimit: { type: "integer", minimum: 1, maximum: 20, default: 10 },
 }, ["operation"]));
-const DUPLICATE_PREPARED_SCHEMA = Object.freeze(strictObject({ preparedId: ID, ...MUTATION_META }));
-const PROMOTE_COMPOSE_SCHEMA = Object.freeze(strictObject({ nodeId: ID, ...MUTATION_META }));
+const DUPLICATE_PREPARED_SCHEMA = Object.freeze(strictObject({ preparedId: ID, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["preparedId", "expectedRevision", "requestId"]));
+const PROMOTE_COMPOSE_SCHEMA = Object.freeze(strictObject({ nodeId: ID, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["nodeId", "expectedRevision", "requestId"]));
 const MOVE_COMPOSE_SCHEMA = Object.freeze(strictObject({
   nodeId: ID,
   position: strictObject({ x: { type: "number", minimum: 0 }, y: { type: "number", minimum: 0 } }),
@@ -381,7 +366,7 @@ const AGGREGATE_COLUMNS_SCHEMA = Object.freeze(strictObject({
   columns: { type: "array", items: ID, maxItems: 200, uniqueItems: true },
   ...MUTATION_META,
 }));
-const PREPARE_EXPORT_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, format: EXPORT_FORMAT_SCHEMA.properties.format, ...MUTATION_META }));
+const PREPARE_EXPORT_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, format: EXPORT_FORMAT_SCHEMA.properties.format, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["preparedId", "format", "expectedRevision", "requestId"]));
 const ACTIVITY_LOG_SCHEMA = Object.freeze(strictObject({
   limit: { type: "integer", minimum: 1, maximum: 100, default: 50 },
   targetId: ID,
@@ -391,11 +376,11 @@ const CHANGES_SINCE_SCHEMA = Object.freeze(strictObject({
   cursor: { type: "integer", minimum: 0, description: "The last activity cursor already observed." },
   limit: { type: "integer", minimum: 1, maximum: 100, default: 100 },
 }, ["cursor"]));
-const ADD_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, step: RECIPE_STEP_DEFINITION_SCHEMA, ...MUTATION_META }));
-const UPDATE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, stepId: ID, step: RECIPE_STEP_DEFINITION_SCHEMA, ...MUTATION_META }));
-const ENABLE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, stepId: ID, enabled: { type: "boolean" }, ...MUTATION_META }));
-const MOVE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, stepId: ID, position: { type: "integer", minimum: 1 }, ...MUTATION_META }));
-const RECIPE_HISTORY_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, ...MUTATION_META }));
+const ADD_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, step: RECIPE_STEP_DEFINITION_SCHEMA, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["preparedId", "step", "expectedRevision", "requestId"]));
+const UPDATE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, stepId: ID, step: RECIPE_STEP_DEFINITION_SCHEMA, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["preparedId", "stepId", "step", "expectedRevision", "requestId"]));
+const ENABLE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, stepId: ID, enabled: { type: "boolean" }, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["preparedId", "stepId", "enabled", "expectedRevision", "requestId"]));
+const MOVE_RECIPE_STEP_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, stepId: ID, position: { type: "integer", minimum: 1 }, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["preparedId", "stepId", "position", "expectedRevision", "requestId"]));
+const RECIPE_HISTORY_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["preparedId", "expectedRevision", "requestId"]));
 const DELETE_ALL_RECIPE_STEPS_SCHEMA = Object.freeze(strictObject({ preparedId: ID, ...MUTATION_META }));
 const REPLACE_RECIPE_SCHEMA = Object.freeze(strictObject({
   preparedId: ID,
@@ -404,7 +389,7 @@ const REPLACE_RECIPE_SCHEMA = Object.freeze(strictObject({
   ...MUTATION_META,
   executionMode: MUTATION_EXECUTION_MODE,
 }, ["preparedId", "recipe", "expectedRecipeRevision", "expectedRevision", "requestId"]));
-const VALUE_ACTION_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, action: VALUE_ACTION_SCHEMA.properties.action, column: ID, value: AGENT_VALUE_SCHEMA, ...MUTATION_META }));
+const VALUE_ACTION_V2_SCHEMA = Object.freeze(strictObject({ preparedId: ID, action: VALUE_ACTION_SCHEMA.properties.action, column: ID, value: AGENT_VALUE_SCHEMA, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["preparedId", "action", "column", "value", "expectedRevision", "requestId"]));
 const CREATE_COMPOSE_OPERATION_V2_SCHEMA = Object.freeze(strictObject({ operation: COMPOSE_OPERATION_SCHEMA, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["operation", "expectedRevision", "requestId"]));
 const AUTO_ARRANGE_V2_SCHEMA = Object.freeze(strictObject({ ...MUTATION_META }));
 function webMcpResult(message, data) {
@@ -431,7 +416,7 @@ function filterSelection(raw) {
 }
 
 const WEBMCP_CAPABILITIES = Object.freeze({
-  contractVersion: "3.0",
+  contractVersion: WEBMCP_CONTRACT_VERSION,
   authenticationRequired: false,
   workspaces: ["source", "prepare", "compose", "account"],
   actions: [
@@ -468,6 +453,9 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     "inspect-shared-activity",
     "inspect-changes-since-cursor",
     "inspect-mutation-operation",
+    "cancel-mutation-operation",
+    "inspect-pending-confirmations",
+    "reject-pending-confirmation",
     "inspect-and-override-semantics",
     "inspect-compose-quality",
     "manage-reusable-metrics",
@@ -486,7 +474,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
 });
 
 const WORKFLOW_GUIDE = Object.freeze({
-  contractVersion: "3.0",
+  contractVersion: WEBMCP_CONTRACT_VERSION,
   flow: [
     { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
     { workspace: "prepare", purpose: "Inspect one prepared dataset, apply temporary filters, and maintain its independent ordered recipe." },
@@ -520,6 +508,9 @@ export const WEBMCP_CORE_TOOL_NAMES = Object.freeze([
   "tabulaflow_get_activity_log",
   "tabulaflow_get_changes_since",
   "tabulaflow_get_operation_status",
+  "tabulaflow_cancel_operation",
+  "tabulaflow_get_pending_confirmations",
+  "tabulaflow_reject_confirmation",
   "tabulaflow_open_workspace",
 ]);
 
@@ -599,8 +590,14 @@ export function createWebMcpTools(contextRef, availability) {
     inputSchema: EMPTY_INPUT_SCHEMA,
     annotations: { readOnlyHint: true, untrustedContentHint: true },
     execute() {
-      const { state } = activeContext(contextRef);
-      return webMcpResult(`TabulaFlow is showing the ${state.workspace} workspace.`, state);
+      const { state, actions } = activeContext(contextRef);
+      const activeOperationIds = actions.getActiveOperationIds?.() ?? state.activeOperationIds ?? [];
+      return webMcpResult(`TabulaFlow is showing the ${state.workspace} workspace.`, {
+        ...state,
+        activeOperationIds,
+        diagnostics: (state.diagnostics ?? []).map(sanitizeWebMcpDiagnostic),
+        runtimeHealth: runtimeHealth.snapshot({ activeOperationIds }),
+      });
     },
   }, {
     name: "tabulaflow_get_capabilities",
@@ -609,9 +606,10 @@ export function createWebMcpTools(contextRef, availability) {
     inputSchema: EMPTY_INPUT_SCHEMA,
     annotations: { readOnlyHint: true },
     execute() {
+      const activeOperationIds = contextRef.current?.actions?.getActiveOperationIds?.() ?? [];
       return webMcpResult("TabulaFlow WebMCP is available without login. Local file selection and deletion remain under user control.", {
         ...WEBMCP_CAPABILITIES,
-        runtimeHealth: runtimeHealth.snapshot(),
+        runtimeHealth: runtimeHealth.snapshot({ activeOperationIds }),
       });
     },
   }, {
@@ -684,6 +682,39 @@ export function createWebMcpTools(contextRef, availability) {
       const { actions } = activeContext(contextRef);
       const result = await actions.getOperationStatus(operationId);
       return webMcpResult(`Mutation operation ${operationId} is ${result.status}.`, result);
+    },
+  }, {
+    name: "tabulaflow_cancel_operation",
+    title: "Cancel a pending TabulaFlow operation",
+    description: "Request cancellation of an accepted or running mutation before its commit boundary. Cancellation never reverses an operation that is already committing or terminal.",
+    inputSchema: OPERATION_STATUS_SCHEMA,
+    annotations: { readOnlyHint: false, destructiveHint: false },
+    async execute({ operationId }) {
+      const { actions } = activeContext(contextRef);
+      const result = await actions.cancelOperation(operationId);
+      return webMcpResult(`Cancellation state for ${operationId}: ${result.status}.`, result);
+    },
+  }, {
+    name: "tabulaflow_get_pending_confirmations",
+    title: "Get pending user confirmations",
+    description: "List privacy-safe destructive requests waiting for a visible user decision. AI agents can inspect or reject a request, but can never confirm deletion.",
+    inputSchema: EMPTY_INPUT_SCHEMA,
+    annotations: { readOnlyHint: true },
+    async execute() {
+      const { actions } = activeContext(contextRef);
+      const result = await actions.getPendingConfirmations();
+      return webMcpResult(`Returned ${result.confirmations.length} pending user confirmations.`, result);
+    },
+  }, {
+    name: "tabulaflow_reject_confirmation",
+    title: "Reject a pending destructive request",
+    description: "Cancel one pending destructive request. This tool cannot confirm or perform deletion; approval remains a visible user-only action.",
+    inputSchema: CONFIRMATION_SCHEMA,
+    annotations: { readOnlyHint: false, destructiveHint: false },
+    async execute({ confirmationId }) {
+      const { actions } = activeContext(contextRef);
+      const result = await actions.rejectConfirmation(confirmationId);
+      return webMcpResult(`Rejected pending confirmation ${confirmationId}.`, result);
     },
   }, {
     name: "tabulaflow_open_workspace",
@@ -850,7 +881,7 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Validate and commit one complete ordered recipe as a single mutation. Requires both current workspace and recipe revisions, so rapid agent edits cannot reorder or overwrite steps silently.",
       inputSchema: REPLACE_RECIPE_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ preparedId, recipe, expectedRecipeRevision, expectedRevision, requestId, executionMode }) {
+      async execute({ preparedId, recipe, expectedRecipeRevision, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
         const result = await actions.replaceRecipe(preparedId, recipe, expectedRecipeRevision, { expectedRevision, requestId, executionMode });
         return webMcpResult(result.status === "accepted" ? "Recipe replacement was accepted for background execution." : `Replaced the recipe with ${recipe.length} ordered steps.`, result);
@@ -861,9 +892,9 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Deep-clone one prepared dataset recipe while sharing its source table. Requires a current workspace revision and idempotency key.",
       inputSchema: DUPLICATE_PREPARED_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ preparedId, expectedRevision, requestId }) {
+      async execute({ preparedId, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.duplicatePrepared(preparedId, { expectedRevision, requestId });
+        const result = await actions.duplicatePrepared(preparedId, { expectedRevision, requestId, executionMode });
         return webMcpResult(`Duplicated prepared dataset ${preparedId}.`, result);
       },
     });
@@ -988,9 +1019,9 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Download the active Prepare result, including its current temporary filters, as CSV or Excel. Requires the latest workspace revision and an idempotency key so retries do not trigger duplicate downloads.",
       inputSchema: PREPARE_EXPORT_V2_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ preparedId, format, expectedRevision, requestId }) {
+      async execute({ preparedId, format, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.exportPrepare(preparedId, format, { expectedRevision, requestId });
+        const result = await actions.exportPrepare(preparedId, format, { expectedRevision, requestId, executionMode, operationClass: "snapshot-compute" });
         return webMcpResult(`Downloaded ${result.filename}.`, result);
       },
     }, {
@@ -999,9 +1030,9 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Append one supported transformation to the active prepared dataset and visibly rebuild its result. Use exact column names from workspace state.",
       inputSchema: ADD_RECIPE_STEP_V2_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ preparedId, step, expectedRevision, requestId }) {
+      async execute({ preparedId, step, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.addRecipeStep(preparedId, step, { expectedRevision, requestId });
+        const result = await actions.addRecipeStep(preparedId, step, { expectedRevision, requestId, executionMode });
         return webMcpResult(`Added ${step.type} to the Prepare recipe.`, result);
       },
     }, {
@@ -1023,9 +1054,9 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Replace the type and parameters of one existing recipe step, preserving its stable ID and enabled state.",
       inputSchema: UPDATE_RECIPE_STEP_V2_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ preparedId, stepId, step, expectedRevision, requestId }) {
+      async execute({ preparedId, stepId, step, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.updateRecipeStep(preparedId, stepId, step, { expectedRevision, requestId });
+        const result = await actions.updateRecipeStep(preparedId, stepId, step, { expectedRevision, requestId, executionMode });
         return webMcpResult(`Updated recipe step ${stepId}.`, result);
       },
     }, {
@@ -1034,9 +1065,9 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Enable or disable one existing Prepare recipe step without deleting it.",
       inputSchema: ENABLE_RECIPE_STEP_V2_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ preparedId, stepId, enabled, expectedRevision, requestId }) {
+      async execute({ preparedId, stepId, enabled, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.setRecipeStepEnabled(preparedId, stepId, enabled, { expectedRevision, requestId });
+        const result = await actions.setRecipeStepEnabled(preparedId, stepId, enabled, { expectedRevision, requestId, executionMode });
         return webMcpResult(`${enabled ? "Enabled" : "Disabled"} recipe step ${stepId}.`, result);
       },
     }, {
@@ -1045,9 +1076,9 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Move one existing recipe step to a one-based position and visibly rebuild the prepared result.",
       inputSchema: MOVE_RECIPE_STEP_V2_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ preparedId, stepId, position, expectedRevision, requestId }) {
+      async execute({ preparedId, stepId, position, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.moveRecipeStep(preparedId, stepId, position, { expectedRevision, requestId });
+        const result = await actions.moveRecipeStep(preparedId, stepId, position, { expectedRevision, requestId, executionMode });
         return webMcpResult(`Moved recipe step ${stepId} to position ${position}.`, result);
       },
     }, {
@@ -1056,9 +1087,9 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Undo the latest Prepare recipe change and visibly rebuild the prepared result.",
       inputSchema: RECIPE_HISTORY_V2_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ preparedId, expectedRevision, requestId }) {
+      async execute({ preparedId, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.undoRecipe(preparedId, { expectedRevision, requestId });
+        const result = await actions.undoRecipe(preparedId, { expectedRevision, requestId, executionMode });
         return webMcpResult("Undid the last Prepare recipe change.", result);
       },
     }, {
@@ -1067,9 +1098,9 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Redo the latest undone Prepare recipe change and visibly rebuild the prepared result.",
       inputSchema: RECIPE_HISTORY_V2_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ preparedId, expectedRevision, requestId }) {
+      async execute({ preparedId, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.redoRecipe(preparedId, { expectedRevision, requestId });
+        const result = await actions.redoRecipe(preparedId, { expectedRevision, requestId, executionMode });
         return webMcpResult("Redid the Prepare recipe change.", result);
       },
     }, {
@@ -1078,9 +1109,9 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Create the same tracked Keep or Delete rows recipe step exposed by a value row context menu in Prepare.",
       inputSchema: VALUE_ACTION_V2_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ preparedId, action, column, value, expectedRevision, requestId }) {
+      async execute({ preparedId, action, column, value, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.applyValueAction(preparedId, action, column, value, { expectedRevision, requestId });
+        const result = await actions.applyValueAction(preparedId, action, column, value, { expectedRevision, requestId, executionMode });
         return webMcpResult(`${action === "keep" ? "Kept" : "Deleted"} rows for the selected grouped value.`, result);
       },
     });
@@ -1206,10 +1237,10 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Select and download one existing Compose dataset or operation result as CSV or Excel. Requires the latest workspace revision and an idempotency key so retries do not trigger duplicate downloads.",
       inputSchema: COMPOSE_EXPORT_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ nodeId, format, expectedRevision, requestId }) {
+      async execute({ nodeId, format, expectedRevision, requestId, executionMode = "async" }) {
         const { state, actions } = activeContext(contextRef);
         if (!state.composeNodes.some((item) => item.id === nodeId)) throw new Error(`Compose node not found: ${nodeId}`);
-        const result = await actions.exportCompose(nodeId, format, { expectedRevision, requestId });
+        const result = await actions.exportCompose(nodeId, format, { expectedRevision, requestId, executionMode, operationClass: "snapshot-compute" });
         return webMcpResult(`Downloaded ${result.filename}.`, result);
       },
     }, {
@@ -1218,7 +1249,7 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Transactionally validate and create Append, Join, Difference, Aggregate, Filter rows, Distinct rows, Pivot, or Unpivot in the visible Compose graph.",
       inputSchema: CREATE_COMPOSE_OPERATION_V2_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ operation, expectedRevision, requestId, executionMode }) {
+      async execute({ operation, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
         const result = await actions.createComposeOperation(operation, { expectedRevision, requestId, executionMode });
         return webMcpResult(result.status === "accepted" ? "Compose operation creation was accepted for background execution." : `Created Compose operation ${result.name}.`, result);
@@ -1229,7 +1260,7 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Transactionally validate and replace an existing Compose operation configuration while preserving its stable node ID.",
       inputSchema: UPDATE_COMPOSE_OPERATION_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ nodeId, operation, expectedRevision, requestId, executionMode }) {
+      async execute({ nodeId, operation, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
         const result = await actions.updateComposeOperation(nodeId, operation, { expectedRevision, requestId, executionMode });
         return webMcpResult(result.status === "accepted" ? "Compose operation update was accepted for background execution." : `Updated Compose operation ${result.name}.`, result);
@@ -1240,9 +1271,9 @@ export function createWebMcpTools(contextRef, availability) {
       description: "Materialize one operation result as an independent prepared dataset with an empty recipe and visible dependency edge.",
       inputSchema: PROMOTE_COMPOSE_SCHEMA,
       annotations: { readOnlyHint: false },
-      async execute({ nodeId, expectedRevision, requestId }) {
+      async execute({ nodeId, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.promoteComposeResult(nodeId, { expectedRevision, requestId });
+        const result = await actions.promoteComposeResult(nodeId, { expectedRevision, requestId, executionMode });
         return webMcpResult(`Created prepared dataset ${result.preparedInputId} from ${nodeId}.`, result);
       },
     });
@@ -1302,13 +1333,23 @@ export function createWebMcpToolBundles(contextRef, availability) {
   };
 }
 
-export async function registerWebMcpTools(modelContext, tools, signal, { onExecutionFailure, onExecutionSuccess } = {}) {
+export async function registerWebMcpTools(modelContext, tools, signal, {
+  onExecutionFailure,
+  onExecutionSuccess,
+  runtimeHealth = null,
+  generation = 0,
+  core = false,
+} = {}) {
   if (typeof modelContext?.registerTool !== "function") return false;
   for (const tool of tools) {
     if (signal?.aborted) return false;
     await modelContext.registerTool({
       ...tool,
       async execute(input = {}) {
+        runtimeHealth?.assertExecutable(generation, {
+          core,
+          mutation: tool.annotations?.readOnlyHint !== true,
+        });
         const normalizedFailure = (cause) => {
           const hadCode = Boolean(cause?.code);
           if (cause && typeof cause === "object") {
@@ -1318,8 +1359,15 @@ export async function registerWebMcpTools(modelContext, tools, signal, { onExecu
             if (typeof input?.requestId === "string") cause.requestId ??= input.requestId;
           }
           onExecutionFailure?.(tool.name, cause);
-          if (!hadCode || cause instanceof SyntaxError) console.warn(`WebMCP tool execution failed: ${tool.name}`, cause);
-          return cause;
+          if (!hadCode || cause instanceof SyntaxError) console.warn(`WebMCP tool execution failed: ${tool.name}`, {
+            code: cause?.code ?? "WEBMCP_EXECUTION_FAILED",
+            phase: cause?.phase ?? "handler",
+          });
+          return webMcpErrorForAgent(cause, {
+            tool: tool.name,
+            phase: cause?.phase ?? "handler",
+            requestId: typeof input?.requestId === "string" ? input.requestId : undefined,
+          });
         };
         try {
           const result = await tool.execute(input);
@@ -1338,6 +1386,14 @@ export async function registerWebMcpTools(modelContext, tools, signal, { onExecu
 export function useWebMcpTools(context) {
   const contextRef = useRef(context);
   contextRef.current = context;
+  const runtimeHealth = runtimeHealthFor(contextRef);
+  const coreControllerRef = useRef(null);
+  const coreToolsRef = useRef([]);
+  const coreReadyRef = useRef(Promise.resolve(false));
+  const workspacePublicationRef = useRef({ controller: null, tools: [], workspace: null, generation: 0 });
+  const publicationQueueRef = useRef(Promise.resolve());
+  const desiredPublicationRef = useRef({ workspace: context.state.workspace, request: 0 });
+  const unmountedRef = useRef(false);
   const availability = {
     workspace: context.state.workspace,
     // Keep each workspace contract stable. Runtime preconditions report when a
@@ -1348,6 +1404,7 @@ export function useWebMcpTools(context) {
   };
 
   useEffect(() => {
+    unmountedRef.current = false;
     let modelContext;
     try {
       modelContext = document.modelContext;
@@ -1357,20 +1414,37 @@ export function useWebMcpTools(context) {
     if (typeof modelContext?.registerTool !== "function") return undefined;
 
     const controller = new AbortController();
+    coreControllerRef.current = controller;
     const { core } = createWebMcpToolBundles(contextRef, {
       workspace: "source",
       hasDataset: false,
       hasPrepared: false,
       hasComposeNodes: false,
     });
-    void registerWebMcpTools(modelContext, core, controller.signal).catch((error) => {
+    coreToolsRef.current = core;
+    const metrics = measureWebMcpToolset(core);
+    coreReadyRef.current = registerWebMcpTools(modelContext, core, controller.signal, {
+      runtimeHealth,
+      generation: 0,
+      core: true,
+    }).then((registered) => {
+      if (!registered) runtimeHealth.markUnavailable();
+      return registered;
+    }).catch((error) => {
       if (!controller.signal.aborted) {
         controller.abort();
-        console.warn("WebMCP core tool registration failed.", error);
+        runtimeHealth.failRegistration(error, { generation: 0, metrics });
+        console.warn("WebMCP core tool registration failed.", { code: error?.code ?? "WEBMCP_REGISTRATION_FAILED" });
       }
+      return false;
     });
-    return () => controller.abort();
-  }, []);
+    return () => {
+      unmountedRef.current = true;
+      controller.abort();
+      workspacePublicationRef.current.controller?.abort();
+      runtimeHealth.markUnavailable();
+    };
+  }, [runtimeHealth]);
 
   useEffect(() => {
     let modelContext;
@@ -1381,15 +1455,90 @@ export function useWebMcpTools(context) {
     }
     if (typeof modelContext?.registerTool !== "function") return undefined;
 
-    const controller = new AbortController();
     const { workspace } = createWebMcpToolBundles(contextRef, availability);
-    if (!workspace.length) return () => controller.abort();
-    void registerWebMcpTools(modelContext, workspace, controller.signal).catch((error) => {
-      if (!controller.signal.aborted) {
+    const request = desiredPublicationRef.current.request + 1;
+    desiredPublicationRef.current = { workspace: availability.workspace, request };
+    publicationQueueRef.current = publicationQueueRef.current.then(async () => {
+      const coreReady = await coreReadyRef.current;
+      if (!coreReady || unmountedRef.current || desiredPublicationRef.current.request !== request) return;
+
+      const previous = workspacePublicationRef.current;
+      const nextGeneration = previous.generation + 1;
+      const combinedMetrics = measureWebMcpToolset([...coreToolsRef.current, ...workspace]);
+      try {
+        assertWebMcpRegistrationBudget(combinedMetrics);
+      } catch (cause) {
+        runtimeHealth.failRegistration(cause, { generation: previous.generation, metrics: combinedMetrics, restored: Boolean(previous.tools.length) });
+        return;
+      }
+
+      runtimeHealth.beginRegistration({
+        generation: nextGeneration,
+        registeredToolCount: coreToolsRef.current.length,
+        expectedToolCount: coreToolsRef.current.length + workspace.length,
+        metrics: combinedMetrics,
+      });
+      if (previous.tools.length) contextRef.current.actions?.fenceMutations?.();
+      previous.controller?.abort();
+      const controller = new AbortController();
+      try {
+        const registered = await registerWebMcpTools(modelContext, workspace, controller.signal, {
+          runtimeHealth,
+          generation: nextGeneration,
+        });
+        if (!registered || unmountedRef.current || desiredPublicationRef.current.request !== request) {
+          controller.abort();
+          return;
+        }
+        workspacePublicationRef.current = {
+          controller,
+          tools: workspace,
+          workspace: availability.workspace,
+          generation: nextGeneration,
+        };
+        runtimeHealth.completeRegistration({
+          generation: nextGeneration,
+          registeredToolCount: coreToolsRef.current.length + workspace.length,
+          expectedToolCount: coreToolsRef.current.length + workspace.length,
+          metrics: combinedMetrics,
+        });
+      } catch (cause) {
         controller.abort();
-        console.warn(`WebMCP ${availability.workspace} tool registration failed.`, error);
+        if (unmountedRef.current) return;
+        let restored = false;
+        if (previous.tools.length) {
+          const restoreController = new AbortController();
+          try {
+            restored = await registerWebMcpTools(modelContext, previous.tools, restoreController.signal, {
+              runtimeHealth,
+              generation: nextGeneration,
+            });
+            if (restored) {
+              workspacePublicationRef.current = {
+                ...previous,
+                controller: restoreController,
+                generation: nextGeneration,
+              };
+            }
+          } catch {
+            restoreController.abort();
+            restored = false;
+          }
+        }
+        runtimeHealth.failRegistration(cause, { generation: nextGeneration, metrics: combinedMetrics, restored });
+        if (restored) {
+          const restoredMetrics = measureWebMcpToolset([...coreToolsRef.current, ...previous.tools]);
+          runtimeHealth.completeRegistration({
+            generation: nextGeneration,
+            registeredToolCount: coreToolsRef.current.length + previous.tools.length,
+            expectedToolCount: coreToolsRef.current.length + previous.tools.length,
+            metrics: restoredMetrics,
+            degraded: true,
+          });
+        }
+        console.warn(`WebMCP ${availability.workspace} tool publication failed.`, { code: cause?.code ?? "WEBMCP_REGISTRATION_FAILED", restored });
       }
     });
-    return () => controller.abort();
-  }, [availability.workspace]);
+    publicationQueueRef.current.catch(() => undefined);
+  }, [availability.workspace, runtimeHealth]);
 }

@@ -45,10 +45,11 @@ test("serializes distinct mutations so only the first matching revision can comm
     revision += 1;
     return { committed: "second" };
   }, "second");
+  const secondRejected = assert.rejects(second, (error) => error.code === "STALE_STATE");
 
   releaseFirst();
   assert.equal((await first).committed, "first");
-  await assert.rejects(second, (error) => error.code === "STALE_STATE");
+  await secondRejected;
   assert.equal(secondExecuted, false);
   assert.equal(revision, 5);
 });
@@ -82,7 +83,10 @@ test("keeps failed mutations terminal and requires a new key for a retry", async
   const run = createWebMcpMutationRunner({ getRevision: () => 5 });
   const meta = { expectedRevision: 5, requestId: "failure-001" };
   await assert.rejects(() => run(meta, async () => { attempts += 1; throw new Error("temporary"); }, "compose:create"), /temporary/);
-  await assert.rejects(() => run(meta, async () => { attempts += 1; return { ok: true }; }, "compose:create"), /temporary/);
+  await assert.rejects(
+    () => run(meta, async () => { attempts += 1; return { ok: true }; }, "compose:create"),
+    (error) => error.code === "WEBMCP_OPERATION_FAILED" && !error.message.includes("temporary"),
+  );
   const result = await run({ ...meta, requestId: "failure-002" }, async () => { attempts += 1; return { ok: true }; }, "compose:create");
   assert.equal(attempts, 2);
   assert.equal(result.ok, true);
@@ -125,7 +129,10 @@ test("async failures replay their terminal failure instead of stale accepted sta
   const accepted = await run(meta, async () => { throw new Error("worker failed"); }, "recipe:replace");
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(run.getOperationStatus(accepted.operationId).status, "failed");
-  await assert.rejects(() => run(meta, async () => ({ ok: true }), "recipe:replace"), /worker failed/);
+  await assert.rejects(
+    () => run(meta, async () => ({ ok: true }), "recipe:replace"),
+    (error) => error.code === "WEBMCP_OPERATION_FAILED" && !error.message.includes("worker failed"),
+  );
 });
 
 test("a cancelled confirmation remains terminal for the original request", async () => {
@@ -151,10 +158,10 @@ test("hydrates committed mutation results across a runner reload", async () => {
 
   let reexecuted = false;
   const restored = createWebMcpMutationRunner(options);
-  restored.hydrate([...stored.values()]);
+  await restored.hydrate([...stored.values()]);
   const replay = await restored(meta, async () => { reexecuted = true; return { value: 99 }; }, "recipe:durable");
   assert.equal(reexecuted, false);
-  assert.deepEqual(replay, committed);
+  assert.deepEqual(replay, { workspaceRevision: committed.workspaceRevision });
 });
 
 test("marks non-terminal persisted mutations as interrupted after reload", async () => {
@@ -164,7 +171,7 @@ test("marks non-terminal persisted mutations as interrupted after reload", async
     getFlowId: () => "flow-a",
     persistOperation: async (operation) => stored.push(structuredClone(operation)),
   });
-  restored.hydrate([{
+  await restored.hydrate([{
     operationId: "operation-interrupted",
     requestId: "durable-running-001",
     fingerprint: "compose:create",
@@ -184,4 +191,71 @@ test("marks non-terminal persisted mutations as interrupted after reload", async
     () => restored({ expectedRevision: 9, requestId: "durable-running-001", executionMode: "async" }, async () => ({ ok: true }), "compose:create"),
     (error) => error.code === "OPERATION_INTERRUPTED_BY_RELOAD",
   );
+});
+
+test("operation status never exposes raw fingerprints or mutation payloads", async () => {
+  let revision = 12;
+  const stored = [];
+  const run = createWebMcpMutationRunner({
+    getRevision: () => revision,
+    getFlowId: () => "flow-private",
+    persistOperation: async (operation) => stored.push(structuredClone(operation)),
+  });
+  const secretFormula = "IF([email] = 'person@example.com', 9900000, 0)";
+  const result = await run({ expectedRevision: 12, requestId: "private-operation-001" }, async () => {
+    revision += 1;
+    return { ok: true, expression: secretFormula };
+  }, `formula:${secretFormula}`);
+  assert.equal(result.ok, true);
+  const operationId = stored.at(-1).operationId;
+  const status = run.getOperationStatus(operationId);
+  assert.equal(JSON.stringify(status).includes("person@example.com"), false);
+  assert.equal(JSON.stringify(status).includes("9900000"), false);
+  assert.equal(Object.hasOwn(status, "fingerprint"), false);
+  assert.equal(Object.hasOwn(status, "fingerprintHash"), false);
+  assert.equal(JSON.stringify(stored).includes(secretFormula), false);
+});
+
+test("cancellation fences a running writer before commit", async () => {
+  let revision = 20;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const run = createWebMcpMutationRunner({ getRevision: () => revision });
+  const accepted = await run({ expectedRevision: 20, requestId: "cancel-writer-001", executionMode: "async" }, async (assertCurrent) => {
+    assertCurrent();
+    await gate;
+    assertCurrent();
+    revision += 1;
+    return { ok: true };
+  }, "recipe:cancel");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(run.cancelOperation(accepted.operationId).status, "cancelling");
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(run.getOperationStatus(accepted.operationId).status, "cancelled");
+  assert.equal(revision, 20);
+});
+
+test("a registration-generation fence prevents an older writer from committing", async () => {
+  let revision = 30;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const run = createWebMcpMutationRunner({ getRevision: () => revision });
+  const accepted = await run({
+    expectedRevision: 30,
+    requestId: "generation-fence-001",
+    executionMode: "async",
+  }, async (assertCurrent) => {
+    await gate;
+    assertCurrent();
+    revision += 1;
+    return { changed: true };
+  }, "recipe:generation-fence");
+
+  assert.equal(run.getOperationStatus(accepted.operationId).status, "running");
+  assert.deepEqual(run.fenceMutations(), [accepted.operationId]);
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(run.getOperationStatus(accepted.operationId).status, "cancelled");
+  assert.equal(revision, 30);
 });
