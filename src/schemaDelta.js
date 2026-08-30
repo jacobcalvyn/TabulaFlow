@@ -1,10 +1,8 @@
-export function schemaDelta(before = [], after = []) {
-  const beforeByName = new Map(before.map((column) => [column.name, column.type ?? null]));
-  const afterByName = new Map(after.map((column) => [column.name, column.type ?? null]));
-  const renamed = after.flatMap((column) => {
+function provenanceRenames(after = [], beforeByName = null) {
+  return after.flatMap((column) => {
     const provenance = column.provenance ?? column.semantic?.provenance;
     const sourceName = provenance?.column ?? provenance?.sourceColumn ?? null;
-    if (!sourceName || sourceName === column.name) return [];
+    if (!sourceName || sourceName === column.name || (beforeByName && !beforeByName.has(sourceName))) return [];
     return [{
       from: sourceName,
       to: column.name,
@@ -12,6 +10,12 @@ export function schemaDelta(before = [], after = []) {
       type: column.type ?? null,
     }];
   });
+}
+
+export function schemaDelta(before = [], after = []) {
+  const beforeByName = new Map(before.map((column) => [column.name, column.type ?? null]));
+  const afterByName = new Map(after.map((column) => [column.name, column.type ?? null]));
+  const renamed = provenanceRenames(after, beforeByName);
   return {
     added: after.filter((column) => !beforeByName.has(column.name)).map((column) => ({ name: column.name, type: column.type ?? null })),
     removed: before.filter((column) => !afterByName.has(column.name)).map((column) => ({ name: column.name, type: column.type ?? null })),
@@ -42,7 +46,7 @@ export function composeSchemaDelta(kind, inputSchemas = [], after = []) {
     const delta = schemaDelta(baseline, after);
     return {
       ...delta,
-      renamed: schemaDelta([], after).renamed,
+      renamed: provenanceRenames(after),
       baseline: "normalized-binary-input",
     };
   }

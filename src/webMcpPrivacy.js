@@ -6,7 +6,11 @@ const SAFE_OPERATION_RESULT_KEYS = new Set([
   "stepId",
   "preparedId",
   "preparedInputId",
+  "createdPreparedId",
   "nodeId",
+  "activePreparedId",
+  "activeNodeId",
+  "selectionChanged",
   "target",
   "targetId",
   "name",
@@ -35,6 +39,11 @@ export function sanitizeWebMcpError(cause) {
     OPERATION_NOT_FOUND: "The requested operation status is unavailable.",
     IDEMPOTENCY_KEY_REUSED: "The idempotency key was already used for another mutation.",
     SOURCE_RELINK_REQUIRED: "The local source must be re-linked by the user before data operations can continue.",
+    SOURCE_NOT_UNLINKED: "The source is already linked and does not need a Re-link interaction.",
+    FILE_HANDLE_UNAVAILABLE: "The requested local source handle is unavailable.",
+    USER_GESTURE_REQUIRED: "The user must complete the requested browser file interaction.",
+    WORKER_NOT_READY: "The local data engine is still starting.",
+    WEBMCP_SNAPSHOT_STALE: "The host WebMCP snapshot is stale. Fetch the current toolset and retry.",
   };
   return {
     code,
@@ -51,6 +60,7 @@ export function webMcpErrorForAgent(cause, metadata = {}) {
     tool: metadata.tool ?? cause?.tool,
     ...(metadata.requestId || cause?.requestId ? { requestId: metadata.requestId ?? cause.requestId } : {}),
     ...(cause?.refreshRequired === true ? { refreshRequired: true } : {}),
+    ...(Number.isInteger(metadata.generation) ? { generation: metadata.generation } : {}),
   });
   return error;
 }
@@ -74,6 +84,14 @@ export function sanitizeWebMcpOperationResult(result) {
 }
 
 export function operationStatusForAgent(operation) {
+  const safeResult = sanitizeWebMcpOperationResult(operation.result);
+  const artifact = safeResult?.filename
+    ? { type: "file", id: null, name: safeResult.filename, format: safeResult.format ?? null }
+    : safeResult?.preparedInputId || safeResult?.preparedId
+      ? { type: "prepared-dataset", id: safeResult.preparedInputId ?? safeResult.preparedId, name: safeResult.name ?? null }
+      : safeResult?.nodeId
+        ? { type: "compose-node", id: safeResult.nodeId, name: safeResult.name ?? null }
+        : null;
   return {
     operationId: operation.operationId,
     requestId: operation.requestId,
@@ -86,7 +104,9 @@ export function operationStatusForAgent(operation) {
     startedAt: operation.startedAt ?? null,
     completedAt: operation.completedAt ?? null,
     cancelRequested: operation.cancelRequested === true,
-    result: sanitizeWebMcpOperationResult(operation.result),
+    target: operation.target ?? null,
+    result: safeResult,
+    artifact,
     error: operation.error ? sanitizeWebMcpError(operation.error) : null,
   };
 }

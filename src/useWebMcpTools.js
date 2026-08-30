@@ -32,13 +32,31 @@ const ACTION_TOOL_DEPENDENCIES = Object.freeze({
 function applyRuntimeHealthToActions(result, health) {
   const degradedNames = new Set((health.degradedTools ?? []).map((item) => item.tool));
   const unavailableActions = [];
+  const registrationBlocked = ["registering", "stale", "limit-exceeded"].includes(health.status);
   const actions = (result.actions ?? []).filter((action) => {
     const failedTools = (ACTION_TOOL_DEPENDENCIES[action] ?? []).filter((name) => degradedNames.has(name));
-    if (!failedTools.length) return true;
-    unavailableActions.push({ action, reason: "runtime-degraded", failedTools });
+    if (!registrationBlocked && !failedTools.length) return true;
+    unavailableActions.push({
+      action,
+      reason: registrationBlocked ? "REFRESH_REQUIRED" : "runtime-degraded",
+      ...(failedTools.length ? { failedTools } : {}),
+    });
     return false;
   });
-  return { ...result, actions, unavailableActions, runtimeHealth: health };
+  const statusByAction = new Map((result.actionStatus ?? []).map((item) => [item.action, item]));
+  const actionStatus = (result.actions ?? []).map((action) => {
+    const base = statusByAction.get(action) ?? { action, registered: true, callable: true, blockedReason: null };
+    const unavailable = unavailableActions.find((item) => item.action === action);
+    return unavailable
+      ? { ...base, callable: false, blockedReason: unavailable.reason }
+      : base;
+  });
+  for (const item of actionStatus) {
+    if (item.callable !== false || unavailableActions.some((entry) => entry.action === item.action)) continue;
+    unavailableActions.push({ action: item.action, reason: item.blockedReason ?? "blocked-by-context" });
+  }
+  const callableActions = actions.filter((action) => actionStatus.find((item) => item.action === action)?.callable !== false);
+  return { ...result, actions: callableActions, actionStatus, unavailableActions, runtimeHealth: health };
 }
 
 const EMPTY_INPUT_SCHEMA = Object.freeze({
@@ -512,14 +530,13 @@ export const WEBMCP_CORE_TOOL_NAMES = Object.freeze([
   "tabulaflow_get_pending_confirmations",
   "tabulaflow_reject_confirmation",
   "tabulaflow_open_workspace",
+  "tabulaflow_request_source_file",
+  "tabulaflow_request_source_relink",
+  "tabulaflow_request_reset_all",
 ]);
 
 const WEBMCP_WORKSPACE_TOOL_NAMES = Object.freeze({
-  source: Object.freeze([
-    "tabulaflow_request_source_file",
-    "tabulaflow_request_source_relink",
-    "tabulaflow_request_reset_all",
-  ]),
+  source: Object.freeze([]),
   prepare: Object.freeze([
     "tabulaflow_get_calculation_catalog",
     "tabulaflow_select_prepared_dataset",
@@ -595,6 +612,7 @@ export function createWebMcpTools(contextRef, availability) {
       return webMcpResult(`TabulaFlow is showing the ${state.workspace} workspace.`, {
         ...state,
         activeOperationIds,
+        pendingInteractions: actions.getPendingInteractions?.() ?? state.pendingInteractions ?? [],
         diagnostics: (state.diagnostics ?? []).map(sanitizeWebMcpDiagnostic),
         runtimeHealth: runtimeHealth.snapshot({ activeOperationIds }),
       });
@@ -675,7 +693,7 @@ export function createWebMcpTools(contextRef, availability) {
   }, {
     name: "tabulaflow_get_operation_status",
     title: "Get mutation operation status",
-    description: "Poll a long-running WebMCP mutation accepted with executionMode async. Returns accepted, running, committed, cancelled, or failed with its final result or diagnostic.",
+    description: "Poll a long-running WebMCP mutation accepted with executionMode async. Returns accepted, running, committing, succeeded, cancelled, or failed with its final result or diagnostic.",
     inputSchema: OPERATION_STATUS_SCHEMA,
     annotations: { readOnlyHint: true },
     async execute({ operationId }) {
@@ -735,8 +753,8 @@ export function createWebMcpTools(contextRef, availability) {
     annotations: { readOnlyHint: false },
     async execute() {
       const { actions } = activeContext(contextRef);
-      await actions.requestSourceFileSelection();
-      return webMcpResult("The Source file chooser is ready for the user.", { awaitingUser: true, workspace: "source" });
+      const result = await actions.requestSourceFileSelection();
+      return webMcpResult("The Source file chooser is ready for the user.", result);
     },
   }, {
     name: "tabulaflow_request_source_relink",
@@ -746,8 +764,8 @@ export function createWebMcpTools(contextRef, availability) {
     annotations: { readOnlyHint: false },
     async execute({ sourceAssetId }) {
       const { actions } = activeContext(contextRef);
-      await actions.requestSourceRelink(sourceAssetId);
-      return webMcpResult("The source Re-link control is ready for the user.", { sourceAssetId, awaitingUser: true });
+      const result = await actions.requestSourceRelink(sourceAssetId);
+      return webMcpResult("The source Re-link control is ready for the user.", result);
     },
   }, {
     name: "tabulaflow_request_reset_all",
@@ -883,7 +901,7 @@ export function createWebMcpTools(contextRef, availability) {
       annotations: { readOnlyHint: false },
       async execute({ preparedId, recipe, expectedRecipeRevision, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.replaceRecipe(preparedId, recipe, expectedRecipeRevision, { expectedRevision, requestId, executionMode });
+        const result = await actions.replaceRecipe(preparedId, recipe, expectedRecipeRevision, { expectedRevision, requestId, executionMode, target: { type: "prepared-dataset", id: preparedId } });
         return webMcpResult(result.status === "accepted" ? "Recipe replacement was accepted for background execution." : `Replaced the recipe with ${recipe.length} ordered steps.`, result);
       },
     }, {
@@ -894,8 +912,10 @@ export function createWebMcpTools(contextRef, availability) {
       annotations: { readOnlyHint: false },
       async execute({ preparedId, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.duplicatePrepared(preparedId, { expectedRevision, requestId, executionMode });
-        return webMcpResult(`Duplicated prepared dataset ${preparedId}.`, result);
+        const result = await actions.duplicatePrepared(preparedId, { expectedRevision, requestId, executionMode, target: { type: "prepared-dataset", id: preparedId } });
+        return webMcpResult(result.status === "accepted"
+          ? "Prepared dataset duplication was accepted for background execution."
+          : `Created prepared dataset ${result.name ?? result.preparedInputId}.`, result);
       },
     });
   }
@@ -1021,8 +1041,10 @@ export function createWebMcpTools(contextRef, availability) {
       annotations: { readOnlyHint: false },
       async execute({ preparedId, format, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.exportPrepare(preparedId, format, { expectedRevision, requestId, executionMode, operationClass: "snapshot-compute" });
-        return webMcpResult(`Downloaded ${result.filename}.`, result);
+        const result = await actions.exportPrepare(preparedId, format, { expectedRevision, requestId, executionMode, operationClass: "snapshot-compute", target: { type: "prepared-dataset", id: preparedId } });
+        return webMcpResult(result.status === "accepted"
+          ? "Prepare export was accepted for background execution."
+          : `Downloaded ${result.filename}.`, result);
       },
     }, {
       name: "tabulaflow_add_recipe_step",
@@ -1240,8 +1262,10 @@ export function createWebMcpTools(contextRef, availability) {
       async execute({ nodeId, format, expectedRevision, requestId, executionMode = "async" }) {
         const { state, actions } = activeContext(contextRef);
         if (!state.composeNodes.some((item) => item.id === nodeId)) throw new Error(`Compose node not found: ${nodeId}`);
-        const result = await actions.exportCompose(nodeId, format, { expectedRevision, requestId, executionMode, operationClass: "snapshot-compute" });
-        return webMcpResult(`Downloaded ${result.filename}.`, result);
+        const result = await actions.exportCompose(nodeId, format, { expectedRevision, requestId, executionMode, operationClass: "snapshot-compute", target: { type: "compose-node", id: nodeId } });
+        return webMcpResult(result.status === "accepted"
+          ? "Compose export was accepted for background execution."
+          : `Downloaded ${result.filename}.`, result);
       },
     }, {
       name: "tabulaflow_create_compose_operation",
@@ -1251,7 +1275,7 @@ export function createWebMcpTools(contextRef, availability) {
       annotations: { readOnlyHint: false },
       async execute({ operation, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.createComposeOperation(operation, { expectedRevision, requestId, executionMode });
+        const result = await actions.createComposeOperation(operation, { expectedRevision, requestId, executionMode, target: { type: "compose-graph", id: null } });
         return webMcpResult(result.status === "accepted" ? "Compose operation creation was accepted for background execution." : `Created Compose operation ${result.name}.`, result);
       },
     }, {
@@ -1262,7 +1286,7 @@ export function createWebMcpTools(contextRef, availability) {
       annotations: { readOnlyHint: false },
       async execute({ nodeId, operation, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.updateComposeOperation(nodeId, operation, { expectedRevision, requestId, executionMode });
+        const result = await actions.updateComposeOperation(nodeId, operation, { expectedRevision, requestId, executionMode, target: { type: "compose-node", id: nodeId } });
         return webMcpResult(result.status === "accepted" ? "Compose operation update was accepted for background execution." : `Updated Compose operation ${result.name}.`, result);
       },
     }, {
@@ -1273,8 +1297,10 @@ export function createWebMcpTools(contextRef, availability) {
       annotations: { readOnlyHint: false },
       async execute({ nodeId, expectedRevision, requestId, executionMode = "async" }) {
         const { actions } = activeContext(contextRef);
-        const result = await actions.promoteComposeResult(nodeId, { expectedRevision, requestId, executionMode });
-        return webMcpResult(`Created prepared dataset ${result.preparedInputId} from ${nodeId}.`, result);
+        const result = await actions.promoteComposeResult(nodeId, { expectedRevision, requestId, executionMode, target: { type: "compose-node", id: nodeId } });
+        return webMcpResult(result.status === "accepted"
+          ? "Compose result promotion was accepted for background execution."
+          : `Created prepared dataset ${result.name ?? result.preparedInputId} from ${nodeId}.`, result);
       },
     });
   }
@@ -1367,10 +1393,17 @@ export async function registerWebMcpTools(modelContext, tools, signal, {
             tool: tool.name,
             phase: cause?.phase ?? "handler",
             requestId: typeof input?.requestId === "string" ? input.requestId : undefined,
+            generation: runtimeHealth?.snapshot().generation ?? generation,
           });
         };
         try {
           const result = await tool.execute(input);
+          if (result?.structuredContent && typeof result.structuredContent === "object") {
+            result.structuredContent = {
+              ...result.structuredContent,
+              generation: runtimeHealth?.snapshot().generation ?? generation,
+            };
+          }
           onExecutionSuccess?.(tool.name);
           return result;
         } catch (cause) {

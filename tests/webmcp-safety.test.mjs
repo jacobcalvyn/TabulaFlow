@@ -92,6 +92,41 @@ test("recipe lineage never lowers sensitivity through rename, cast, or Formula c
   assert.deepEqual(redactAgentRows([{ status: "secret", notes: 42, public_result: "secret" }], derived).rows, [{ status: "[redacted]", notes: "[redacted]", public_result: "[redacted]" }]);
 });
 
+test("Formula column semantics follow the output type while preserving strict sensitivity", () => {
+  const source = [{
+    name: "weight",
+    type: "DOUBLE",
+    semantic: { role: "measure", unit: "kg", sensitivity: "internal", source: "override" },
+  }];
+  const recipe = [
+    { id: "copy", type: "calculated-field", enabled: true, params: { outputColumn: "weight_copy", expression: "[weight]", expressionVersion: 1 } },
+    { id: "band", type: "calculated-field", enabled: true, params: { outputColumn: "weight_band", expression: "if([weight] >= 1, 'Heavy', 'Light')", expressionVersion: 1 } },
+    { id: "flag", type: "calculated-field", enabled: true, params: { outputColumn: "is_heavy", expression: "[weight] >= 1", expressionVersion: 1 } },
+    { id: "literal", type: "calculated-field", enabled: true, params: { outputColumn: "private_literal", expression: "'person@example.com'", expressionVersion: 1 } },
+  ];
+  const derived = deriveRecipeSemanticSchema(source, recipe, [
+    source[0],
+    { name: "weight_copy", type: "DOUBLE" },
+    { name: "weight_band", type: "VARCHAR" },
+    { name: "is_heavy", type: "BOOLEAN" },
+    { name: "private_literal", type: "VARCHAR" },
+  ], [{
+    name: "weight_band",
+    type: "VARCHAR",
+    semantic: { role: "measure", unit: "kg", allowedAggregations: ["sum"], sensitivity: "public", source: "derived" },
+  }]);
+
+  const byName = new Map(derived.map((column) => [column.name, column.semantic]));
+  assert.equal(byName.get("weight_copy").role, "measure");
+  assert.equal(byName.get("weight_copy").unit, "kg");
+  assert.equal(byName.get("weight_band").role, "dimension");
+  assert.equal(byName.get("weight_band").unit, null);
+  assert.deepEqual(byName.get("weight_band").allowedAggregations, ["count", "count-distinct"]);
+  assert.equal(byName.get("weight_band").sensitivity, "internal");
+  assert.equal(byName.get("is_heavy").role, "flag");
+  assert.equal(byName.get("private_literal").sensitivity, "internal");
+});
+
 test("stale inferred public semantics cannot bypass a stricter identifier heuristic", () => {
   const schema = [{ name: "shipment_id", type: "BIGINT", semantic: { role: "identifier", sensitivity: "public", source: "inferred" } }];
   assert.deepEqual(redactAgentRows([{ shipment_id: 42 }], schema).rows, [{ shipment_id: "[redacted]" }]);
@@ -230,6 +265,12 @@ test("dry-run schema deltas contain metadata only", () => {
     typeChanged: [{ name: "id", before: "BIGINT", after: "VARCHAR" }],
     renamed: [],
   });
+});
+
+test("unary schema deltas do not replay historical upstream renames", () => {
+  const input = [{ name: "score", type: "DOUBLE", semantic: { provenance: { kind: "rename-column", column: "_score" } } }];
+  const output = [{ name: "score", type: "DOUBLE", semantic: { provenance: { kind: "rename-column", column: "_score" } } }];
+  assert.deepEqual(schemaDelta(input, output).renamed, []);
 });
 
 test("derived rebuilds do not advance the semantic workspace revision", () => {

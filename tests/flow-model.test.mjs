@@ -51,6 +51,7 @@ test("duplicates a prepared input without duplicating its source asset and with 
   assert.notEqual(duplicated.preparedInput.recipe, created.preparedInput.recipe);
   assert.equal(duplicated.preparedInput.recipe[0].type, "trim");
   assert.notEqual(duplicated.preparedInput.recipe[0].id, "shared-step");
+  assert.equal(duplicated.graph.activeNodeId, graph.activeNodeId);
   assert.deepEqual(duplicated.preparedInput.position, {
     x: created.preparedInput.position.x + 320,
     y: created.preparedInput.position.y,

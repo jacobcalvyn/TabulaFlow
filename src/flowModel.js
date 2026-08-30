@@ -356,7 +356,7 @@ export function duplicatePreparedInput(graph, preparedInputId) {
     graph: {
       ...graph,
       revision: graph.revision + 1,
-      activeNodeId: copy.id,
+      activeNodeId: graph.activeNodeId,
       preparedInputs: [...graph.preparedInputs, copy],
       semanticModels: { ...(graph.semanticModels ?? {}), [copy.id]: copyModel },
       metricDefinitions: graph.metricDefinitions ?? [],

@@ -8,7 +8,7 @@ import { createWebMcpMutationRunner } from "../src/webMcpMutation.js";
 
 function state(revision, { compose = true, workspace = "prepare" } = {}) {
   return {
-    contractVersion: "3.1",
+    contractVersion: "3.1.1",
     workspaceRevision: revision,
     workspace,
     worker: { ready: true, recovering: false },
@@ -67,8 +67,10 @@ test("React WebMCP registration keeps core stable and rotates only the active wo
   const view = render(React.createElement(Harness, { context: { state: state(revision), actions } }));
   await waitFor(() => assert.ok(registry.has("tabulaflow_export_prepare")));
   const coreSignal = registrations.find(({ name }) => name === "tabulaflow_get_workspace_state").signal;
+  const sourceRequestSignal = registrations.find(({ name }) => name === "tabulaflow_request_source_file").signal;
   const prepareSignal = registrations.find(({ name }) => name === "tabulaflow_export_prepare").signal;
   assert.notEqual(coreSignal, prepareSignal);
+  assert.equal(sourceRequestSignal, coreSignal);
   assert.equal(registry.has("tabulaflow_export_compose"), false);
   const exportTool = registry.get("tabulaflow_export_prepare");
   const args = { preparedId: "prepared-a", format: "csv", expectedRevision: 7, requestId: "registered-export-001", executionMode: "wait" };
@@ -90,6 +92,7 @@ test("React WebMCP registration keeps core stable and rotates only the active wo
   await waitFor(() => assert.ok(registry.has("tabulaflow_export_compose")));
   assert.equal(prepareSignal.aborted, true);
   assert.equal(coreSignal.aborted, false);
+  assert.equal(sourceRequestSignal.aborted, false);
   const composeSignal = registrations.find(({ name }) => name === "tabulaflow_export_compose").signal;
   view.unmount();
   assert.equal(coreSignal.aborted, true);

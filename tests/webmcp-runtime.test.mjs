@@ -37,9 +37,13 @@ test("runtime health blocks stale generations and reports registration failures 
   const metrics = { schemaBytes: 100, propertyCount: 4, schemaDepth: 3 };
   health.beginRegistration({ generation: 1, expectedToolCount: 10, metrics });
   assert.equal(health.snapshot().status, "registering");
+  assert.equal(health.snapshot().callableToolCount, 0);
+  assert.equal(health.snapshot().blockedToolCount, 10);
   assert.throws(() => health.assertExecutable(0), (error) => error.code === "WEBMCP_REFRESH_REQUIRED");
   health.completeRegistration({ generation: 1, registeredToolCount: 10, expectedToolCount: 10, metrics });
   assert.equal(health.snapshot().status, "available");
+  assert.equal(health.snapshot().callableToolCount, 10);
+  assert.equal(health.snapshot().blockedToolCount, 0);
   assert.throws(() => health.assertExecutable(0), (error) => error.code === "WEBMCP_STALE_GENERATION");
   health.failRegistration(Object.assign(new Error("configuration exceeds supported limits"), { code: "WEBMCP_CONFIGURATION_LIMIT_EXCEEDED" }), { generation: 1, metrics });
   assert.equal(health.snapshot().status, "limit-exceeded");

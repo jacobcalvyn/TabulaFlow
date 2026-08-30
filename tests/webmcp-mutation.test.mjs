@@ -24,7 +24,9 @@ test("deduplicates concurrent retries and returns the committed revision", async
   const meta = { expectedRevision: 2, requestId: "retry-001" };
   const [first, second] = await Promise.all([run(meta, execute, "recipe:add:a"), run(meta, execute, "recipe:add:a")]);
   assert.equal(executions, 1);
-  assert.deepEqual(first, { changed: true, workspaceRevision: 3 });
+  assert.equal(first.status, "succeeded");
+  assert.equal(first.changed, true);
+  assert.equal(first.workspaceRevision, 3);
   assert.deepEqual(second, first);
 });
 
@@ -118,9 +120,32 @@ test("acknowledges long mutations asynchronously and exposes terminal status", a
   release();
   await new Promise((resolve) => setTimeout(resolve, 0));
   const completed = run.getOperationStatus(accepted.operationId);
-  assert.equal(completed.status, "committed");
+  assert.equal(completed.status, "succeeded");
   assert.equal(completed.result.recipeRevision, 4);
   assert.equal(completed.result.workspaceRevision, 11);
+});
+
+test("async envelopes expose stable targets and terminal artifacts without undefined copy", async () => {
+  let revision = 3;
+  const run = createWebMcpMutationRunner({ getRevision: () => revision });
+  const accepted = await run({
+    expectedRevision: 3,
+    requestId: "async-export-envelope-001",
+    executionMode: "async",
+    operationClass: "snapshot-compute",
+    target: { type: "prepared-dataset", id: "prepared-a" },
+  }, async () => {
+    revision += 1;
+    return { filename: "Orders.csv", format: "csv" };
+  }, "prepare:export");
+
+  assert.equal(accepted.status, "accepted");
+  assert.deepEqual(accepted.target, { type: "prepared-dataset", id: "prepared-a" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const terminal = run.getOperationStatus(accepted.operationId);
+  assert.equal(terminal.status, "succeeded");
+  assert.deepEqual(terminal.artifact, { type: "file", id: null, name: "Orders.csv", format: "csv" });
+  assert.equal(JSON.stringify(terminal).includes("undefined"), false);
 });
 
 test("async failures replay their terminal failure instead of stale accepted state", async () => {
@@ -144,7 +169,7 @@ test("a cancelled confirmation remains terminal for the original request", async
   assert.deepEqual(replay, { target: "prepared-dataset", targetId: "prepared-a", pendingConfirmation: false, requestId: meta.requestId, status: "cancelled" });
 });
 
-test("hydrates committed mutation results across a runner reload", async () => {
+test("hydrates succeeded mutation results across a runner reload", async () => {
   const stored = new Map();
   const options = {
     getRevision: () => 6,
@@ -161,7 +186,8 @@ test("hydrates committed mutation results across a runner reload", async () => {
   await restored.hydrate([...stored.values()]);
   const replay = await restored(meta, async () => { reexecuted = true; return { value: 99 }; }, "recipe:durable");
   assert.equal(reexecuted, false);
-  assert.deepEqual(replay, { workspaceRevision: committed.workspaceRevision });
+  assert.equal(replay.status, "succeeded");
+  assert.equal(replay.workspaceRevision, committed.workspaceRevision);
 });
 
 test("marks non-terminal persisted mutations as interrupted after reload", async () => {

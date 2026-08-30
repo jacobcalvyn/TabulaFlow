@@ -18,7 +18,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "3.1", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "3.1.1", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -42,13 +42,13 @@ function createContext() {
         async getAvailableActions(targetId) { calls.push(["available-actions", targetId]); return { targetId, actions: ["inspect"] }; },
         async getActivityLog(options) { calls.push(["activity", options]); return { events: [{ sequence: 12, actor: "agent" }], cursor: 12, hasMore: false }; },
         async getChangesSince(cursor, options) { calls.push(["changes", cursor, options]); return { events: [], cursor, hasMore: false }; },
-        async getOperationStatus(operationId) { calls.push(["operation-status", operationId]); return { operationId, status: "committed" }; },
+        async getOperationStatus(operationId) { calls.push(["operation-status", operationId]); return { operationId, status: "succeeded" }; },
         async cancelOperation(operationId) { calls.push(["cancel-operation", operationId]); return { operationId, status: "cancelling" }; },
         async getPendingConfirmations() { calls.push(["pending-confirmations"]); return { confirmations: [] }; },
         async rejectConfirmation(confirmationId) { calls.push(["reject-confirmation", confirmationId]); return { confirmationId, status: "cancelled" }; },
         async openWorkspace(workspace) { calls.push(["workspace", workspace]); return { workspace, workspaceRevision: REVISION, activityCursor: 12, activePreparedId: "prepared-a", activeNodeId: "operation-a" }; },
-        async requestSourceFileSelection() { calls.push(["file"]); },
-        async requestSourceRelink(sourceAssetId) { calls.push(["relink", sourceAssetId]); },
+        async requestSourceFileSelection() { calls.push(["file"]); return { interactionId: "interaction-file", status: "awaiting-user", awaitingUser: true, workspace: "source" }; },
+        async requestSourceRelink(sourceAssetId) { calls.push(["relink", sourceAssetId]); return { interactionId: "interaction-relink", status: "awaiting-user", awaitingUser: true, workspace: "source", sourceAssetId }; },
         async requestResetAll(meta) { calls.push(["reset-all", meta]); return result({ pendingConfirmation: true }); },
         async listCloudFiles() { calls.push(["cloud-list"]); return { authenticated: true, files: [{ id: "cloud-a" }] }; },
         async openCloudFile(fileId, meta) { calls.push(["cloud-open", fileId, meta]); return result({ fileId, name: "orders.csv" }); },
@@ -149,13 +149,14 @@ test("WebMCP registers a small permanent core and only the active workspace bund
   const { ref } = createContext();
   const availability = { hasDataset: true, hasPrepared: true, hasComposeNodes: true };
   const expectedWorkspaceTools = {
-    source: ["tabulaflow_request_source_file", "tabulaflow_request_source_relink", "tabulaflow_request_reset_all"],
+    source: [],
     account: ["tabulaflow_list_cloud_files", "tabulaflow_open_cloud_file", "tabulaflow_request_cloud_upload"],
   };
 
   for (const workspace of ["source", "prepare", "compose", "account"]) {
     const bundles = createWebMcpToolBundles(ref, { ...availability, workspace });
     assert.deepEqual(bundles.core.map((tool) => tool.name), WEBMCP_CORE_TOOL_NAMES);
+    assert.ok(bundles.core.some((tool) => tool.name === "tabulaflow_request_source_file"));
     assert.equal(new Set([...bundles.core, ...bundles.workspace].map((tool) => tool.name)).size, bundles.core.length + bundles.workspace.length);
     const metrics = measureWebMcpToolset([...bundles.core, ...bundles.workspace]);
     assert.ok(metrics.schemaBytes <= WEBMCP_REGISTRATION_BUDGET.maxSchemaBytes, `${workspace} WebMCP bundle exceeded its configuration budget`);
@@ -203,7 +204,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "3.1");
+  assert.equal(capabilities.structuredContent.contractVersion, "3.1.1");
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");

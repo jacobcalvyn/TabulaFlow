@@ -1,7 +1,7 @@
 import { classifyColumnSemantics } from "./dataPrivacy.js";
 import { getFormulaColumnReferences } from "./formulaEngine.js";
 
-export const SEMANTIC_ROLES = Object.freeze(["identifier", "dimension", "measure", "timestamp", "status", "free-text", "attribute"]);
+export const SEMANTIC_ROLES = Object.freeze(["identifier", "dimension", "measure", "timestamp", "status", "free-text", "attribute", "flag"]);
 export const SEMANTIC_SENSITIVITIES = Object.freeze(["public", "internal", "pii", "financial", "secret"]);
 export const METRIC_FUNCTIONS = Object.freeze(["count", "count-distinct", "sum", "average", "min", "max", "median", "percentile"]);
 
@@ -143,8 +143,48 @@ function derivedField(name, type, dependencies, provenance) {
   return { name, type: type ?? null, semantic: { ...semantic, businessName: name } };
 }
 
+function formulaTypePolicy(type) {
+  const normalized = String(type ?? "").toUpperCase();
+  if (/BOOL/.test(normalized)) return { role: "flag", allowedAggregations: ["count", "count-distinct"] };
+  if (/DATE|TIME/.test(normalized)) return { role: "timestamp", allowedAggregations: ["min", "max", "count", "count-distinct"] };
+  if (/INT|DECIMAL|NUMERIC|DOUBLE|FLOAT|REAL|HUGEINT/.test(normalized)) {
+    return { role: "measure", allowedAggregations: ["count", "sum", "average", "min", "max", "median", "percentile"] };
+  }
+  if (/CHAR|TEXT|STRING|UUID|JSON/.test(normalized)) return { role: "dimension", allowedAggregations: ["count", "count-distinct"] };
+  return { role: "attribute", allowedAggregations: ["count", "count-distinct"] };
+}
+
+function formulaPreservesUnit(expression, references) {
+  if (references.length !== 1) return false;
+  const compact = String(expression ?? "").replace(/\s+/g, "");
+  const escaped = references[0].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^\\[${escaped}\\]$`, "i").test(compact)
+    || new RegExp(`^(?:CAST|TRY_CAST)\\(\\[${escaped}\\]AS[A-Z0-9_(),]+\\)$`, "i").test(compact);
+}
+
+function formulaDerivedField(name, type, dependencies, provenance, expression, references) {
+  const base = dependencies.length
+    ? mergeFieldSemantics(dependencies, provenance)
+    : { ...inferFieldSemantic({ name, type }, provenance), sensitivity: "internal", source: "derived" };
+  const policy = formulaTypePolicy(type);
+  return {
+    name,
+    type: type ?? null,
+    semantic: {
+      ...base,
+      ...policy,
+      businessName: name,
+      unit: formulaPreservesUnit(expression, references) ? (dependencies[0]?.semantic?.unit ?? null) : null,
+      sensitivity: dependencies.length ? strictestSensitivity(dependencies.map((column) => resolveFieldSemantic(column))) : "internal",
+      provenance,
+      source: "derived",
+    },
+  };
+}
+
 export function deriveRecipeSemanticSchema(sourceSchema = [], recipe = [], outputSchema = [], existingSchema = []) {
   const existingByName = new Map(existingSchema.map((column) => [column.name, column]));
+  const outputByName = new Map(outputSchema.map((column) => [column.name, column]));
   const fields = new Map(sourceSchema.map((column) => {
     const existing = existingByName.get(column.name);
     const seed = existing ? { ...column, semantic: existing.semantic } : column;
@@ -191,12 +231,12 @@ export function deriveRecipeSemanticSchema(sourceSchema = [], recipe = [], outpu
         // Invalid formulas are handled by the recipe compiler; a failed semantic parse stays conservative.
       }
       const dependencies = references.map((name) => schemaField(fields, name) ?? existingByName.get(name)).filter(Boolean);
-      fields.set(params.outputColumn, derivedField(params.outputColumn, null, dependencies, {
+      fields.set(params.outputColumn, formulaDerivedField(params.outputColumn, outputByName.get(params.outputColumn)?.type ?? null, dependencies, {
         kind: "calculated-field",
         stepId: step.id,
         column: params.outputColumn,
         dependencies: references,
-      }));
+      }, params.expression, references));
     } else if (step.type === "calculated-column") {
       const references = [params.leftColumn, params.rightColumn].filter(Boolean);
       const dependencies = references.map((name) => schemaField(fields, name) ?? existingByName.get(name)).filter(Boolean);
@@ -220,6 +260,7 @@ export function deriveRecipeSemanticSchema(sourceSchema = [], recipe = [], outpu
     const existing = existingByName.get(column.name);
     if (!derived) return { ...column, semantic: { sensitivity: "internal", source: "derived-recipe", provenance: { kind: "recipe", column: column.name } } };
     const existingSemantic = existing?.semantic;
+    const preserveExisting = existingSemantic?.source === "override" || existingSemantic?.source === "user-override";
     const sensitivity = existingSemantic
       ? strictestSensitivity([derived.semantic, existingSemantic])
       : derived.semantic.sensitivity;
@@ -227,7 +268,7 @@ export function deriveRecipeSemanticSchema(sourceSchema = [], recipe = [], outpu
       ...column,
       semantic: {
         ...derived.semantic,
-        ...(existingSemantic ?? {}),
+        ...(preserveExisting ? existingSemantic : {}),
         sensitivity,
         provenance: derived.semantic.provenance,
         source: derived.semantic.source,

@@ -60,10 +60,16 @@ export function createWebMcpMutationRunner({
         const safeError = sanitizeWebMcpError(operation.error);
         throw mutationError(safeError.message, safeError.code);
       }
-      if (operation?.status === "committed" || operation?.status === "cancelled") return structuredClone(operation.result);
+      if (operation?.status === "succeeded" || operation?.status === "cancelled") return structuredClone(operation.result);
       if (operation && ["accepted", "running", "cancelling", "committing"].includes(operation.status)) {
         if (cached.executionMode === "wait") return cached.promise;
-        return { operationId: operation.operationId, requestId, status: operation.status, workspaceRevision: getRevision() };
+        return {
+          operationId: operation.operationId,
+          requestId,
+          status: operation.status,
+          target: operation.target ?? null,
+          workspaceRevision: getRevision(),
+        };
       }
       return cached.response;
     }
@@ -77,6 +83,9 @@ export function createWebMcpMutationRunner({
       flowId: getFlowId(),
       executionMode,
       operationClass: meta?.operationClass === "snapshot-compute" ? "snapshot-compute" : "workspace-writer",
+      target: meta?.target && typeof meta.target === "object"
+        ? { type: String(meta.target.type ?? "workspace"), id: meta.target.id == null ? null : String(meta.target.id) }
+        : null,
       baseRevision: expectedRevision,
       phase: "queued",
       writeEpoch: null,
@@ -123,13 +132,20 @@ export function createWebMcpMutationRunner({
         throw mutationError("The operation was cancelled before its commit boundary.", "OPERATION_CANCELLED");
       }
       const normalized = result && typeof result === "object" ? result : { result };
-      const committed = { ...normalized, workspaceRevision: getRevision() };
-      operation.status = "committed";
+      const succeeded = {
+        operationId,
+        requestId,
+        status: "succeeded",
+        target: operation.target,
+        ...normalized,
+        workspaceRevision: getRevision(),
+      };
+      operation.status = "succeeded";
       operation.phase = "completed";
       operation.completedAt = new Date().toISOString();
-      operation.result = committed;
+      operation.result = succeeded;
       persist(operation);
-      return committed;
+      return succeeded;
     }).catch((cause) => {
       operation.status = cause?.code === "OPERATION_CANCELLED" ? "cancelled" : "failed";
       operation.phase = operation.status === "cancelled" ? "cancelled" : "failed";
@@ -145,7 +161,7 @@ export function createWebMcpMutationRunner({
     });
     mutationQueue = promise.then(() => undefined, () => undefined);
     const response = executionMode === "async"
-      ? Promise.resolve({ operationId, requestId, status: "accepted", workspaceRevision: getRevision() })
+      ? Promise.resolve({ operationId, requestId, status: "accepted", target: operation.target, workspaceRevision: getRevision() })
       : promise;
     cache.set(requestId, { fingerprintHash, response, promise, operationId, executionMode });
     promise.then(evictTerminalEntries, evictTerminalEntries);
@@ -172,7 +188,7 @@ export function createWebMcpMutationRunner({
   runWebMcpMutation.cancelOperation = (operationId) => {
     const operation = operations.get(String(operationId ?? ""));
     if (!operation) throw mutationError(`Mutation operation not found: ${operationId}`, "OPERATION_NOT_FOUND");
-    if (["committed", "failed", "cancelled"].includes(operation.status)) return operationStatusForAgent(operation);
+    if (["succeeded", "failed", "cancelled"].includes(operation.status)) return operationStatusForAgent(operation);
     if (operation.status === "committing") throw mutationError("The operation has crossed its commit boundary.", "TOO_LATE_TO_CANCEL");
     operation.cancelRequested = true;
     operation.status = "cancelling";
@@ -201,7 +217,7 @@ export function createWebMcpMutationRunner({
     const cached = cache.get(String(requestId ?? ""));
     if (!cached) return false;
     const operation = operations.get(cached.operationId);
-    if (!operation || !["cancelled", "committed"].includes(status)) return false;
+    if (!operation || !["cancelled", "succeeded"].includes(status)) return false;
     operation.status = status;
     operation.completedAt = new Date().toISOString();
     operation.result = { ...result, requestId: operation.requestId, status };
@@ -216,6 +232,8 @@ export function createWebMcpMutationRunner({
       const operation = structuredClone(stored);
       operation.fingerprintHash ??= digestFingerprint(operation.fingerprint);
       delete operation.fingerprint;
+      if (operation.status === "committed") operation.status = "succeeded";
+      if (operation.result?.status === "committed") operation.result.status = "succeeded";
       if (["accepted", "running", "cancelling", "committing"].includes(operation.status)) {
         operation.status = "failed";
         operation.phase = "failed";
@@ -232,7 +250,7 @@ export function createWebMcpMutationRunner({
         operationId: operation.operationId,
         executionMode: operation.executionMode ?? "wait",
         response: operation.result,
-        promise: operation.status === "committed" || operation.status === "cancelled"
+        promise: operation.status === "succeeded" || operation.status === "cancelled"
           ? Promise.resolve(structuredClone(operation.result))
           : Promise.reject(mutationError(operation.error?.message ?? "Mutation failed.", operation.error?.code ?? "MUTATION_FAILED")),
       });

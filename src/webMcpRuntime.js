@@ -1,4 +1,4 @@
-export const WEBMCP_CONTRACT_VERSION = "3.1";
+export const WEBMCP_CONTRACT_VERSION = "3.1.1";
 
 export const WEBMCP_REGISTRATION_BUDGET = Object.freeze({
   maxToolCount: 48,
@@ -81,6 +81,8 @@ export function createWebMcpRuntimeHealth() {
     status: "unavailable",
     generation: 0,
     registeredToolCount: 0,
+    callableToolCount: 0,
+    blockedToolCount: 0,
     expectedToolCount: 0,
     schemaBytes: 0,
     propertyCount: 0,
@@ -102,6 +104,8 @@ export function createWebMcpRuntimeHealth() {
         status: "registering",
         generation,
         registeredToolCount,
+        callableToolCount: registeredToolCount,
+        blockedToolCount: Math.max(0, Number(expectedToolCount ?? 0) - registeredToolCount),
         expectedToolCount,
         schemaBytes: metrics?.schemaBytes ?? 0,
         propertyCount: metrics?.propertyCount ?? 0,
@@ -115,6 +119,8 @@ export function createWebMcpRuntimeHealth() {
         status: degraded || failures.size ? "degraded" : "available",
         generation,
         registeredToolCount,
+        callableToolCount: Math.max(0, registeredToolCount - failures.size),
+        blockedToolCount: failures.size,
         expectedToolCount,
         schemaBytes: metrics?.schemaBytes ?? state.schemaBytes,
         propertyCount: metrics?.propertyCount ?? state.propertyCount,
@@ -137,11 +143,13 @@ export function createWebMcpRuntimeHealth() {
           code: cause?.code ?? "WEBMCP_REGISTRATION_FAILED",
           message: limitExceeded ? "WebMCP tool configuration exceeds the supported registration budget." : "WebMCP tool publication failed.",
         },
+        callableToolCount: restored ? state.registeredToolCount : 0,
+        blockedToolCount: restored ? failures.size : state.expectedToolCount,
         refreshRequired: !restored,
       });
     },
     markUnavailable() {
-      update({ status: "unavailable", registeredToolCount: 0, refreshRequired: false });
+      update({ status: "unavailable", registeredToolCount: 0, callableToolCount: 0, blockedToolCount: 0, refreshRequired: false });
     },
     record(toolName, cause) {
       if (!(cause instanceof SyntaxError) && cause?.code !== "WEBMCP_EXECUTION_SYNTAX_ERROR") return;
@@ -165,14 +173,14 @@ export function createWebMcpRuntimeHealth() {
       });
     },
     assertExecutable(generation, { core = false, mutation = false } = {}) {
-      if (core) return;
+      if (core && !mutation) return;
       if (state.status === "registering" || state.status === "stale" || state.status === "limit-exceeded") {
         const error = new Error("WebMCP tools are being refreshed. Fetch the current toolset and retry.");
         error.code = "WEBMCP_REFRESH_REQUIRED";
         error.refreshRequired = true;
         throw error;
       }
-      if (generation !== state.generation) {
+      if (!core && generation !== state.generation) {
         const error = new Error("This WebMCP tool belongs to a stale registration generation.");
         error.code = "WEBMCP_STALE_GENERATION";
         error.refreshRequired = true;
