@@ -4,14 +4,50 @@ const FORMULA_MAX_TOKENS = 512;
 
 const CAST_TYPES = new Set(["VARCHAR", "BIGINT", "DOUBLE", "BOOLEAN", "DATE", "TIMESTAMP"]);
 const NUMERIC_TYPES = new Set(["BIGINT", "DOUBLE"]);
-const STRING_FUNCTIONS = Object.freeze({
-  trim: { min: 1, max: 1, returnType: "VARCHAR" },
-  upper: { min: 1, max: 1, returnType: "VARCHAR" },
-  lower: { min: 1, max: 1, returnType: "VARCHAR" },
-  length: { min: 1, max: 1, returnType: "BIGINT" },
-  substring: { min: 2, max: 3, returnType: "VARCHAR" },
-  replace: { min: 3, max: 3, returnType: "VARCHAR" },
+const DATE_PARTS = new Set(["year", "quarter", "month", "week", "day", "hour", "minute", "second"]);
+const DATE_ADD_INTERVALS = Object.freeze({
+  year: "1 year",
+  quarter: "3 months",
+  month: "1 month",
+  week: "1 week",
+  day: "1 day",
+  hour: "1 hour",
+  minute: "1 minute",
+  second: "1 second",
+});
+const FUNCTION_RULES = Object.freeze({
+  trim: { min: 1, max: 1, returnType: "VARCHAR", stringArgs: [0] },
+  ltrim: { min: 1, max: 1, returnType: "VARCHAR", stringArgs: [0] },
+  rtrim: { min: 1, max: 1, returnType: "VARCHAR", stringArgs: [0] },
+  upper: { min: 1, max: 1, returnType: "VARCHAR", stringArgs: [0] },
+  lower: { min: 1, max: 1, returnType: "VARCHAR", stringArgs: [0] },
+  length: { min: 1, max: 1, returnType: "BIGINT", stringArgs: [0] },
+  substring: { min: 2, max: 3, returnType: "VARCHAR", stringArgs: [0], numericArgs: [1, 2] },
+  left: { min: 2, max: 2, returnType: "VARCHAR", stringArgs: [0], numericArgs: [1] },
+  right: { min: 2, max: 2, returnType: "VARCHAR", stringArgs: [0], numericArgs: [1] },
+  replace: { min: 3, max: 3, returnType: "VARCHAR", stringArgs: [0, 1, 2] },
   concat: { min: 2, max: Number.POSITIVE_INFINITY, returnType: "VARCHAR" },
+  contains: { min: 2, max: 2, returnType: "BOOLEAN", stringArgs: [0, 1] },
+  starts_with: { min: 2, max: 2, returnType: "BOOLEAN", stringArgs: [0, 1] },
+  ends_with: { min: 2, max: 2, returnType: "BOOLEAN", stringArgs: [0, 1] },
+  split_part: { min: 3, max: 3, returnType: "VARCHAR", stringArgs: [0, 1], numericArgs: [2] },
+  lpad: { min: 3, max: 3, returnType: "VARCHAR", stringArgs: [0, 2], numericArgs: [1] },
+  rpad: { min: 3, max: 3, returnType: "VARCHAR", stringArgs: [0, 2], numericArgs: [1] },
+  repeat: { min: 2, max: 2, returnType: "VARCHAR", stringArgs: [0], numericArgs: [1] },
+  reverse: { min: 1, max: 1, returnType: "VARCHAR", stringArgs: [0] },
+  abs: { min: 1, max: 1, returnArg: 0, numericArgs: [0] },
+  round: { min: 1, max: 2, returnArg: 0, numericArgs: [0, 1] },
+  floor: { min: 1, max: 1, returnArg: 0, numericArgs: [0] },
+  ceil: { min: 1, max: 1, returnArg: 0, numericArgs: [0] },
+  power: { min: 2, max: 2, returnType: "DOUBLE", numericArgs: [0, 1] },
+  sqrt: { min: 1, max: 1, returnType: "DOUBLE", numericArgs: [0] },
+  sign: { min: 1, max: 1, returnType: "BIGINT", numericArgs: [0] },
+  year: { min: 1, max: 1, returnType: "BIGINT", dateArgs: [0] },
+  month: { min: 1, max: 1, returnType: "BIGINT", dateArgs: [0] },
+  day: { min: 1, max: 1, returnType: "BIGINT", dateArgs: [0] },
+  date_trunc: { min: 2, max: 2, returnType: "TIMESTAMP", datePartArg: 0, dateArgs: [1] },
+  date_diff: { min: 3, max: 3, returnType: "BIGINT", datePartArg: 0, dateArgs: [1, 2] },
+  date_add: { min: 3, max: 3, returnType: "TIMESTAMP", datePartArg: 0, numericArgs: [1], dateArgs: [2] },
 });
 
 export const CALCULATION_CATALOG = Object.freeze({
@@ -23,18 +59,46 @@ export const CALCULATION_CATALOG = Object.freeze({
     operators: ["+", "-", "*", "/", "%", "=", "!=", "<>", ">", ">=", "<", "<=", "AND", "OR", "NOT"],
   },
   functions: [
-    { name: "if", signature: "IF(condition, value_if_true, value_if_false)", arguments: ["condition", "value_if_true", "value_if_false"], description: "Choose a value from a condition." },
-    { name: "coalesce", signature: "COALESCE(value1, value2, ...)", arguments: ["value1", "value2", "..."], variadic: true, description: "Return the first non-null value." },
-    { name: "ifnull", signature: "IFNULL(value, fallback)", arguments: ["value", "fallback"], description: "Return a fallback when a value is null." },
-    { name: "trim", signature: "TRIM(text)", arguments: ["text"], description: "Remove surrounding whitespace." },
-    { name: "upper", signature: "UPPER(text)", arguments: ["text"], description: "Convert text to uppercase." },
-    { name: "lower", signature: "LOWER(text)", arguments: ["text"], description: "Convert text to lowercase." },
-    { name: "length", signature: "LENGTH(text)", arguments: ["text"], description: "Count characters in text." },
-    { name: "substring", signature: "SUBSTRING(text, start, length)", arguments: ["text", "start", "length"], optionalArguments: [2], description: "Extract part of a text value." },
-    { name: "replace", signature: "REPLACE(text, from, to)", arguments: ["text", "from", "to"], description: "Replace literal text." },
-    { name: "concat", signature: "CONCAT(value1, value2, ...)", arguments: ["value1", "value2", "..."], variadic: true, description: "Join values as text." },
-    { name: "cast", signature: "CAST(value AS TYPE)", arguments: ["value", "TYPE"], description: "Convert a value and fail the step on invalid input." },
-    { name: "try_cast", signature: "TRY_CAST(value AS TYPE)", arguments: ["value", "TYPE"], description: "Convert a value and return null on invalid input." },
+    { name: "if", signature: "IF(condition, value_if_true, value_if_false)", arguments: ["condition", "value_if_true", "value_if_false"], description: "Choose a value from a condition.", example: "IF([Amount] >= 1000, 'High', 'Standard')" },
+    { name: "coalesce", signature: "COALESCE(value1, value2, ...)", arguments: ["value1", "value2", "..."], variadic: true, description: "Return the first non-null value.", example: "COALESCE([Phone], [Mobile], 'Unknown')" },
+    { name: "ifnull", signature: "IFNULL(value, fallback)", arguments: ["value", "fallback"], description: "Return a fallback when a value is null.", example: "IFNULL([Discount], 0)" },
+    { name: "nullif", signature: "NULLIF(value, match)", arguments: ["value", "match"], description: "Return null when two values match.", example: "NULLIF([Email], '')" },
+    { name: "trim", signature: "TRIM(text)", arguments: ["text"], description: "Remove surrounding whitespace.", example: "TRIM([Customer Name])" },
+    { name: "ltrim", signature: "LTRIM(text)", arguments: ["text"], description: "Remove whitespace from the left.", example: "LTRIM([Customer Name])" },
+    { name: "rtrim", signature: "RTRIM(text)", arguments: ["text"], description: "Remove whitespace from the right.", example: "RTRIM([Customer Name])" },
+    { name: "upper", signature: "UPPER(text)", arguments: ["text"], description: "Convert text to uppercase.", example: "UPPER([Service])" },
+    { name: "lower", signature: "LOWER(text)", arguments: ["text"], description: "Convert text to lowercase.", example: "LOWER([Email])" },
+    { name: "length", signature: "LENGTH(text)", arguments: ["text"], description: "Count characters in text.", example: "LENGTH([Tracking Number])" },
+    { name: "substring", signature: "SUBSTRING(text, start, length)", arguments: ["text", "start", "length"], optionalArguments: [2], description: "Extract part of a text value.", example: "SUBSTRING([Tracking Number], 1, 3)" },
+    { name: "left", signature: "LEFT(text, count)", arguments: ["text", "count"], description: "Extract characters from the left.", example: "LEFT([Tracking Number], 3)" },
+    { name: "right", signature: "RIGHT(text, count)", arguments: ["text", "count"], description: "Extract characters from the right.", example: "RIGHT([Tracking Number], 4)" },
+    { name: "replace", signature: "REPLACE(text, from, to)", arguments: ["text", "from", "to"], description: "Replace literal text.", example: "REPLACE([Status], ' ', '_')" },
+    { name: "concat", signature: "CONCAT(value1, value2, ...)", arguments: ["value1", "value2", "..."], variadic: true, description: "Join values as text.", example: "CONCAT([First Name], ' ', [Last Name])" },
+    { name: "contains", signature: "CONTAINS(text, search)", arguments: ["text", "search"], description: "Check whether text contains a value.", example: "CONTAINS([Notes], 'urgent')" },
+    { name: "starts_with", signature: "STARTS_WITH(text, prefix)", arguments: ["text", "prefix"], description: "Check whether text starts with a value.", example: "STARTS_WITH([Tracking Number], 'DCI')" },
+    { name: "ends_with", signature: "ENDS_WITH(text, suffix)", arguments: ["text", "suffix"], description: "Check whether text ends with a value.", example: "ENDS_WITH([Filename], '.csv')" },
+    { name: "split_part", signature: "SPLIT_PART(text, delimiter, index)", arguments: ["text", "delimiter", "index"], description: "Return one 1-based part of split text.", example: "SPLIT_PART([Email], '@', 2)" },
+    { name: "lpad", signature: "LPAD(text, length, fill)", arguments: ["text", "length", "fill"], description: "Pad text on the left to a target length.", example: "LPAD(CAST([Zone] AS VARCHAR), 5, '0')" },
+    { name: "rpad", signature: "RPAD(text, length, fill)", arguments: ["text", "length", "fill"], description: "Pad text on the right to a target length.", example: "RPAD([Code], 8, '0')" },
+    { name: "repeat", signature: "REPEAT(text, count)", arguments: ["text", "count"], description: "Repeat text a number of times.", example: "REPEAT([Marker], 3)" },
+    { name: "reverse", signature: "REVERSE(text)", arguments: ["text"], description: "Reverse the characters in text.", example: "REVERSE([Code])" },
+    { name: "abs", signature: "ABS(number)", arguments: ["number"], description: "Return the absolute numeric value.", example: "ABS([Weight Gap])" },
+    { name: "round", signature: "ROUND(number, digits)", arguments: ["number", "digits"], optionalArguments: [1], description: "Round a number to decimal digits.", example: "ROUND([Amount], 2)" },
+    { name: "floor", signature: "FLOOR(number)", arguments: ["number"], description: "Round a number down.", example: "FLOOR([Weight])" },
+    { name: "ceil", signature: "CEIL(number)", arguments: ["number"], description: "Round a number up.", example: "CEIL([Weight])" },
+    { name: "greatest", signature: "GREATEST(value1, value2, ...)", arguments: ["value1", "value2", "..."], variadic: true, description: "Return the greatest compatible value.", example: "GREATEST([Actual Weight], [Chargeable Weight])" },
+    { name: "least", signature: "LEAST(value1, value2, ...)", arguments: ["value1", "value2", "..."], variadic: true, description: "Return the least compatible value.", example: "LEAST([Actual Weight], [Chargeable Weight])" },
+    { name: "power", signature: "POWER(number, exponent)", arguments: ["number", "exponent"], description: "Raise a number to an exponent.", example: "POWER([Length], 2)" },
+    { name: "sqrt", signature: "SQRT(number)", arguments: ["number"], description: "Return the square root of a number.", example: "SQRT([Area])" },
+    { name: "sign", signature: "SIGN(number)", arguments: ["number"], description: "Return -1, 0, or 1 for a number.", example: "SIGN([Weight Gap])" },
+    { name: "year", signature: "YEAR(date)", arguments: ["date"], description: "Return the year from a date or timestamp.", example: "YEAR(TRY_CAST([Created at] AS TIMESTAMP))" },
+    { name: "month", signature: "MONTH(date)", arguments: ["date"], description: "Return the month number from a date or timestamp.", example: "MONTH(TRY_CAST([Created at] AS TIMESTAMP))" },
+    { name: "day", signature: "DAY(date)", arguments: ["date"], description: "Return the day of month from a date or timestamp.", example: "DAY(TRY_CAST([Created at] AS TIMESTAMP))" },
+    { name: "date_trunc", signature: "DATE_TRUNC(part, date)", arguments: ["part", "date"], description: "Truncate a date or timestamp to a supported part.", example: "DATE_TRUNC('month', TRY_CAST([Created at] AS TIMESTAMP))" },
+    { name: "date_diff", signature: "DATE_DIFF(part, start, end)", arguments: ["part", "start", "end"], description: "Count date-part boundaries between two values.", example: "DATE_DIFF('day', TRY_CAST([Sent at] AS DATE), TRY_CAST([Received at] AS DATE))" },
+    { name: "date_add", signature: "DATE_ADD(part, amount, date)", arguments: ["part", "amount", "date"], description: "Add an amount of a supported date part.", example: "DATE_ADD('day', 7, TRY_CAST([Created at] AS TIMESTAMP))" },
+    { name: "cast", signature: "CAST(value AS TYPE)", arguments: ["value", "TYPE"], description: "Convert a value and fail the step on invalid input.", example: "CAST([Zone] AS VARCHAR)" },
+    { name: "try_cast", signature: "TRY_CAST(value AS TYPE)", arguments: ["value", "TYPE"], description: "Convert a value and return null on invalid input.", example: "TRY_CAST([Amount text] AS DOUBLE)" },
   ],
   castTypes: [...CAST_TYPES],
   examples: [
@@ -305,6 +369,22 @@ function requireNumeric(type, node) {
   if (!NUMERIC_TYPES.has(type) && type !== "UNKNOWN" && type !== "NULL") throw new FormulaError("Arithmetic operands must be numeric.", node.start, node.end, "TYPE_MISMATCH");
 }
 
+function requireString(type, node) {
+  if (!["VARCHAR", "UNKNOWN", "NULL"].includes(type)) throw new FormulaError("Text function arguments must be VARCHAR.", node.start, node.end, "TYPE_MISMATCH");
+}
+
+function requireDate(type, node) {
+  if (!["DATE", "TIMESTAMP", "UNKNOWN", "NULL"].includes(type)) throw new FormulaError("Date function arguments must be DATE or TIMESTAMP.", node.start, node.end, "TYPE_MISMATCH");
+}
+
+function requireDatePart(node) {
+  const part = node?.kind === "literal" && node.literalType === "string" ? String(node.value).toLowerCase() : null;
+  if (!part || !DATE_PARTS.has(part)) {
+    throw new FormulaError(`Date part must be one of: ${[...DATE_PARTS].join(", ")}.`, node?.start ?? 0, node?.end ?? 1, "INVALID_DATE_PART");
+  }
+  return part;
+}
+
 function analyze(ast, schema) {
   const exact = new Map(schema.map((column) => [column.name, column]));
   const referenced = [];
@@ -351,18 +431,19 @@ function analyze(ast, schema) {
         requireBoolean(argTypes[0], node.args[0]);
         return commonType(argTypes.slice(1), node);
       }
-      if (node.name === "coalesce" || node.name === "ifnull") {
-        const expected = node.name === "ifnull" ? [2, 2] : [2, Number.POSITIVE_INFINITY];
+      if (["coalesce", "ifnull", "nullif", "greatest", "least"].includes(node.name)) {
+        const expected = ["ifnull", "nullif"].includes(node.name) ? [2, 2] : [2, Number.POSITIVE_INFINITY];
         if (node.args.length < expected[0] || node.args.length > expected[1]) throw new FormulaError(`${node.name} expects ${expected[0]}${Number.isFinite(expected[1]) ? "" : " or more"} arguments.`, node.start, node.end, "INVALID_ARGUMENT_COUNT");
         return commonType(argTypes, node);
       }
-      const definition = STRING_FUNCTIONS[node.name];
+      const definition = FUNCTION_RULES[node.name];
       if (!definition) throw new FormulaError(`Function "${node.name}" is not supported.`, node.start, node.end, "UNSUPPORTED_FUNCTION");
       if (node.args.length < definition.min || node.args.length > definition.max) throw new FormulaError(`${node.name} expects ${definition.min}${definition.max !== definition.min ? `-${definition.max}` : ""} arguments.`, node.start, node.end, "INVALID_ARGUMENT_COUNT");
-      if (node.name === "substring") {
-        requireNumeric(argTypes[1], node.args[1]);
-        if (node.args[2]) requireNumeric(argTypes[2], node.args[2]);
-      }
+      definition.stringArgs?.forEach((index) => { if (node.args[index]) requireString(argTypes[index], node.args[index]); });
+      definition.numericArgs?.forEach((index) => { if (node.args[index]) requireNumeric(argTypes[index], node.args[index]); });
+      definition.dateArgs?.forEach((index) => { if (node.args[index]) requireDate(argTypes[index], node.args[index]); });
+      if (Number.isInteger(definition.datePartArg)) requireDatePart(node.args[definition.datePartArg]);
+      if (Number.isInteger(definition.returnArg)) return argTypes[definition.returnArg];
       return definition.returnType;
     }
     throw new FormulaError("Unsupported expression node.", node.start, node.end);
@@ -395,6 +476,10 @@ function compileAst(node) {
   }
   if (node.kind === "cast") return `${node.safe ? "TRY_CAST" : "CAST"}(${compileAst(node.value)} AS ${node.targetType})`;
   if (node.kind === "call") {
+    if (node.name === "date_add") {
+      const part = String(node.args[0].value).toLowerCase();
+      return `DATE_ADD(${compileAst(node.args[2])}, (${compileAst(node.args[1])}) * INTERVAL ${quoteString(DATE_ADD_INTERVALS[part])})`;
+    }
     const functionName = node.name === "ifnull" ? "COALESCE" : node.name.toUpperCase();
     return `${functionName}(${node.args.map(compileAst).join(", ")})`;
   }

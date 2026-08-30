@@ -22,6 +22,14 @@ const SAFE_OPERATION_RESULT_KEYS = new Set([
   "confirmed",
 ]);
 
+const SAFE_ERROR_RECOVERY = {
+  STALE_VALUE_REFERENCE: {
+    requiredAction: "query-column-values",
+    recommendedWorkspace: "prepare",
+    retryable: true,
+  },
+};
+
 export function sanitizeWebMcpError(cause) {
   const code = String(cause?.code ?? "WEBMCP_OPERATION_FAILED");
   const safeMessages = {
@@ -52,10 +60,13 @@ export function sanitizeWebMcpError(cause) {
     PREPARED_NOT_ACTIVE: "Open the required prepared dataset before running this action.",
     PROTECTED_VALUE_NOT_RESTORABLE: "The protected value no longer has a matching saved value in the current workspace state.",
     PROTECTED_VALUE_BINDING_MISMATCH: "The protected value binding does not match the current workspace state.",
+    STALE_VALUE_REFERENCE: "The protected value reference expired after the data context changed. Query column values again and retry with the new valueRef.",
   };
+  const recovery = SAFE_ERROR_RECOVERY[code] ?? {};
   return {
     code,
     message: safeMessages[code] ?? "The operation failed with a structured WebMCP error.",
+    ...recovery,
     ...(cause?.targetId ? { targetId: cause.targetId } : {}),
     ...(cause?.stepId ? { stepId: cause.stepId } : {}),
     ...(cause?.parameter ? { parameter: cause.parameter } : {}),
@@ -74,9 +85,9 @@ export function webMcpErrorForAgent(cause, metadata = {}) {
     ...(cause?.targetId ? { targetId: cause.targetId } : {}),
     ...(cause?.stepId ? { stepId: cause.stepId } : {}),
     ...(cause?.parameter ? { parameter: cause.parameter } : {}),
-    ...(cause?.requiredAction ? { requiredAction: cause.requiredAction } : {}),
-    ...(cause?.recommendedWorkspace ? { recommendedWorkspace: cause.recommendedWorkspace } : {}),
-    ...(typeof cause?.retryable === "boolean" ? { retryable: cause.retryable } : {}),
+    ...(safe.requiredAction || cause?.requiredAction ? { requiredAction: cause?.requiredAction ?? safe.requiredAction } : {}),
+    ...(safe.recommendedWorkspace || cause?.recommendedWorkspace ? { recommendedWorkspace: cause?.recommendedWorkspace ?? safe.recommendedWorkspace } : {}),
+    ...(typeof cause?.retryable === "boolean" || typeof safe.retryable === "boolean" ? { retryable: cause?.retryable ?? safe.retryable } : {}),
     ...(Array.isArray(cause?.sourceAssetIds) ? { sourceAssetIds: [...cause.sourceAssetIds] } : {}),
     ...(Array.isArray(cause?.blockedDependencyIds) ? { blockedDependencyIds: [...cause.blockedDependencyIds] } : {}),
     ...(Number.isInteger(metadata.generation) ? { generation: metadata.generation } : {}),

@@ -129,6 +129,7 @@ export function FormulaColumnEditor({
   const [previewError, setPreviewError] = useState("");
   const [autocomplete, setAutocomplete] = useState(null);
   const [activeSuggestion, setActiveSuggestion] = useState(0);
+  const [selectedCatalogFunction, setSelectedCatalogFunction] = useState(null);
   const [cursorPosition, setCursorPosition] = useState((initialParams?.expression ?? "").length);
   const outputInputRef = useRef(null);
   const textareaRef = useRef(null);
@@ -138,13 +139,16 @@ export function FormulaColumnEditor({
     () => findFormulaFunctionContext(expression, cursorPosition),
     [expression, cursorPosition],
   );
+  const functionHelpContext = selectedCatalogFunction
+    ? { item: selectedCatalogFunction, argumentIndex: 0, closed: false, catalogSelection: true }
+    : functionContext;
   const primaryDiagnostic = validation.diagnostics[0] ?? null;
   const hideArityDiagnostic = functionContext && primaryDiagnostic?.code === "INVALID_ARGUMENT_COUNT";
-  const functionArguments = functionContext?.item.arguments ?? [];
-  const functionArgumentIndex = functionContext ? Math.min(
-    functionContext.closed && primaryDiagnostic?.code === "INVALID_ARGUMENT_COUNT"
-      ? functionContext.argumentIndex + 1
-      : functionContext.argumentIndex,
+  const functionArguments = functionHelpContext?.item.arguments ?? [];
+  const functionArgumentIndex = functionHelpContext ? Math.min(
+    !functionHelpContext.catalogSelection && functionHelpContext.closed && primaryDiagnostic?.code === "INVALID_ARGUMENT_COUNT"
+      ? functionHelpContext.argumentIndex + 1
+      : functionHelpContext.argumentIndex,
     Math.max(0, functionArguments.length - 1),
   ) : 0;
   const originalOutput = String(initialParams?.outputColumn ?? "").trim().toLocaleLowerCase("id-ID");
@@ -211,7 +215,20 @@ export function FormulaColumnEditor({
     setAutocomplete(null);
   };
 
+  const insertCatalogFunction = (item) => {
+    const start = textareaRef.current?.selectionStart ?? cursorPosition ?? expression.length;
+    const end = textareaRef.current?.selectionEnd ?? start;
+    const replacement = `${item.name.toUpperCase()}()`;
+    const next = `${expression.slice(0, start)}${replacement}${expression.slice(end)}`;
+    const cursor = start + replacement.length - 1;
+    pendingCursorRef.current = cursor;
+    setExpression(next);
+    setPreview(null);
+    setAutocomplete(null);
+  };
+
   const handleFormulaKeyDown = (event) => {
+    setSelectedCatalogFunction(null);
     if (!autocomplete || !suggestions.length) return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
@@ -254,88 +271,136 @@ export function FormulaColumnEditor({
         <button type="button" onClick={onCancel} aria-label={t("closeForm")}><X /></button>
       </header>
 
-      <label className="formula-editor__field">
-        <span>{t("formulaOutputColumn")}</span>
-        <input ref={outputInputRef} value={outputColumn} onChange={(event) => { setOutputColumn(event.target.value); setPreview(null); }} placeholder={t("formulaOutputPlaceholder")} />
-      </label>
-      {outputCollision && <p className="formula-editor__diagnostic" role="alert">{t("formulaCreateOnlyCollision")}</p>}
-
-      <label className="formula-editor__field">
-        <span>{t("formulaExpression")}</span>
-        <div className="formula-editor__expression">
-          <textarea
-            ref={textareaRef}
-            value={expression}
-            onChange={(event) => {
-              setExpression(event.target.value);
-              setPreview(null);
-              updateAutocomplete(event.target.value, event.target.selectionStart);
-            }}
-            onKeyDown={handleFormulaKeyDown}
-            onClick={(event) => updateAutocomplete(expression, event.currentTarget.selectionStart)}
-            onSelect={(event) => setCursorPosition(event.currentTarget.selectionStart)}
-            onBlur={() => setAutocomplete(null)}
-            spellCheck="false"
-            placeholder="CASE WHEN [Amount] >= 1000 THEN 'High' ELSE 'Standard' END"
-            role="combobox"
-            aria-autocomplete="list"
-            aria-expanded={Boolean(autocomplete && suggestions.length)}
-            aria-controls="formula-suggestions"
-            aria-activedescendant={autocomplete && suggestions.length ? `formula-suggestion-${activeSuggestion}` : undefined}
-          />
-          {autocomplete && suggestions.length > 0 && (
-            <ul id="formula-suggestions" className="formula-editor__suggestions" role="listbox" aria-label={autocomplete.kind === "column" ? t("formulaColumnSuggestions") : t("formulaFunctionSuggestions")}>
-              {suggestions.map((suggestion, index) => (
-                <li
-                  id={`formula-suggestion-${index}`}
-                  key={`${suggestion.kind}-${suggestion.key}`}
-                  role="option"
-                  aria-selected={index === activeSuggestion}
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => chooseSuggestion(suggestion)}
+      <div className="formula-editor__body">
+        <aside className="formula-editor__catalog" aria-label={t("formulaFunctions")}>
+          <header>
+            <strong>{t("formulaFunctions")}</strong>
+            <span>{t("formulaFunctionsHint")}</span>
+          </header>
+          <ul>
+            {CALCULATION_CATALOG.functions.map((item) => (
+              <li key={item.name}>
+                <button
+                  type="button"
+                  onClick={() => setSelectedCatalogFunction(item)}
+                  onDoubleClick={() => insertCatalogFunction(item)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter") return;
+                    event.preventDefault();
+                    setSelectedCatalogFunction(item);
+                    insertCatalogFunction(item);
+                  }}
+                  aria-label={`${t("formulaSelectFunction")}: ${item.signature}`}
+                  aria-pressed={selectedCatalogFunction?.name === item.name}
+                  title={t("formulaFunctionsHint")}
                 >
-                  <strong>{suggestion.label}</strong><span>{suggestion.meta}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-          {functionContext && functionArguments.length > 0 && (
-            <div className="formula-editor__function-help" role="status" aria-label={t("formulaFunctionSyntax")}>
-              <code>
-                <strong>{functionContext.item.name.toUpperCase()}(</strong>
-                {functionArguments.map((argument, index) => (
-                  <span key={`${functionContext.item.name}-${argument}-${index}`}>
-                    {index > 0 && <span>{functionContext.item.name.includes("cast") ? " AS " : ", "}</span>}
-                    <mark className={index === functionArgumentIndex ? "is-active" : ""}>{argument}</mark>
-                  </span>
-                ))}
-                <strong>)</strong>
-              </code>
-              <span>{t("formulaActiveArgument", { count: functionArgumentIndex + 1, argument: functionArguments[functionArgumentIndex] })}</span>
+                  <strong>{item.name.toUpperCase()}</strong>
+                  <span>{item.signature.slice(item.signature.indexOf("("))}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </aside>
+
+        <div className="formula-editor__workspace">
+          <label className="formula-editor__field">
+            <span>{t("formulaOutputColumn")}</span>
+            <input ref={outputInputRef} value={outputColumn} onChange={(event) => { setOutputColumn(event.target.value); setPreview(null); }} placeholder={t("formulaOutputPlaceholder")} />
+          </label>
+          {outputCollision && <p className="formula-editor__diagnostic" role="alert">{t("formulaCreateOnlyCollision")}</p>}
+
+          <label className="formula-editor__field">
+            <span>{t("formulaExpression")}</span>
+            <div className="formula-editor__expression">
+              <textarea
+                ref={textareaRef}
+                value={expression}
+                onChange={(event) => {
+                  setExpression(event.target.value);
+                  setPreview(null);
+                  setSelectedCatalogFunction(null);
+                  updateAutocomplete(event.target.value, event.target.selectionStart);
+                }}
+                onKeyDown={handleFormulaKeyDown}
+                onClick={(event) => {
+                  setSelectedCatalogFunction(null);
+                  updateAutocomplete(expression, event.currentTarget.selectionStart);
+                }}
+                onSelect={(event) => {
+                  setSelectedCatalogFunction(null);
+                  setCursorPosition(event.currentTarget.selectionStart);
+                }}
+                onBlur={() => setAutocomplete(null)}
+                spellCheck="false"
+                placeholder="CASE WHEN [Amount] >= 1000 THEN 'High' ELSE 'Standard' END"
+                role="combobox"
+                aria-autocomplete="list"
+                aria-expanded={Boolean(autocomplete && suggestions.length)}
+                aria-controls="formula-suggestions"
+                aria-activedescendant={autocomplete && suggestions.length ? `formula-suggestion-${activeSuggestion}` : undefined}
+              />
+              {autocomplete && suggestions.length > 0 && (
+                <ul id="formula-suggestions" className="formula-editor__suggestions" role="listbox" aria-label={autocomplete.kind === "column" ? t("formulaColumnSuggestions") : t("formulaFunctionSuggestions")}>
+                  {suggestions.map((suggestion, index) => (
+                    <li
+                      id={`formula-suggestion-${index}`}
+                      key={`${suggestion.kind}-${suggestion.key}`}
+                      role="option"
+                      aria-selected={index === activeSuggestion}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => chooseSuggestion(suggestion)}
+                    >
+                      <strong>{suggestion.label}</strong><span>{suggestion.meta}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {functionHelpContext && functionArguments.length > 0 && (
+                <div className="formula-editor__function-help" role="status" aria-label={t("formulaFunctionSyntax")}>
+                  <div className="formula-editor__function-syntax">
+                    <code>
+                      <strong>{functionHelpContext.item.name.toUpperCase()}(</strong>
+                      {functionArguments.map((argument, index) => (
+                        <span key={`${functionHelpContext.item.name}-${argument}-${index}`}>
+                          {index > 0 && <span>{functionHelpContext.item.name.includes("cast") ? " AS " : ", "}</span>}
+                          <mark className={index === functionArgumentIndex ? "is-active" : ""}>{argument}</mark>
+                        </span>
+                      ))}
+                      <strong>)</strong>
+                    </code>
+                    <span>{t("formulaActiveArgument", { count: functionArgumentIndex + 1, argument: functionArguments[functionArgumentIndex] })}</span>
+                  </div>
+                  <p>{functionHelpContext.item.description}</p>
+                  <div className="formula-editor__function-example">
+                    <span>{t("formulaExample")}</span>
+                    <code>{functionHelpContext.item.example}</code>
+                  </div>
+                </div>
+              )}
             </div>
+          </label>
+
+          {validation.valid ? (
+            <div className="formula-editor__status" role="status">
+              <span>{t("formulaInferredType")}: <strong>{validation.inferredType}</strong></span>
+              <span>{t("formulaReferences")}: <strong>{validation.referencedColumns.join(", ") || t("none")}</strong></span>
+            </div>
+          ) : expression.trim() && !hideArityDiagnostic ? (
+            <p className="formula-editor__diagnostic" role="alert">
+              {primaryDiagnostic?.message} {t("formulaAtCharacter", { count: (primaryDiagnostic?.start ?? 0) + 1 })}
+            </p>
+          ) : null}
+
+          {(error || previewError) && <div className="formula-editor__error" role="alert"><WarningCircle weight="fill" />{error || previewError}</div>}
+
+          {preview && (
+            <section className="formula-editor__preview" aria-label={t("formulaPreview")}>
+              <strong>{t("formulaPreview")}</strong>
+              <div><table><thead><tr>{preview.columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{preview.preview.map((row, index) => <tr key={index}>{preview.columns.map((column) => <td key={column}>{row[column] === null || row[column] === undefined ? t("emptyValue") : String(row[column])}</td>)}</tr>)}</tbody></table></div>
+            </section>
           )}
         </div>
-      </label>
-
-      {validation.valid ? (
-        <div className="formula-editor__status" role="status">
-          <span>{t("formulaInferredType")}: <strong>{validation.inferredType}</strong></span>
-          <span>{t("formulaReferences")}: <strong>{validation.referencedColumns.join(", ") || t("none")}</strong></span>
-        </div>
-      ) : expression.trim() && !hideArityDiagnostic ? (
-        <p className="formula-editor__diagnostic" role="alert">
-          {primaryDiagnostic?.message} {t("formulaAtCharacter", { count: (primaryDiagnostic?.start ?? 0) + 1 })}
-        </p>
-      ) : null}
-
-      {(error || previewError) && <div className="formula-editor__error" role="alert"><WarningCircle weight="fill" />{error || previewError}</div>}
-
-      {preview && (
-        <section className="formula-editor__preview" aria-label={t("formulaPreview")}>
-          <strong>{t("formulaPreview")}</strong>
-          <div><table><thead><tr>{preview.columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{preview.preview.map((row, index) => <tr key={index}>{preview.columns.map((column) => <td key={column}>{row[column] === null || row[column] === undefined ? t("emptyValue") : String(row[column])}</td>)}</tr>)}</tbody></table></div>
-        </section>
-      )}
+      </div>
 
       <footer>
         <button type="button" onClick={onCancel}>{t("cancel")}</button>

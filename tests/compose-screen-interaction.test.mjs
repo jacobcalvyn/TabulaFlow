@@ -561,3 +561,30 @@ test("Formula column chooses the first unused default name and does not suggest 
   assert.equal(view.queryByText(/if expects 3 arguments/), null);
   view.unmount();
 });
+
+test("Formula column previews a selected catalog function and only inserts it on double-click", () => {
+  const view = render(React.createElement(LanguageProvider, null, React.createElement(FormulaColumnEditor, {
+    schema: [{ name: "amount", type: "DOUBLE" }],
+    title: "Formula column",
+    submitLabel: "Add",
+    onCancel() {},
+    onSubmit() {},
+  })));
+
+  const catalog = view.getByRole("complementary", { name: "Functions" });
+  assert.equal(within(catalog).getAllByRole("button").length, 40);
+  const formula = view.getByLabelText("Formula");
+  fireEvent.change(formula, { target: { value: "[amount] + ", selectionStart: 11, selectionEnd: 11 } });
+  const ifFunction = within(catalog).getByRole("button", { name: "Select function: IF(condition, value_if_true, value_if_false)" });
+  fireEvent.click(ifFunction);
+  assert.equal(formula.value, "[amount] + ");
+  assert.equal(ifFunction.getAttribute("aria-pressed"), "true");
+  assert.match(view.getByRole("status", { name: "Function syntax" }).textContent, /IF\(condition, value_if_true, value_if_false\)/);
+  assert.match(view.getByRole("status", { name: "Function syntax" }).textContent, /Argument 1: condition/);
+  assert.match(view.getByRole("status", { name: "Function syntax" }).textContent, /ExampleIF\(\[Amount\] >= 1000, 'High', 'Standard'\)/);
+  fireEvent.doubleClick(ifFunction);
+  assert.equal(formula.value, "[amount] + IF()");
+  assert.equal(formula.selectionStart, 14);
+  assert.equal(formula.selectionEnd, 14);
+  view.unmount();
+});

@@ -181,6 +181,23 @@ test("async protected-value failures retain safe structured diagnostics", async 
   assert.equal(JSON.stringify(failed).includes("person@example.com"), false);
 });
 
+test("stale value references expose a safe retry path in terminal operation status", async () => {
+  const run = createWebMcpMutationRunner({ getRevision: () => 3 });
+  const accepted = await run({ expectedRevision: 3, requestId: "stale-value-ref-001", executionMode: "async" }, async () => {
+    const error = new Error("private stale token detail");
+    error.code = "STALE_VALUE_REFERENCE";
+    throw error;
+  }, "prepare:value-action");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const failed = run.getOperationStatus(accepted.operationId);
+  assert.equal(failed.error.code, "STALE_VALUE_REFERENCE");
+  assert.equal(failed.error.requiredAction, "query-column-values");
+  assert.equal(failed.error.recommendedWorkspace, "prepare");
+  assert.equal(failed.error.retryable, true);
+  assert.equal(failed.diagnostics[0].code, "STALE_VALUE_REFERENCE");
+  assert.equal(JSON.stringify(failed).includes("private stale token detail"), false);
+});
+
 test("a cancelled confirmation remains terminal for the original request", async () => {
   const run = createWebMcpMutationRunner({ getRevision: () => 2 });
   const meta = { expectedRevision: 2, requestId: "delete-cancel-001" };

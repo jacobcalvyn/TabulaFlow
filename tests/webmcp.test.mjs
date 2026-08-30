@@ -9,6 +9,7 @@ import {
   createWebMcpTools,
   registerWebMcpTools,
 } from "../src/useWebMcpTools.js";
+import { compileFormula } from "../src/formulaEngine.js";
 import { protectRecipeForAgent, restoreProtectedRecipeValues } from "../src/agentDataProtection.js";
 import { WEBMCP_REGISTRATION_BUDGET, measureWebMcpToolset } from "../src/webMcpRuntime.js";
 
@@ -216,6 +217,89 @@ test("stable dispatchers validate the selected action schema and route against c
   );
 });
 
+test("WebMCP publishes and executes the expanded Formula column catalog through stable dispatchers", async () => {
+  const { calls, ref } = createContext();
+  const formulaSchema = [
+    { name: "status", type: "VARCHAR" },
+    { name: "amount", type: "DOUBLE" },
+    { name: "created_at", type: "TIMESTAMP" },
+    { name: "received_at", type: "TIMESTAMP" },
+  ];
+  const compileStep = (step) => {
+    assert.equal(step.type, "calculated-field");
+    assert.equal(step.params.expressionVersion, 1);
+    return compileFormula(step.params.expression, formulaSchema);
+  };
+  ref.current.actions.previewRecipeChange = async (preparedId, recipe, stepIndex, options) => {
+    const compiled = compileStep(recipe[stepIndex]);
+    calls.push(["formula-preview", preparedId, compiled, options]);
+    return {
+      valid: true,
+      output: { rowCount: 10, columnCount: formulaSchema.length + 1 },
+      schemaDelta: { added: [{ name: recipe[stepIndex].params.outputColumn, type: compiled.inferredType }] },
+      diagnostics: [],
+      saved: false,
+      formula: { sql: compiled.sql, inferredType: compiled.inferredType },
+    };
+  };
+  ref.current.actions.addRecipeStep = async (preparedId, step, meta) => {
+    const compiled = compileStep(step);
+    calls.push(["formula-add", preparedId, compiled, meta]);
+    return {
+      status: "succeeded",
+      workspaceRevision: REVISION + 1,
+      stepId: `step-${step.params.outputColumn}`,
+      formula: { sql: compiled.sql, inferredType: compiled.inferredType },
+    };
+  };
+
+  const stable = createWebMcpStableTools(ref);
+  const prepareRead = toolByName(stable, "tabulaflow_prepare_read");
+  const prepareMutate = toolByName(stable, "tabulaflow_prepare_mutate");
+  const catalog = await prepareRead.execute({ action: "get_calculation_catalog", input: {} });
+  assert.equal(catalog.structuredContent.functions.length, 40);
+  for (const name of ["left", "round", "date_diff"]) {
+    const item = catalog.structuredContent.functions.find((entry) => entry.name === name);
+    assert.ok(item, `Expected ${name} in the WebMCP Formula catalog`);
+    assert.ok(item.description);
+    assert.ok(item.example);
+  }
+
+  const cases = [
+    { outputColumn: "status_prefix", expression: "LEFT([status], 3)", inferredType: "VARCHAR" },
+    { outputColumn: "rounded_amount", expression: "ROUND(ABS([amount]), 2)", inferredType: "DOUBLE" },
+    { outputColumn: "transit_days", expression: "DATE_DIFF('day', [created_at], [received_at])", inferredType: "BIGINT" },
+  ];
+  for (const [index, formula] of cases.entries()) {
+    const step = {
+      id: `formula-${index + 1}`,
+      type: "calculated-field",
+      enabled: true,
+      params: { outputColumn: formula.outputColumn, expression: formula.expression, expressionVersion: 1 },
+    };
+    const preview = await prepareRead.execute({
+      action: "preview_recipe_change",
+      input: { preparedId: "prepared-a", recipe: [step], stepIndex: 0 },
+    });
+    assert.equal(preview.structuredContent.valid, true);
+    assert.equal(preview.structuredContent.formula.inferredType, formula.inferredType);
+
+    const mutationResult = await prepareMutate.execute({
+      action: "add_recipe_step",
+      input: {
+        preparedId: "prepared-a",
+        step: { type: step.type, params: step.params },
+        ...mutation(`formula-catalog-${index + 1}`),
+        executionMode: "wait",
+      },
+    });
+    assert.equal(mutationResult.structuredContent.status, "succeeded");
+    assert.equal(mutationResult.structuredContent.formula.inferredType, formula.inferredType);
+  }
+  assert.equal(calls.filter((call) => call[0] === "formula-preview").length, 3);
+  assert.equal(calls.filter((call) => call[0] === "formula-add").length, 3);
+});
+
 test("WebMCP read plane observes workflow, Prepare data, and Compose data", async () => {
   const { calls, ref } = createContext();
   const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
@@ -250,7 +334,10 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   assert.deepEqual(capabilities.structuredContent.operationLifecycle.terminalStates, ["succeeded", "failed", "cancelled"]);
   assert.deepEqual(capabilities.structuredContent.operationLifecycle.cancelOutcomes, ["CANCEL_ACCEPTED", "ALREADY_TERMINAL", "TOO_LATE_TO_CANCEL"]);
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
+  assert.equal(calculationCatalog.structuredContent.functions.length, 40);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
+  assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "date_add"));
+  assert.equal(calculationCatalog.structuredContent.functions.every((item) => item.description && item.example), true);
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");
   assert.equal(capabilities.structuredContent.safeguards.deletion, "visible-user-confirmation-required");
   assert.equal(capabilities.structuredContent.safeguards.semanticDeclassification, "visible-user-action-required");
@@ -665,6 +752,30 @@ test("registered WebMCP tools preserve safe recovery metadata", async () => {
       && error.sourceAssetIds[0] === "source-a"
       && error.blockedDependencyIds[0] === "prepared-a"
       && !error.message.includes("private source detail"),
+  );
+});
+
+test("registered WebMCP tools derive recovery metadata for expired value references", async () => {
+  const controller = new AbortController();
+  let registered;
+  await registerWebMcpTools({ async registerTool(tool) { registered = tool; } }, [{
+    name: "tabulaflow_stale_value_reference",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    execute() {
+      const error = new Error("private stale token detail");
+      error.code = "STALE_VALUE_REFERENCE";
+      throw error;
+    },
+  }], controller.signal);
+
+  await assert.rejects(
+    () => registered.execute({}),
+    (error) => error.code === "STALE_VALUE_REFERENCE"
+      && error.requiredAction === "query-column-values"
+      && error.recommendedWorkspace === "prepare"
+      && error.retryable === true
+      && error.diagnostics?.[0]?.code === "STALE_VALUE_REFERENCE"
+      && !error.message.includes("private stale token detail"),
   );
 });
 
