@@ -22,7 +22,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "3.2.4", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "3.2.5", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -167,7 +167,7 @@ test("qualitative coding WebMCP uses one bounded dispatcher and keeps approval h
   assert.equal(coding.inputSchema.properties.action.enum.includes("approve"), false);
 });
 
-test("WebMCP 3.2.4 registers one small stable dispatcher surface", () => {
+test("WebMCP 3.2.5 registers one small stable dispatcher surface", () => {
   const { ref } = createContext();
   const stable = createWebMcpStableTools(ref);
   assert.deepEqual(stable.map((tool) => tool.name), WEBMCP_STABLE_TOOL_NAMES);
@@ -236,7 +236,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "3.2.4");
+  assert.equal(capabilities.structuredContent.contractVersion, "3.2.5");
   assert.deepEqual(capabilities.structuredContent.operationLifecycle.terminalStates, ["succeeded", "failed", "cancelled"]);
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
@@ -479,6 +479,9 @@ test("stable dispatchers expose strict action contracts on demand", async () => 
   assert.equal(validation.structuredContent.targetAction, "validate_compose_operation");
   assert.deepEqual(validation.structuredContent.inputSchema.required, ["operation"]);
   assert.equal(new Set(validation.structuredContent.inputSchema.properties.operation.oneOf.map((branch) => branch.properties.kind.const)).size, 8);
+  assert.deepEqual(validation.structuredContent.inputSchema.properties.schemaDeltaDetail.enum, ["summary", "paged"]);
+  assert.equal(validation.structuredContent.inputSchema.properties.schemaDeltaLimit.maximum, 100);
+  assert.equal(validation.structuredContent.inputSchema.additionalProperties, false);
 
   const creation = await composeMutate.execute({
     action: WEBMCP_ACTION_CONTRACT_ACTION,
@@ -486,6 +489,43 @@ test("stable dispatchers expose strict action contracts on demand", async () => 
   });
   assert.deepEqual(creation.structuredContent.inputSchema.required, ["operation", "expectedRevision", "requestId"]);
   assert.equal(new Set(creation.structuredContent.inputSchema.properties.operation.oneOf.map((branch) => branch.properties.kind.const)).size, 8);
+});
+
+test("Compose and recipe dry-runs compact schema deltas by default and expose bounded pages", async () => {
+  const { ref } = createContext();
+  const wideDelta = {
+    baseline: "normalized-binary-input",
+    added: [],
+    removed: [],
+    typeChanged: [],
+    renamed: Array.from({ length: 608 }, (_, index) => ({ from: `field_${index}`, to: `field_${index}_right`, side: "right", type: "VARCHAR" })),
+  };
+  ref.current.actions.validateComposeOperation = async () => ({ valid: true, output: { rowCount: 4, columnCount: 610 }, schemaDelta: wideDelta, diagnostics: [] });
+  ref.current.actions.previewRecipeChange = async () => ({ valid: true, output: { rowCount: 4, columnCount: 610 }, schemaDelta: wideDelta, diagnostics: [], saved: false });
+  const stable = createWebMcpStableTools(ref);
+  const composeRead = toolByName(stable, "tabulaflow_compose_read");
+  const prepareRead = toolByName(stable, "tabulaflow_prepare_read");
+  const operation = { kind: "join", leftId: "prepared-a", rightId: "prepared-b", leftKey: "status", rightKey: "status", joinType: "inner" };
+
+  const summary = await composeRead.execute({ action: "validate_compose_operation", input: { operation } });
+  assert.equal(summary.structuredContent.schemaDelta.counts.renamed, 608);
+  assert.equal(summary.structuredContent.schemaDelta.detailLevel, "summary");
+  assert.equal(Object.hasOwn(summary.structuredContent.schemaDelta, "changes"), false);
+  assert.ok(Buffer.byteLength(JSON.stringify(summary.structuredContent)) < 4_096);
+
+  const page = await composeRead.execute({
+    action: "validate_compose_operation",
+    input: { operation, schemaDeltaDetail: "paged", schemaDeltaLimit: 25, schemaDeltaCursor: "schema-delta:25" },
+  });
+  assert.equal(page.structuredContent.schemaDelta.changes.length, 25);
+  assert.equal(page.structuredContent.schemaDelta.page.nextCursor, "schema-delta:50");
+
+  const recipe = await prepareRead.execute({
+    action: "preview_recipe_change",
+    input: { preparedId: "prepared-a", recipe: [], schemaDeltaDetail: "summary" },
+  });
+  assert.equal(recipe.structuredContent.schemaDelta.counts.total, 608);
+  assert.equal(Object.hasOwn(recipe.structuredContent.schemaDelta, "changes"), false);
 });
 
 test("context-blocked actions stay registered but are not advertised as executable", async () => {

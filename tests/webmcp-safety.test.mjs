@@ -3,7 +3,7 @@ import test from "node:test";
 import { agentPreviewColumnSchema, canExposeProfileRange, classifyColumnSemantics, redactAgentRows } from "../src/dataPrivacy.js";
 import { sanitizeExportBaseName } from "../src/dataExport.js";
 import { buildJoinKeyCandidates, rankJoinKeyCandidates } from "../src/joinRecommendations.js";
-import { schemaDelta } from "../src/schemaDelta.js";
+import { compactSchemaDelta, schemaDelta } from "../src/schemaDelta.js";
 import { nextWorkspaceRevision } from "../src/workspaceRevision.js";
 import { qualityCoverage, qualityProfileBatches } from "../src/qualityProfiling.js";
 import {
@@ -282,6 +282,59 @@ test("unary schema deltas do not replay historical upstream renames", () => {
   const input = [{ name: "score", type: "DOUBLE", semantic: { provenance: { kind: "rename-column", column: "_score" } } }];
   const output = [{ name: "score", type: "DOUBLE", semantic: { provenance: { kind: "rename-column", column: "_score" } } }];
   assert.deepEqual(schemaDelta(input, output).renamed, []);
+});
+
+test("agent schema delta responses default to compact counts and page wide details", () => {
+  const delta = {
+    baseline: "normalized-binary-input",
+    added: [],
+    removed: [],
+    typeChanged: [],
+    renamed: Array.from({ length: 608 }, (_, index) => ({
+      from: `shipment_attribute_${index}`,
+      to: `shipment_attribute_${index}_${index % 2 ? "right" : "left"}`,
+      side: index % 2 ? "right" : "left",
+      type: "VARCHAR",
+    })),
+  };
+
+  const summary = compactSchemaDelta(delta);
+  assert.deepEqual(summary.counts, { added: 0, removed: 0, typeChanged: 0, renamed: 608, total: 608 });
+  assert.equal(summary.detailLevel, "summary");
+  assert.equal(summary.truncated, true);
+  assert.equal(summary.page, null);
+  assert.equal(Object.hasOwn(summary, "changes"), false);
+  assert.ok(Buffer.byteLength(JSON.stringify(summary)) < 2_048);
+
+  const firstPage = compactSchemaDelta(delta, { detailLevel: "paged", limit: 100 });
+  assert.equal(firstPage.changes.length, 100);
+  assert.equal(firstPage.page.nextCursor, "schema-delta:100");
+  assert.equal(firstPage.page.hasMore, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(firstPage)) < 20_000);
+
+  const longNamesDelta = {
+    ...delta,
+    renamed: Array.from({ length: 100 }, (_, index) => ({
+      from: `left_${index}_${"nested_source_path_".repeat(12)}`,
+      to: `right_${index}_${"nested_source_path_".repeat(12)}`,
+      side: "right",
+      type: "VARCHAR",
+    })),
+  };
+  const byteBoundedPage = compactSchemaDelta(longNamesDelta, { detailLevel: "paged", limit: 100 });
+  assert.ok(byteBoundedPage.changes.length < 100);
+  assert.equal(byteBoundedPage.page.hasMore, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(byteBoundedPage)) < 16_000);
+
+  const lastPage = compactSchemaDelta(delta, { detailLevel: "paged", cursor: "schema-delta:600", limit: 100 });
+  assert.equal(lastPage.changes.length, 8);
+  assert.equal(lastPage.page.nextCursor, null);
+  assert.equal(lastPage.page.hasMore, false);
+  assert.equal(lastPage.truncated, false);
+  assert.throws(
+    () => compactSchemaDelta(delta, { detailLevel: "paged", cursor: "not-a-cursor" }),
+    (error) => error.code === "INVALID_SCHEMA_DELTA_CURSOR",
+  );
 });
 
 test("derived rebuilds do not advance the semantic workspace revision", () => {

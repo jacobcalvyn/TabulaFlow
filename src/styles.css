@@ -322,7 +322,7 @@ button { color: inherit; }
 .account-card__heading .button { display: inline-flex; align-items: center; gap: 6px; }
 .account-ai-card { margin-bottom: 14px; }
 .account-ai-card__title { min-width: 0; display: flex; align-items: center; gap: 11px; }
-.account-ai-card__title > span { width: 38px; height: 38px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 7px; color: var(--accent-strong); background: var(--accent-soft); }
+.account-ai-card__title > span:first-child { width: 38px; height: 38px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 7px; color: var(--accent-strong); background: var(--accent-soft); }
 .account-ai-card__title svg { width: 21px; height: 21px; }
 .account-ai-status { padding: 5px 8px; border-radius: 999px; font-size: 10px !important; }
 .account-ai-status--available { color: #08726d !important; background: #e6f5f3; }
@@ -331,12 +331,12 @@ button { color: inherit; }
 .account-ai-capabilities li { min-width: 0; padding: 10px 11px; border-radius: 6px; color: #405056; background: #f7f9f9; font-size: 10px; line-height: 1.45; }
 .account-ai-note { margin: 11px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .account-activity-card { margin-bottom: 14px; padding: 0; overflow: hidden; }
-.account-activity-toggle { width: 100%; padding: 18px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+.account-activity-toggle { width: 100%; padding: 18px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 18px; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
 .account-activity-toggle:hover { background: #f8fafa; }
 .account-activity-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
-.account-activity-toggle .account-ai-card__title > span:last-child { min-width: 0; display: grid; gap: 4px; }
+.account-activity-toggle__copy { min-width: 0; display: grid; gap: 3px; }
 .account-activity-toggle .account-ai-card__title strong { font-size: 15px; }
-.account-activity-toggle .account-ai-card__title small { color: var(--muted); font-size: 11px; font-weight: 400; }
+.account-activity-toggle .account-ai-card__title small { color: var(--muted); font-size: 11px; font-weight: 400; line-height: 1.35; }
 .account-activity-toggle__meta { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; color: #405056; font-size: 12px; white-space: nowrap; }
 .account-activity-toggle__meta svg { width: 16px; height: 16px; transition: transform .16s ease; }
 .account-activity-card--open .account-activity-toggle__meta svg { transform: rotate(180deg); }
@@ -357,6 +357,11 @@ button { color: inherit; }
 .activity-override-notice > svg { width: 17px; height: 17px; color: var(--accent-strong); }
 .activity-override-notice button { width: 26px; height: 26px; display: grid; place-items: center; border: 0; border-radius: 5px; color: var(--muted); background: transparent; }
 .activity-override-notice button:hover { background: #f0f4f4; }
+
+@media (max-width: 680px) {
+  .account-activity-toggle { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .account-activity-toggle__meta { padding-left: 49px; justify-content: space-between; }
+}
 .account-details { margin: 18px 0 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .account-details div { padding: 11px 12px; border-radius: 6px; background: #f7f9f9; }
 .account-details dt { margin-bottom: 4px; color: var(--muted); font-size: 10px; font-weight: 650; }

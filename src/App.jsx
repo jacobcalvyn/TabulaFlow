@@ -436,7 +436,7 @@ function AccountScreen({ onOpenFile, uploadRequestToken, onUploadRequestShown, a
           aria-controls="account-activity-content"
           onClick={() => setActivityOpen((open) => !open)}
         >
-          <span className="account-ai-card__title"><span><ClockCounterClockwise weight="duotone" /></span><span><strong id="activity-title">{t("activity")}</strong><small>{t("activityDescription")}</small></span></span>
+          <span className="account-ai-card__title"><span><ClockCounterClockwise weight="duotone" /></span><span className="account-activity-toggle__copy"><strong id="activity-title">{t("activity")}</strong><small>{t("activityDescription")}</small></span></span>
           <span className="account-activity-toggle__meta"><strong>{t("activityEventCount", { count: activityEvents.length })}</strong><CaretDown weight="bold" aria-hidden="true" /></span>
         </button>
         {activityOpen && <div id="account-activity-content" className="account-activity-content">

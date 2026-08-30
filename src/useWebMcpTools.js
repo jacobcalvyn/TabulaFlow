@@ -8,6 +8,7 @@ import {
   measureWebMcpToolset,
 } from "./webMcpRuntime.js";
 import { assertWebMcpInput } from "./webMcpSchema.js";
+import { compactSchemaDelta } from "./schemaDelta.js";
 
 const WEBMCP_RUNTIME_HEALTH = new WeakMap();
 
@@ -329,6 +330,20 @@ const COLUMN_VALUES_SCHEMA = Object.freeze(strictObject({
   offset: { type: "integer", minimum: 0, default: 0 },
   limit: { type: "integer", minimum: 1, maximum: 100, default: 100 },
 }, ["preparedId", "column"]));
+const SCHEMA_DELTA_RESPONSE_OPTIONS = Object.freeze({
+  schemaDeltaDetail: {
+    type: "string",
+    enum: ["summary", "paged"],
+    default: "summary",
+    description: "Return compact counts by default or one bounded page of schema changes.",
+  },
+  schemaDeltaCursor: {
+    type: "string",
+    pattern: "^schema-delta:[0-9]+$",
+    description: "Opaque nextCursor from a prior paged schema delta response.",
+  },
+  schemaDeltaLimit: { type: "integer", minimum: 1, maximum: 100, default: 100 },
+});
 const RECIPE_PREVIEW_SCHEMA = Object.freeze(strictObject({
   preparedId: ID,
   recipe: {
@@ -345,6 +360,7 @@ const RECIPE_PREVIEW_SCHEMA = Object.freeze(strictObject({
   stepIndex: { type: "integer", minimum: 0 },
   previewColumns: { type: "array", items: ID, maxItems: 20, uniqueItems: true, description: "Optional explicit columns for a bounded row preview. Omit for metadata-only validation." },
   previewLimit: { type: "integer", minimum: 1, maximum: 20, default: 10 },
+  ...SCHEMA_DELTA_RESPONSE_OPTIONS,
 }, ["preparedId", "recipe"]));
 const WORKSPACE_ACTIONS_SCHEMA = Object.freeze(strictObject({ targetId: ID }, []));
 const OPERATION_DESCRIPTION_SCHEMA = Object.freeze(strictObject({ kind: { type: "string", enum: OPERATION_KINDS } }));
@@ -399,6 +415,7 @@ const VALIDATE_COMPOSE_OPERATION_SCHEMA = Object.freeze(strictObject({
   operation: COMPOSE_OPERATION_SCHEMA,
   previewColumns: { type: "array", items: ID, maxItems: 20, uniqueItems: true, description: "Optional explicit columns for a bounded row preview. Omit for metadata-only validation." },
   previewLimit: { type: "integer", minimum: 1, maximum: 20, default: 10 },
+  ...SCHEMA_DELTA_RESPONSE_OPTIONS,
 }, ["operation"]));
 const DUPLICATE_PREPARED_SCHEMA = Object.freeze(strictObject({ preparedId: ID, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["preparedId", "expectedRevision", "requestId"]));
 const PROMOTE_COMPOSE_SCHEMA = Object.freeze(strictObject({ nodeId: ID, ...MUTATION_META, executionMode: MUTATION_EXECUTION_MODE }, ["nodeId", "expectedRevision", "requestId"]));
@@ -629,6 +646,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     exports: "revision-and-idempotency-required",
     idempotency: "flow-scoped-and-persistent-across-reload",
     qualitativeCoding: "human-codebook-and-human-review-required",
+    schemaDelta: "summary-by-default-with-byte-bounded-cursor-pages",
   },
 });
 
@@ -1087,13 +1105,16 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_preview_recipe_change",
       title: "Preview a complete recipe",
-      description: "Dry-run a complete recipe. Returns diagnostics, counts, schema delta, and only explicitly requested bounded rows.",
+      description: "Dry-run a complete recipe. Schema delta returns compact counts by default; request paged detail with schemaDeltaDetail=paged and follow nextCursor.",
       inputSchema: RECIPE_PREVIEW_SCHEMA,
       annotations: { readOnlyHint: true, untrustedContentHint: true },
-      async execute({ preparedId, recipe, stepIndex, previewColumns, previewLimit = 10 }) {
+      async execute({ preparedId, recipe, stepIndex, previewColumns, previewLimit = 10, schemaDeltaDetail = "summary", schemaDeltaCursor, schemaDeltaLimit = 100 }) {
         const { actions } = activeContext(contextRef);
         const result = await actions.previewRecipeChange(preparedId, recipe, stepIndex, { previewColumns, previewLimit });
-        return webMcpResult(result.valid ? "Validated the recipe change without saving it." : "The recipe change is invalid.", result);
+        return webMcpResult(result.valid ? "Validated the recipe change without saving it." : "The recipe change is invalid.", {
+          ...result,
+          schemaDelta: compactSchemaDelta(result.schemaDelta, { detailLevel: schemaDeltaDetail, cursor: schemaDeltaCursor, limit: schemaDeltaLimit }),
+        });
       },
     }, {
       name: "tabulaflow_set_aggregate_columns",
@@ -1317,13 +1338,16 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_validate_compose_operation",
       title: "Validate a Compose operation",
-      description: "Dry-run a candidate operation and return diagnostics, output counts, and schema delta without changing the graph. Rows require explicit previewColumns and are limited to 20.",
+      description: "Dry-run a candidate operation without changing the graph. Schema delta returns compact counts by default; request paged detail and follow nextCursor. Rows require explicit previewColumns and are limited to 20.",
       inputSchema: VALIDATE_COMPOSE_OPERATION_SCHEMA,
       annotations: { readOnlyHint: true, untrustedContentHint: true },
-      async execute({ operation, previewColumns, previewLimit = 10 }) {
+      async execute({ operation, previewColumns, previewLimit = 10, schemaDeltaDetail = "summary", schemaDeltaCursor, schemaDeltaLimit = 100 }) {
         const { actions } = activeContext(contextRef);
         const result = await actions.validateComposeOperation(operation, { previewColumns, previewLimit });
-        return webMcpResult(result.valid ? "Validated the candidate Compose operation without saving it." : "The candidate Compose operation is invalid.", result);
+        return webMcpResult(result.valid ? "Validated the candidate Compose operation without saving it." : "The candidate Compose operation is invalid.", {
+          ...result,
+          schemaDelta: compactSchemaDelta(result.schemaDelta, { detailLevel: schemaDeltaDetail, cursor: schemaDeltaCursor, limit: schemaDeltaLimit }),
+        });
       },
     }, {
       name: "tabulaflow_get_connection_options",
