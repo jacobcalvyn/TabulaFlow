@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CaretDown, CaretUp, CheckCircle, Copy, CornersOut, Database, DownloadSimple, FileXls, Intersect, LinkSimple, MagnifyingGlassMinus, MagnifyingGlassPlus, PencilSimple, PlugsConnected, Plus, SlidersHorizontal, Trash, TreeStructure, X } from "@phosphor-icons/react";
 import { MdJoinFull, MdJoinInner, MdJoinLeft, MdJoinRight } from "react-icons/md";
+import { calculateGraphFit } from "./composeViewport.js";
 import { useI18n } from "./i18n.jsx";
 
 const NODE_WIDTH = 230;
@@ -436,6 +437,8 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
   const [isMobile, setIsMobile] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 580px)").matches);
   const [viewScale, setViewScale] = useState(1);
   const canvasRef = useRef(null);
+  const fittedGraphRef = useRef("");
+  const previousCanvasSizeRef = useRef({ width: 0, height: 0 });
   const canvasPositions = positions;
 
   useEffect(() => {
@@ -648,20 +651,50 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
     x: unarySourcePosition.x + 34,
     y: unarySourcePosition.y + NODE_HEIGHT + 10,
   } : null;
-  const fitGraph = () => {
+  const fitGraph = useCallback((behavior = "smooth") => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const values = Object.values(canvasPositions);
-    const minX = values.length ? Math.min(...values.map((position) => position.x)) : 0;
-    const minY = values.length ? Math.min(...values.map((position) => position.y)) : 0;
-    const maxX = values.length ? Math.max(...values.map((position) => position.x + NODE_WIDTH)) : canvasWidth;
-    const maxY = values.length ? Math.max(...values.map((position) => position.y + NODE_HEIGHT)) : canvasHeight;
-    const graphWidth = Math.max(NODE_WIDTH, maxX - minX);
-    const graphHeight = Math.max(NODE_HEIGHT, maxY - minY);
-    const nextScale = Math.max(0.3, Math.min(1, (canvas.clientWidth - 48) / graphWidth, (canvas.clientHeight - 48) / graphHeight));
-    setViewScale(nextScale);
-    window.requestAnimationFrame(() => canvas.scrollTo({ left: Math.max(0, minX * nextScale - 24), top: Math.max(0, minY * nextScale - 24), behavior: "smooth" }));
-  };
+    const viewport = calculateGraphFit({
+      positions: positionsRef.current,
+      viewportWidth: canvas.clientWidth,
+      viewportHeight: canvas.clientHeight,
+      nodeWidth: NODE_WIDTH,
+      nodeHeight: NODE_HEIGHT,
+    });
+    setViewScale(viewport.scale);
+    window.requestAnimationFrame(() => canvas.scrollTo?.({ left: viewport.scrollLeft, top: viewport.scrollTop, behavior }));
+  }, []);
+
+  const graphIdentity = nodes.map((node) => node.id).sort().join(":");
+
+  useEffect(() => {
+    if (!graphIdentity || fittedGraphRef.current === graphIdentity) return undefined;
+    const frame = window.requestAnimationFrame(() => {
+      fitGraph("auto");
+      fittedGraphRef.current = graphIdentity;
+    });
+    return () => window.cancelAnimationFrame?.(frame);
+  }, [fitGraph, graphIdentity]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || typeof ResizeObserver === "undefined") return undefined;
+    let frame = 0;
+    const observer = new ResizeObserver(([entry]) => {
+      const width = entry.contentRect.width;
+      const height = entry.contentRect.height;
+      const previous = previousCanvasSizeRef.current;
+      previousCanvasSizeRef.current = { width, height };
+      if (!previous.width || (width >= previous.width - 1 && height >= previous.height - 1)) return;
+      window.cancelAnimationFrame?.(frame);
+      frame = window.requestAnimationFrame(() => fitGraph("auto"));
+    });
+    observer.observe(canvas);
+    return () => {
+      window.cancelAnimationFrame?.(frame);
+      observer.disconnect();
+    };
+  }, [fitGraph]);
   const zoomBy = (delta) => setViewScale((current) => Math.max(0.3, Math.min(1.5, Number((current + delta).toFixed(2)))));
   const autoArrange = async () => {
     setOperation(null);
@@ -682,7 +715,7 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
     <main className="compose-screen">
       <header className="compose-toolbar">
         <div><h1>{t("compose")}</h1><p>{connectingFrom ? t("chooseSecondDataset") : t("composeCanvasHint")} {dirty && <span className="compose-dirty">· {t("unsavedChanges")}</span>}</p></div>
-        <div className="compose-toolbar__actions"><div className="compose-zoom-controls" role="group" aria-label={t("canvasZoom")}><button type="button" onClick={() => zoomBy(-0.15)} aria-label={t("zoomOut")} title={t("zoomOut")}><MagnifyingGlassMinus /></button><span>{Math.round(viewScale * 100)}%</span><button type="button" onClick={() => zoomBy(0.15)} aria-label={t("zoomIn")} title={t("zoomIn")}><MagnifyingGlassPlus /></button></div><button className="compose-auto-arrange" type="button" onClick={autoArrange}><TreeStructure />{t("autoArrange")}</button><button className="compose-fit-graph" type="button" onClick={fitGraph}><CornersOut />{t("fitGraph")}</button>{connectingFrom && <button className="compose-cancel-connect" type="button" onClick={dismissConnection}><X />{t("cancelConnection")}</button>}</div>
+        <div className="compose-toolbar__actions"><div className="compose-zoom-controls" role="group" aria-label={t("canvasZoom")}><button type="button" onClick={() => zoomBy(-0.15)} aria-label={t("zoomOut")} title={t("zoomOut")}><MagnifyingGlassMinus /></button><span>{Math.round(viewScale * 100)}%</span><button type="button" onClick={() => zoomBy(0.15)} aria-label={t("zoomIn")} title={t("zoomIn")}><MagnifyingGlassPlus /></button></div><button className="compose-auto-arrange" type="button" onClick={autoArrange}><TreeStructure />{t("autoArrange")}</button><button className="compose-fit-graph" type="button" onClick={() => fitGraph()}><CornersOut />{t("fitGraph")}</button>{connectingFrom && <button className="compose-cancel-connect" type="button" onClick={dismissConnection}><X />{t("cancelConnection")}</button>}</div>
       </header>
       {error && <div className="compose-global-error" role="alert">{error}</div>}
       {confirmingMetricDeleteId && <div className="compose-global-confirmation" role="alertdialog" aria-label={t("confirmDeleteMetricDefinition")}>
