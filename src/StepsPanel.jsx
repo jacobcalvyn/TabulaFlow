@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   ArrowClockwise,
   ArrowCounterClockwise,
@@ -235,6 +236,7 @@ export function StepsPanel({
   const [confirmingDeleteAll, setConfirmingDeleteAll] = useState(false);
   const [deleteAllRequestTargetId, setDeleteAllRequestTargetId] = useState(null);
   const sheetPointerRef = useRef(null);
+  const formulaModalRef = useRef(null);
   const deleteAllConfirmRef = useRef(null);
   const sheetDragOffsetRef = useRef(0);
   const sheetDragMovedRef = useRef(false);
@@ -307,14 +309,58 @@ export function StepsPanel({
 
   const openEdit = (step) => {
     setEditingId(step.id);
+    if (step.type === "calculated-field") {
+      window.clearTimeout(dismissTimerRef.current);
+      setFormExpanded(false);
+      setFormOpen(true);
+      return;
+    }
     revealForm();
+  };
+
+  const dismissFormulaModal = () => {
+    window.clearTimeout(dismissTimerRef.current);
+    setFormOpen(false);
+    setFormExpanded(false);
+    setEditingId(null);
+  };
+
+  const keepFormulaFocusInside = (event) => {
+    if (event.key !== "Tab") return;
+    const focusable = [...event.currentTarget.querySelectorAll(
+      'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+    )].filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true");
+    if (!focusable.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   };
 
   const submitEdit = (type, params) => {
     const next = recipe.map((step) => step.id === editingId ? { ...step, type, params: { ...params } } : step);
-    dismissForm();
+    if (type === "calculated-field") dismissFormulaModal();
+    else dismissForm();
     onChange(next, editingId);
   };
+
+  useEffect(() => {
+    if (!formOpen || editingStep?.type !== "calculated-field") return undefined;
+    formulaModalRef.current?.focus();
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape" && !applying) dismissFormulaModal();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [applying, editingStep?.type, formOpen]);
 
   const startSheetDrag = (event) => {
     if (event.button !== 0) return;
@@ -453,7 +499,7 @@ export function StepsPanel({
         {!recipe.length && <div className="steps-empty"><strong>{t("noTransforms")}</strong><span>{t("chooseToolHint")}</span></div>}
       </div>
 
-      {formOpen && editingId ? (
+      {formOpen && editingId && editingStep?.type !== "calculated-field" ? (
         <section
           className={`step-form-sheet ${formExpanded ? "step-form-sheet--expanded" : "step-form-sheet--collapsed"} ${sheetDragging ? "step-form-sheet--dragging" : ""}`}
           style={sheetDragging ? {
@@ -476,7 +522,36 @@ export function StepsPanel({
           >
             <CaretDown weight="bold" />
           </button>
-          {editingStep?.type === "calculated-field" ? (
+          <TransformationForm
+            key={editingId}
+            columns={columns}
+            initialType={editingStep?.type}
+            initialParams={{ ...DEFAULT_PARAMS[editingStep?.type], ...editingStep?.params }}
+            title={t("editStep")}
+            submitLabel={t("save")}
+            applying={applying}
+            onSubmit={submitEdit}
+            onCancel={dismissForm}
+          />
+        </section>
+      ) : null}
+
+      {formOpen && editingId && editingStep?.type === "calculated-field" ? createPortal(
+        <div
+          className="formula-step-modal-backdrop"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget && !applying) dismissFormulaModal();
+          }}
+        >
+          <section
+            ref={formulaModalRef}
+            className="formula-step-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t("editFormulaColumn")}
+            tabIndex={-1}
+            onKeyDown={keepFormulaFocusInside}
+          >
             <FormulaColumnEditor
               key={editingId}
               schema={editingSchema}
@@ -486,22 +561,11 @@ export function StepsPanel({
               applying={applying}
               onPreview={onPreviewDraft ? (params, referencedColumns) => onPreviewDraft(editingId, params, referencedColumns) : undefined}
               onSubmit={(params) => submitEdit("calculated-field", params)}
-              onCancel={dismissForm}
+              onCancel={dismissFormulaModal}
             />
-          ) : (
-            <TransformationForm
-              key={editingId}
-              columns={columns}
-              initialType={editingStep?.type}
-              initialParams={{ ...DEFAULT_PARAMS[editingStep?.type], ...editingStep?.params }}
-              title={t("editStep")}
-              submitLabel={t("save")}
-              applying={applying}
-              onSubmit={submitEdit}
-              onCancel={dismissForm}
-            />
-          )}
-        </section>
+          </section>
+        </div>,
+        document.body,
       ) : null}
     </aside>
   );

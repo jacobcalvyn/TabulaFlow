@@ -201,6 +201,49 @@ test("Distinct output mode is an accessible two-option segmented control", () =>
   view.unmount();
 });
 
+test("opening Data preview preserves the current Compose zoom", async () => {
+  const observers = [];
+  const originalResizeObserver = globalThis.ResizeObserver;
+  globalThis.ResizeObserver = class TestResizeObserver {
+    constructor(callback) {
+      this.callback = callback;
+      observers.push(this);
+    }
+
+    observe(target) {
+      this.target = target;
+    }
+
+    disconnect() {}
+  };
+
+  let view;
+  try {
+    view = renderCompose({
+      preview: { rowCount: 4, columns: ["group", "count"], preview: [] },
+    });
+    assert.equal(observers.length, 1);
+
+    await act(async () => {
+      observers[0].callback([{ contentRect: { width: 1200, height: 800 } }]);
+    });
+    fireEvent.click(view.getByRole("button", { name: "Zoom out" }));
+    assert.equal(view.getByText("85%").textContent, "85%");
+
+    fireEvent.click(view.getByRole("button", { name: "Show preview" }));
+    await act(async () => {
+      observers[0].callback([{ contentRect: { width: 1200, height: 480 } }]);
+    });
+
+    assert.equal(view.getByText("85%").textContent, "85%");
+    assert.equal(view.getByRole("button", { name: "Hide preview" }).getAttribute("aria-expanded"), "true");
+  } finally {
+    view?.unmount();
+    if (originalResizeObserver === undefined) delete globalThis.ResizeObserver;
+    else globalThis.ResizeObserver = originalResizeObserver;
+  }
+});
+
 test("a WebMCP delete request opens the existing confirmation without deleting", async () => {
   const calls = [];
   const view = renderCompose({
@@ -391,6 +434,62 @@ test("Prepare Steps hides Delete all when the active recipe is empty", () => {
   })));
 
   assert.equal(view.queryByRole("button", { name: "Delete all" }), null);
+  view.unmount();
+});
+
+test("Formula recipe steps edit in a modal instead of the embedded swipe sheet", () => {
+  const calls = [];
+  const recipe = [{
+    id: "formula-a",
+    type: "calculated-field",
+    version: 1,
+    enabled: true,
+    params: { outputColumn: "amount_double", expression: "[amount] * 2", expressionVersion: 1 },
+  }];
+  const view = render(React.createElement(LanguageProvider, null, React.createElement(StepsPanel, {
+    open: true,
+    embedded: true,
+    columns: ["amount"],
+    schema: [{ name: "amount", type: "DOUBLE" }],
+    recipe,
+    stepStates: [],
+    invalidStepId: null,
+    error: "",
+    applying: false,
+    canUndo: false,
+    canRedo: false,
+    onClose() {},
+    onChange(nextRecipe, changedStepId) { calls.push([nextRecipe, changedStepId]); },
+    onUndo() {},
+    onRedo() {},
+    onPreview() {},
+    previewedStepId: null,
+  })));
+
+  fireEvent.click(view.getByRole("button", { name: "Edit step" }));
+  let dialog = view.getByRole("dialog", { name: "Edit formula column" });
+  assert.equal(document.body.contains(dialog), true);
+  assert.equal(view.container.querySelector(".step-form-sheet"), null);
+  assert.equal(within(dialog).getByLabelText("New column name").value, "amount_double");
+  assert.equal(within(dialog).getByLabelText("Formula").value, "[amount] * 2");
+  const saveButton = within(dialog).getByRole("button", { name: "Save" });
+  saveButton.focus();
+  fireEvent.keyDown(dialog, { key: "Tab" });
+  assert.equal(document.activeElement, within(dialog).getByRole("button", { name: "Close form" }));
+
+  fireEvent.keyDown(document, { key: "Escape" });
+  assert.equal(view.queryByRole("dialog", { name: "Edit formula column" }), null);
+
+  fireEvent.click(view.getByRole("button", { name: "Edit step" }));
+  dialog = view.getByRole("dialog", { name: "Edit formula column" });
+  fireEvent.pointerDown(dialog.parentElement);
+  assert.equal(view.queryByRole("dialog", { name: "Edit formula column" }), null);
+
+  fireEvent.click(view.getByRole("button", { name: "Edit step" }));
+  dialog = view.getByRole("dialog", { name: "Edit formula column" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  assert.deepEqual(calls, [[recipe, "formula-a"]]);
+  assert.equal(view.queryByRole("dialog", { name: "Edit formula column" }), null);
   view.unmount();
 });
 

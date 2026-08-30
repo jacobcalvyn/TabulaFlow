@@ -5,6 +5,12 @@ export const MIN_MANUAL_SCALE = 0.3;
 export const MIN_FIT_SCALE = 0.02;
 export const MAX_CANVAS_COORDINATE = 32_000;
 
+export function shouldAutoFitCanvasResize(previous, next, tolerance = 1) {
+  if (!previous?.width || !previous?.height) return false;
+  if (previous.previewOpen !== next.previewOpen) return false;
+  return next.width < previous.width - tolerance || next.height < previous.height - tolerance;
+}
+
 export function normalizeCanvasPosition(position, fallback = { x: 40, y: 52 }) {
   const rawX = Number(position?.x);
   const rawY = Number(position?.y);

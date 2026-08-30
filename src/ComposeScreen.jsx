@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { CaretDown, CaretUp, CheckCircle, Copy, CornersOut, Database, DownloadSimple, FileXls, Intersect, LinkSimple, MagnifyingGlassMinus, MagnifyingGlassPlus, PencilSimple, PlugsConnected, Plus, SlidersHorizontal, Trash, TreeStructure, X } from "@phosphor-icons/react";
 import { MdJoinFull, MdJoinInner, MdJoinLeft, MdJoinRight } from "react-icons/md";
-import { calculateGraphFit, MIN_MANUAL_SCALE, normalizeCanvasPosition } from "./composeViewport.js";
+import { calculateGraphFit, MIN_MANUAL_SCALE, normalizeCanvasPosition, shouldAutoFitCanvasResize } from "./composeViewport.js";
 import { useI18n } from "./i18n.jsx";
 
 const NODE_WIDTH = 230;
@@ -439,8 +439,13 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
   const [pendingViewport, setPendingViewport] = useState(null);
   const canvasRef = useRef(null);
   const fittedGraphRef = useRef("");
-  const previousCanvasSizeRef = useRef({ width: 0, height: 0 });
+  const previewOpenRef = useRef(previewOpen);
+  const previousCanvasSizeRef = useRef({ width: 0, height: 0, previewOpen });
   const canvasPositions = positions;
+
+  useLayoutEffect(() => {
+    previewOpenRef.current = previewOpen;
+  }, [previewOpen]);
 
   useEffect(() => {
     const query = window.matchMedia("(max-width: 580px)");
@@ -689,11 +694,14 @@ export function ComposeScreen({ flow, dirty, preview, loading, error, onSelectNo
     if (!canvas || typeof ResizeObserver === "undefined") return undefined;
     let frame = 0;
     const observer = new ResizeObserver(([entry]) => {
-      const width = entry.contentRect.width;
-      const height = entry.contentRect.height;
       const previous = previousCanvasSizeRef.current;
-      previousCanvasSizeRef.current = { width, height };
-      if (!previous.width || (width >= previous.width - 1 && height >= previous.height - 1)) return;
+      const next = {
+        width: entry.contentRect.width,
+        height: entry.contentRect.height,
+        previewOpen: previewOpenRef.current,
+      };
+      previousCanvasSizeRef.current = next;
+      if (!shouldAutoFitCanvasResize(previous, next)) return;
       window.cancelAnimationFrame?.(frame);
       frame = window.requestAnimationFrame(() => fitGraph("auto"));
     });

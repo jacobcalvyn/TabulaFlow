@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { calculateGraphFit, MAX_CANVAS_COORDINATE, normalizeCanvasPosition } from "../src/composeViewport.js";
+import { calculateGraphFit, MAX_CANVAS_COORDINATE, normalizeCanvasPosition, shouldAutoFitCanvasResize } from "../src/composeViewport.js";
 
 test("calculateGraphFit keeps a wide persisted graph inside a narrow Compose viewport", () => {
   const result = calculateGraphFit({
@@ -70,4 +70,22 @@ test("calculateGraphFit centers a graph restored far from the canvas origin", ()
 test("normalizeCanvasPosition rejects invalid and extreme persisted coordinates", () => {
   assert.deepEqual(normalizeCanvasPosition({ x: Number.NaN, y: Number.POSITIVE_INFINITY }), { x: 40, y: 52 });
   assert.deepEqual(normalizeCanvasPosition({ x: -500, y: MAX_CANVAS_COORDINATE * 10 }), { x: 24, y: MAX_CANVAS_COORDINATE });
+});
+
+test("opening Data preview does not auto-fit or shrink the Compose graph", () => {
+  assert.equal(shouldAutoFitCanvasResize(
+    { width: 1200, height: 820, previewOpen: false },
+    { width: 1200, height: 480, previewOpen: true },
+  ), false);
+});
+
+test("an external canvas shrink still requests automatic graph fitting", () => {
+  assert.equal(shouldAutoFitCanvasResize(
+    { width: 1200, height: 820, previewOpen: false },
+    { width: 900, height: 820, previewOpen: false },
+  ), true);
+  assert.equal(shouldAutoFitCanvasResize(
+    { width: 900, height: 820, previewOpen: true },
+    { width: 900, height: 620, previewOpen: true },
+  ), true);
 });
