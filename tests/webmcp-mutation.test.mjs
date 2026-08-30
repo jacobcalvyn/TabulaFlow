@@ -166,7 +166,38 @@ test("a cancelled confirmation remains terminal for the original request", async
   await run(meta, async () => ({ target: "prepared-dataset", targetId: "prepared-a", pendingConfirmation: true }), "delete:prepared-a");
   assert.equal(run.setRequestTerminalStatus(meta.requestId, "cancelled", { target: "prepared-dataset", targetId: "prepared-a", pendingConfirmation: false }), true);
   const replay = await run(meta, async () => ({ pendingConfirmation: true }), "delete:prepared-a");
-  assert.deepEqual(replay, { target: "prepared-dataset", targetId: "prepared-a", pendingConfirmation: false, requestId: meta.requestId, status: "cancelled" });
+  assert.equal(replay.operationId.startsWith("operation-"), true);
+  assert.equal(replay.requestId, meta.requestId);
+  assert.equal(replay.status, "cancelled");
+  assert.equal(replay.target, "prepared-dataset");
+  assert.equal(replay.targetId, "prepared-a");
+  assert.equal(replay.pendingConfirmation, false);
+  assert.equal(replay.workspaceRevision, 2);
+});
+
+test("confirmation requests do not occupy or get fenced with the workspace writer", async () => {
+  let revision = 2;
+  let releaseWriter;
+  const writerGate = new Promise((resolve) => { releaseWriter = resolve; });
+  const run = createWebMcpMutationRunner({ getRevision: () => revision });
+  const writer = await run({ expectedRevision: 2, requestId: "writer-while-confirming", executionMode: "async" }, async () => {
+    await writerGate;
+    revision += 1;
+    return { changed: true };
+  }, "recipe:writer");
+  const confirmation = await run({
+    expectedRevision: 2,
+    requestId: "confirmation-independent",
+    operationClass: "confirmation-request",
+  }, async () => ({ confirmationId: "confirmation-a", pendingConfirmation: true }), "delete:request");
+  assert.equal(confirmation.status, "succeeded");
+  assert.equal(confirmation.pendingConfirmation, true);
+  assert.deepEqual(run.getActiveOperationIds(), [writer.operationId]);
+  assert.deepEqual(run.fenceMutations(), [writer.operationId]);
+  assert.equal(run.getOperationStatus(confirmation.operationId).status, "succeeded");
+  releaseWriter();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(run.getOperationStatus(writer.operationId).status, "cancelled");
 });
 
 test("hydrates succeeded mutation results across a runner reload", async () => {

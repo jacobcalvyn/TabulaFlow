@@ -18,7 +18,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "3.2.0", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "3.2.1", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -44,6 +44,7 @@ function createContext() {
         async getChangesSince(cursor, options) { calls.push(["changes", cursor, options]); return { events: [], cursor, hasMore: false }; },
         async getOperationStatus(operationId) { calls.push(["operation-status", operationId]); return { operationId, status: "succeeded" }; },
         async cancelOperation(operationId) { calls.push(["cancel-operation", operationId]); return { operationId, status: "cancelling" }; },
+        async cancelInteraction(interactionId) { calls.push(["cancel-interaction", interactionId]); return { interactionId, status: "cancelled" }; },
         async getPendingConfirmations() { calls.push(["pending-confirmations"]); return { confirmations: [] }; },
         async rejectConfirmation(confirmationId) { calls.push(["reject-confirmation", confirmationId]); return { confirmationId, status: "cancelled" }; },
         async openWorkspace(workspace) { calls.push(["workspace", workspace]); return { workspace, workspaceRevision: REVISION, activityCursor: 12, activePreparedId: "prepared-a", activeNodeId: "operation-a" }; },
@@ -221,7 +222,8 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "3.2.0");
+  assert.equal(capabilities.structuredContent.contractVersion, "3.2.1");
+  assert.deepEqual(capabilities.structuredContent.operationLifecycle.terminalStates, ["succeeded", "failed", "cancelled"]);
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");
@@ -361,6 +363,33 @@ test("registered WebMCP export tools execute through the modelContext registry w
   assert.equal(composeResult.structuredContent.workspaceRevision, REVISION + 1);
   assert.ok(calls.some((call) => call[0] === "export-prepare" && call[3].requestId === "registered-prepare-export"));
   assert.ok(calls.some((call) => call[0] === "export-compose" && call[3].requestId === "registered-compose-export"));
+  controller.abort();
+});
+
+test("registered tools reject schema-invalid input before an application action runs", async () => {
+  const { calls, ref } = createContext();
+  const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
+  const registry = new Map();
+  const controller = new AbortController();
+  await registerWebMcpTools({
+    async registerTool(tool) { registry.set(tool.name, tool); },
+  }, tools, controller.signal);
+
+  await assert.rejects(
+    () => registry.get("tabulaflow_set_preview_filter").execute({
+      preparedId: "prepared-a",
+      column: "status",
+      values: ["open"],
+      ...mutation("invalid-filter-shape"),
+    }),
+    (error) => error.code === "WEBMCP_INVALID_INPUT" && error.phase === "input-validation",
+  );
+  await assert.rejects(
+    () => registry.get("tabulaflow_cancel_operation").execute({ operationId: "operation-a", interactionId: "interaction-a" }),
+    (error) => error.code === "WEBMCP_INVALID_INPUT",
+  );
+  assert.equal(calls.some((call) => call[0] === "filters"), false);
+  assert.equal(calls.some((call) => call[0] === "cancel-operation" || call[0] === "cancel-interaction"), false);
   controller.abort();
 });
 

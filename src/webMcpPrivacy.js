@@ -44,6 +44,9 @@ export function sanitizeWebMcpError(cause) {
     USER_GESTURE_REQUIRED: "The user must complete the requested browser file interaction.",
     WORKER_NOT_READY: "The local data engine is still starting.",
     WEBMCP_SNAPSHOT_STALE: "The host WebMCP snapshot is stale. Fetch the current toolset and retry.",
+    WEBMCP_INVALID_INPUT: "The tool input does not match the registered WebMCP schema.",
+    INTERACTION_NOT_FOUND: "The requested user interaction is unavailable or expired.",
+    WRONG_WORKSPACE: "Open the required TabulaFlow workspace before requesting this action.",
   };
   return {
     code,

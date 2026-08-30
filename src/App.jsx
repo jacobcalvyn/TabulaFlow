@@ -29,6 +29,7 @@ import { useDataWorker } from "./useDataWorker.js";
 import { useWebMcpTools } from "./useWebMcpTools.js";
 import { createWebMcpMutationRunner } from "./webMcpMutation.js";
 import { createWebMcpInteractionRegistry } from "./webMcpInteractions.js";
+import { WEBMCP_CONTRACT_VERSION } from "./webMcpRuntime.js";
 import { composeNodeSummaryForAgent, paginateAgentSchema } from "./webMcpDto.js";
 import { StepsPanel, TransformationForm } from "./StepsPanel.jsx";
 import { FormulaColumnEditor } from "./FormulaColumnEditor.jsx";
@@ -2981,14 +2982,15 @@ export function App() {
   const previewRecipe = (recipe, stepIndex, options = {}) => worker.previewRecipe(recipe, stepIndex, options);
 
   const openWorkspace = async (workspace) => {
+    const previousWorkspace = screen === "input" ? "source" : screen === "data" ? "prepare" : screen;
     if (workspace === "source" || workspace === "account") {
       setScreen(workspace === "source" ? "input" : "account");
-      return { workspace, activePreparedId: activePreparedIdRef.current, activeNodeId: flowRef.current.activeNodeId, workspaceRevision: workspaceRevisionRef.current, activityCursor: activityEventsRef.current[0]?.sequence ?? 0 };
+      return { workspace, workspaceChanged: previousWorkspace !== workspace, activePreparedId: activePreparedIdRef.current, activeNodeId: flowRef.current.activeNodeId, workspaceRevision: workspaceRevisionRef.current, activityCursor: activityEventsRef.current[0]?.sequence ?? 0 };
     }
     if (workspace === "compose") {
       if (flowRef.current.preparedInputs.length === 0) throw new Error("Compose requires at least one prepared dataset.");
       setScreen("compose");
-      return { workspace, activePreparedId: activePreparedIdRef.current, activeNodeId: flowRef.current.activeNodeId, workspaceRevision: workspaceRevisionRef.current, activityCursor: activityEventsRef.current[0]?.sequence ?? 0 };
+      return { workspace, workspaceChanged: previousWorkspace !== workspace, activePreparedId: activePreparedIdRef.current, activeNodeId: flowRef.current.activeNodeId, workspaceRevision: workspaceRevisionRef.current, activityCursor: activityEventsRef.current[0]?.sequence ?? 0 };
     }
     if (workspace !== "prepare") throw new Error(`Unknown workspace: ${workspace}`);
     const preparedId = flowRef.current.preparedInputs.some((item) => item.id === flowRef.current.activeNodeId)
@@ -2996,7 +2998,7 @@ export function App() {
       : activePreparedIdRef.current ?? flowRef.current.preparedInputs[0]?.id;
     if (!preparedId) throw new Error("Prepare requires an existing prepared dataset.");
     await openPrepared(preparedId);
-    return { workspace, activePreparedId: preparedId, activeNodeId: flowRef.current.activeNodeId, workspaceRevision: workspaceRevisionRef.current, activityCursor: activityEventsRef.current[0]?.sequence ?? 0 };
+    return { workspace, workspaceChanged: previousWorkspace !== workspace, activePreparedId: preparedId, activeNodeId: flowRef.current.activeNodeId, workspaceRevision: workspaceRevisionRef.current, activityCursor: activityEventsRef.current[0]?.sequence ?? 0 };
   };
 
   const selectComposeNodeFromTool = async (nodeId, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
@@ -3763,15 +3765,29 @@ export function App() {
     return result;
   }, `compose:promote:${nodeId}`);
 
-  const requestDeleteFromTool = async (target, targetId, meta) => runWebMcpMutation(meta, async () => {
+  const requestDeleteFromTool = async (target, targetId, meta) => runWebMcpMutation({ ...meta, operationClass: "confirmation-request" }, async () => {
+    const activeWorkspace = screen === "input" ? "source" : screen === "data" ? "prepare" : screen;
+    const requiredWorkspace = target === "recipe-step" || target === "prepare-recipe" ? "prepare" : "compose";
+    if (activeWorkspace !== requiredWorkspace) {
+      const wrongWorkspace = new Error(`Open ${requiredWorkspace} before requesting deletion.`);
+      wrongWorkspace.code = "WRONG_WORKSPACE";
+      throw wrongWorkspace;
+    }
     if (target === "prepare-recipe") {
       assertActivePreparedForTool(targetId);
       if (!currentPreparedRecipe(targetId).length) throw new Error(`Prepare recipe has no steps: ${targetId}`);
+    } else if (target === "recipe-step") {
+      if (!currentPreparedRecipe(activePreparedIdRef.current).some((step) => step.id === targetId)) throw new Error(`Recipe step not found: ${targetId}`);
+    } else if (target === "metric-definition") {
+      if (!(flowRef.current.metricDefinitions ?? []).some((metric) => metric.id === targetId)) throw new Error(`Metric definition not found: ${targetId}`);
+    } else if (target === "prepared-dataset") {
+      if (!flowRef.current.preparedInputs.some((item) => item.id === targetId)) throw new Error(`Prepared dataset not found: ${targetId}`);
+    } else if (target === "compose-operation") {
+      if (!flowRef.current.composeNodes.some((item) => item.id === targetId)) throw new Error(`Compose operation not found: ${targetId}`);
     }
-    setScreen(target === "recipe-step" || target === "prepare-recipe" ? "data" : "compose");
     const confirmationId = `confirmation-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
     const expiresAt = new Date(Date.now() + WEBMCP_CONFIRMATION_TTL_MS).toISOString();
-    const workspace = target === "recipe-step" || target === "prepare-recipe" ? "prepare" : "compose";
+    const workspace = requiredWorkspace;
     const activity = await recordActivity({ action: "delete_requested", targetType: target, targetId, status: "pending-confirmation", summary: { targetKind: target } }, webMcpActivity(meta));
     pendingDeleteConfirmationsRef.current.set(`${target}:${targetId}`, {
       confirmationId,
@@ -3785,10 +3801,15 @@ export function App() {
       activityEventId: activity?.eventId ?? null,
     });
     setWebMcpDeleteRequest({ target, targetId, token: confirmationId, confirmationId, expiresAt, requestId: meta.requestId, workspace });
-    return { target, targetId, confirmationId, confirmationToken: confirmationId, expiresAt, pendingConfirmation: true, activity };
+    return { target, targetId, confirmationId, confirmationToken: confirmationId, expiresAt, pendingConfirmation: true, workspace, workspaceChanged: false, activity };
   }, `delete:request:${target}:${targetId}`);
 
-  const requestResetAllFromTool = async (meta) => runWebMcpMutation(meta, async () => {
+  const requestResetAllFromTool = async (meta) => runWebMcpMutation({ ...meta, operationClass: "confirmation-request" }, async () => {
+    if (screen !== "input") {
+      const wrongWorkspace = new Error("Open Source before requesting a complete flow reset.");
+      wrongWorkspace.code = "WRONG_WORKSPACE";
+      throw wrongWorkspace;
+    }
     const currentFlow = flowRef.current;
     const hasFlowData = currentFlow.sourceAssets.length > 0
       || currentFlow.preparedInputs.length > 0
@@ -3798,7 +3819,6 @@ export function App() {
       emptyError.code = "FLOW_ALREADY_EMPTY";
       throw emptyError;
     }
-    setScreen("input");
     const confirmationId = `confirmation-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
     const expiresAt = new Date(Date.now() + WEBMCP_CONFIRMATION_TTL_MS).toISOString();
     const request = { token: confirmationId, confirmationId, expiresAt, requestId: meta.requestId, flowId: currentFlow.id, workspace: "source" };
@@ -3816,7 +3836,7 @@ export function App() {
       activityEventId: activity?.eventId ?? null,
     };
     setWebMcpResetRequest(request);
-    return { confirmationId, confirmationToken: confirmationId, expiresAt, pendingConfirmation: true, workspace: "source", activity };
+    return { confirmationId, confirmationToken: confirmationId, expiresAt, pendingConfirmation: true, workspace: "source", workspaceChanged: false, activity };
   }, "flow:request-reset-all");
 
   const getActivityLogFromTool = async ({ limit = 50, targetId = null, actor = null } = {}) => {
@@ -3840,7 +3860,7 @@ export function App() {
     pendingDeleteConfirmationsRef.current.delete(key);
     webMcpMutationRunnerRef.current?.setRequestTerminalStatus?.(
       pending.requestId,
-      outcome === "cancelled" ? "cancelled" : "committed",
+      outcome === "cancelled" ? "cancelled" : "succeeded",
       { target, targetId, pendingConfirmation: false, confirmed: outcome !== "cancelled" },
     );
     return recordActivity({
@@ -3960,7 +3980,7 @@ export function App() {
 
   useWebMcpTools({
     state: {
-      contractVersion: "3.2.0",
+      contractVersion: WEBMCP_CONTRACT_VERSION,
       workspaceRevision,
       flowId: flow.id,
       flowRevision: flow.revision,
@@ -4031,6 +4051,7 @@ export function App() {
       getActiveOperationIds: () => webMcpMutationRunnerRef.current.getActiveOperationIds(),
       getPendingInteractions: () => sourceInteractionsRef.current.list(),
       cancelOperation: (operationId) => webMcpMutationRunnerRef.current.cancelOperation(operationId),
+      cancelInteraction: (interactionId) => sourceInteractionsRef.current.cancel(interactionId),
       fenceMutations: () => webMcpMutationRunnerRef.current.fenceMutations(),
       getPendingConfirmations: getPendingConfirmationsFromTool,
       rejectConfirmation: rejectConfirmationFromTool,

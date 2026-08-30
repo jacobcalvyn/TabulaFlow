@@ -65,6 +65,20 @@ export function createWebMcpInteractionRegistry({ ttlMs = 10 * 60 * 1000, now = 
       interaction.reason = details.reason ?? null;
       return safe(interaction);
     },
+    cancel(interactionId, reason = "AGENT_CANCELLED") {
+      expire();
+      const interaction = interactions.get(String(interactionId ?? ""));
+      if (!interaction) {
+        const error = new Error(`Source interaction not found: ${interactionId}`);
+        error.code = "INTERACTION_NOT_FOUND";
+        throw error;
+      }
+      if (interaction.status !== "awaiting-user") return safe(interaction);
+      interaction.status = "cancelled";
+      interaction.completedAt = new Date(now()).toISOString();
+      interaction.reason = reason;
+      return safe(interaction);
+    },
     list({ includeTerminal = false } = {}) {
       expire();
       return [...interactions.values()]

@@ -49,3 +49,15 @@ test("runtime health blocks stale generations and reports registration failures 
   assert.equal(health.snapshot().status, "limit-exceeded");
   assert.equal(health.snapshot().refreshRequired, true);
 });
+
+test("workspace navigation can wait for one complete stable generation", async () => {
+  const health = createWebMcpRuntimeHealth();
+  const pending = health.waitForStableGeneration(2, { timeoutMs: 100, workspace: "compose" });
+  health.beginRegistration({ generation: 3, workspace: "compose", expectedToolCount: 12, metrics: { schemaBytes: 100 } });
+  health.completeRegistration({ generation: 3, workspace: "compose", registeredToolCount: 12, expectedToolCount: 12, metrics: { schemaBytes: 100 } });
+  const stable = await pending;
+  assert.equal(stable.generation, 3);
+  assert.equal(stable.status, "available");
+  assert.equal(stable.workspace, "compose");
+  assert.equal(stable.registeredToolCount, stable.expectedToolCount);
+});

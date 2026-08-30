@@ -1,4 +1,4 @@
-export const WEBMCP_CONTRACT_VERSION = "3.2.0";
+export const WEBMCP_CONTRACT_VERSION = "3.2.1";
 
 export const WEBMCP_REGISTRATION_BUDGET = Object.freeze({
   maxToolCount: 48,
@@ -77,8 +77,10 @@ export function assertWebMcpRegistrationBudget(metrics, budget = WEBMCP_REGISTRA
 
 export function createWebMcpRuntimeHealth() {
   const failures = new Map();
+  const listeners = new Set();
   let state = {
     status: "unavailable",
+    workspace: null,
     generation: 0,
     registeredToolCount: 0,
     callableToolCount: 0,
@@ -96,13 +98,15 @@ export function createWebMcpRuntimeHealth() {
     const status = patch.status ?? state.status;
     if (!HEALTH_STATES.has(status)) throw new Error(`Unsupported WebMCP runtime health state: ${status}`);
     state = { ...state, ...patch, status };
+    for (const listener of listeners) listener(state);
   };
 
   return {
-    beginRegistration({ generation, registeredToolCount = 0, expectedToolCount, metrics }) {
+    beginRegistration({ generation, workspace = null, registeredToolCount = 0, expectedToolCount, metrics }) {
       update({
         status: "registering",
         generation,
+        workspace,
         registeredToolCount,
         callableToolCount: registeredToolCount,
         blockedToolCount: Math.max(0, Number(expectedToolCount ?? 0) - registeredToolCount),
@@ -114,10 +118,11 @@ export function createWebMcpRuntimeHealth() {
         refreshRequired: true,
       });
     },
-    completeRegistration({ generation, registeredToolCount, expectedToolCount, metrics, degraded = false }) {
+    completeRegistration({ generation, workspace = state.workspace, registeredToolCount, expectedToolCount, metrics, degraded = false }) {
       update({
         status: degraded || failures.size ? "degraded" : "available",
         generation,
+        workspace,
         registeredToolCount,
         callableToolCount: Math.max(0, registeredToolCount - failures.size),
         blockedToolCount: failures.size,
@@ -191,6 +196,31 @@ export function createWebMcpRuntimeHealth() {
         error.code = "WEBMCP_MUTATION_UNAVAILABLE";
         throw error;
       }
+    },
+    waitForStableGeneration(afterGeneration, { timeoutMs = 5_000, workspace = null } = {}) {
+      const isStable = (candidate) => (
+        candidate.generation > afterGeneration
+        && (!workspace || candidate.workspace === workspace)
+        && ["available", "degraded"].includes(candidate.status)
+        && candidate.registeredToolCount === candidate.expectedToolCount
+      );
+      if (isStable(state)) return Promise.resolve({ ...state });
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          listeners.delete(onUpdate);
+          const error = new Error("WebMCP workspace publication did not become stable before the timeout.");
+          error.code = "WEBMCP_SNAPSHOT_STALE";
+          error.refreshRequired = true;
+          reject(error);
+        }, timeoutMs);
+        const onUpdate = (candidate) => {
+          if (!isStable(candidate)) return;
+          clearTimeout(timeout);
+          listeners.delete(onUpdate);
+          resolve({ ...candidate });
+        };
+        listeners.add(onUpdate);
+      });
     },
     snapshot(extra = {}) {
       return {

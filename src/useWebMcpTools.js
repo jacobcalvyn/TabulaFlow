@@ -7,6 +7,7 @@ import {
   createWebMcpRuntimeHealth,
   measureWebMcpToolset,
 } from "./webMcpRuntime.js";
+import { assertWebMcpInput } from "./webMcpSchema.js";
 
 const WEBMCP_RUNTIME_HEALTH = new WeakMap();
 
@@ -355,6 +356,12 @@ const COMPOSE_SCHEMA_PAGE_SCHEMA = Object.freeze(strictObject({
   limit: { type: "integer", minimum: 1, maximum: 100, default: 100 },
 }, ["nodeId"]));
 const OPERATION_STATUS_SCHEMA = Object.freeze(strictObject({ operationId: ID }));
+const CANCEL_PENDING_SCHEMA = Object.freeze({
+  type: "object",
+  properties: { operationId: ID, interactionId: ID },
+  oneOf: [{ required: ["operationId"] }, { required: ["interactionId"] }],
+  additionalProperties: false,
+});
 const CONFIRMATION_SCHEMA = Object.freeze(strictObject({ confirmationId: ID }));
 const SEMANTIC_MODEL_SCHEMA = Object.freeze(strictObject({ targetId: ID }));
 const UPDATE_SEMANTIC_FIELD_SCHEMA = Object.freeze(strictObject({
@@ -516,6 +523,11 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     "submit-qualitative-coding-suggestions",
     "inspect-qualitative-review-progress",
   ],
+  operationLifecycle: {
+    states: ["accepted", "running", "committing", "succeeded", "failed", "cancelling", "cancelled"],
+    terminalStates: ["succeeded", "failed", "cancelled"],
+    userInteractions: ["awaiting-user", "completed", "failed", "cancelled", "expired"],
+  },
   safeguards: {
     localFileSelection: "user-action-required",
     deletion: "visible-user-confirmation-required",
@@ -584,7 +596,6 @@ const WEBMCP_WORKSPACE_TOOL_NAMES = Object.freeze({
     "tabulaflow_update_semantic_field",
     "tabulaflow_list_metric_definitions",
     "tabulaflow_upsert_metric_definition",
-    "tabulaflow_delete_metric_definition",
     "tabulaflow_replace_recipe",
     "tabulaflow_duplicate_prepared_dataset",
     "tabulaflow_get_prepare_dataset",
@@ -743,14 +754,17 @@ export function createWebMcpTools(contextRef, availability) {
     },
   }, {
     name: "tabulaflow_cancel_operation",
-    title: "Cancel a pending TabulaFlow operation",
-    description: "Cancel an accepted or running mutation before its commit boundary.",
-    inputSchema: OPERATION_STATUS_SCHEMA,
+    title: "Cancel pending TabulaFlow work",
+    description: "Cancel an accepted or running mutation before commit, or dismiss an awaiting-user Source interaction.",
+    inputSchema: CANCEL_PENDING_SCHEMA,
     annotations: { readOnlyHint: false, destructiveHint: false },
-    async execute({ operationId }) {
+    async execute({ operationId, interactionId }) {
       const { actions } = activeContext(contextRef);
-      const result = await actions.cancelOperation(operationId);
-      return webMcpResult(`Cancellation state for ${operationId}: ${result.status}.`, result);
+      const result = interactionId
+        ? await actions.cancelInteraction(interactionId)
+        : await actions.cancelOperation(operationId);
+      const targetId = interactionId ?? operationId;
+      return webMcpResult(`Cancellation state for ${targetId}: ${result.status}.`, result);
     },
   }, {
     name: "tabulaflow_get_pending_confirmations",
@@ -782,8 +796,12 @@ export function createWebMcpTools(contextRef, availability) {
     annotations: { readOnlyHint: false },
     async execute({ workspace }) {
       const { actions } = activeContext(contextRef);
+      const before = runtimeHealth.snapshot();
       const result = await actions.openWorkspace(workspace);
-      return webMcpResult(`Opened the ${workspace} workspace.`, result);
+      const publication = result.workspaceChanged && before.status !== "unavailable"
+        ? await runtimeHealth.waitForStableGeneration(before.generation, { workspace })
+        : runtimeHealth.snapshot();
+      return webMcpResult(`Opened the ${workspace} workspace.`, { ...result, generation: publication.generation });
     },
   }, {
     name: "tabulaflow_request_source_file",
@@ -793,8 +811,12 @@ export function createWebMcpTools(contextRef, availability) {
     annotations: { readOnlyHint: false },
     async execute() {
       const { actions } = activeContext(contextRef);
+      const before = runtimeHealth.snapshot();
       const result = await actions.requestSourceFileSelection();
-      return webMcpResult("The Source file chooser is ready for the user.", result);
+      const publication = result.workspaceChanged && before.status !== "unavailable"
+        ? await runtimeHealth.waitForStableGeneration(before.generation, { workspace: "source" })
+        : runtimeHealth.snapshot();
+      return webMcpResult("The Source file chooser is ready for the user.", { ...result, generation: publication.generation });
     },
   }, {
     name: "tabulaflow_request_source_relink",
@@ -804,8 +826,12 @@ export function createWebMcpTools(contextRef, availability) {
     annotations: { readOnlyHint: false },
     async execute({ sourceAssetId }) {
       const { actions } = activeContext(contextRef);
+      const before = runtimeHealth.snapshot();
       const result = await actions.requestSourceRelink(sourceAssetId);
-      return webMcpResult("The source Re-link control is ready for the user.", result);
+      const publication = result.workspaceChanged && before.status !== "unavailable"
+        ? await runtimeHealth.waitForStableGeneration(before.generation, { workspace: "source" })
+        : runtimeHealth.snapshot();
+      return webMcpResult("The source Re-link control is ready for the user.", { ...result, generation: publication.generation });
     },
   }, {
     name: "tabulaflow_request_reset_all",
@@ -1467,6 +1493,7 @@ export async function registerWebMcpTools(modelContext, tools, signal, {
           });
         };
         try {
+          assertWebMcpInput(tool.inputSchema, input);
           const result = await tool.execute(input);
           if (result?.structuredContent && typeof result.structuredContent === "object") {
             result.structuredContent = {
@@ -1577,6 +1604,7 @@ export function useWebMcpTools(context) {
 
       runtimeHealth.beginRegistration({
         generation: nextGeneration,
+        workspace: availability.workspace,
         registeredToolCount: coreToolsRef.current.length,
         expectedToolCount: coreToolsRef.current.length + workspace.length,
         metrics: combinedMetrics,
@@ -1601,6 +1629,7 @@ export function useWebMcpTools(context) {
         };
         runtimeHealth.completeRegistration({
           generation: nextGeneration,
+          workspace: availability.workspace,
           registeredToolCount: coreToolsRef.current.length + workspace.length,
           expectedToolCount: coreToolsRef.current.length + workspace.length,
           metrics: combinedMetrics,
@@ -1633,6 +1662,7 @@ export function useWebMcpTools(context) {
           const restoredMetrics = measureWebMcpToolset([...coreToolsRef.current, ...previous.tools]);
           runtimeHealth.completeRegistration({
             generation: nextGeneration,
+            workspace: previous.workspace,
             registeredToolCount: coreToolsRef.current.length + previous.tools.length,
             expectedToolCount: coreToolsRef.current.length + previous.tools.length,
             metrics: restoredMetrics,
