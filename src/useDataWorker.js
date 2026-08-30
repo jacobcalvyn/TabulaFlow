@@ -53,6 +53,7 @@ export function useDataWorker() {
     for (const [requestId, pending] of pendingRef.current.entries()) {
       if (generation !== null && pending.generation !== generation) continue;
       window.clearTimeout(pending.timeoutId);
+      pending.signal?.removeEventListener("abort", pending.abortHandler);
       pending.reject(error);
       pendingRef.current.delete(requestId);
     }
@@ -74,6 +75,7 @@ export function useDataWorker() {
       if (!pending || pending.generation !== generation) return;
       pendingRef.current.delete(event.data.requestId);
       window.clearTimeout(pending.timeoutId);
+      pending.signal?.removeEventListener("abort", pending.abortHandler);
       setProgress((current) => current?.requestId === event.data.requestId ? null : current);
       if (event.data.ok) pending.resolve(event.data.result);
       else pending.reject(new DataWorkerError(event.data.error));
@@ -88,19 +90,32 @@ export function useDataWorker() {
     return worker;
   }, []);
 
-  const sendDirect = useCallback((type, payload, { recoverOnTimeout = true, timeoutMs = REQUEST_TIMEOUT_MS } = {}) => new Promise((resolve, reject) => {
+  const sendDirect = useCallback((type, payload, { recoverOnTimeout = true, timeoutMs = REQUEST_TIMEOUT_MS, signal = null } = {}) => new Promise((resolve, reject) => {
     const worker = workerRef.current;
     const generation = generationRef.current;
     if (!worker) {
       reject(new DataWorkerError({ code: "WORKER_NOT_READY", message: "Data worker is not ready." }));
       return;
     }
+    if (signal?.aborted) {
+      reject(new DataWorkerError({ code: "OPERATION_CANCELLED", message: "The data operation was cancelled before it started." }));
+      return;
+    }
     const requestId = ++sequenceRef.current;
     setProgress({ requestId, phase: "queued", percent: 0 });
+    const abortHandler = () => {
+      setProgress((current) => current?.requestId === requestId ? { ...current, phase: "cancelling" } : current);
+      try {
+        worker.postMessage({ kind: "cancel", requestId });
+      } catch {
+        // Worker recovery owns transport failures; the mutation fence still prevents commit.
+      }
+    };
     const timeoutId = window.setTimeout(() => {
       const pending = pendingRef.current.get(requestId);
       if (!pending || pending.generation !== generation) return;
       pendingRef.current.delete(requestId);
+      pending.signal?.removeEventListener("abort", pending.abortHandler);
       setProgress((current) => current?.requestId === requestId ? null : current);
       const error = new DataWorkerError({
         code: "WORKER_TIMEOUT",
@@ -111,12 +126,14 @@ export function useDataWorker() {
       reject(error);
       if (recoverOnTimeout) recoverHandlerRef.current?.(error);
     }, timeoutMs);
-    pendingRef.current.set(requestId, { resolve, reject, timeoutId, generation });
+    pendingRef.current.set(requestId, { resolve, reject, timeoutId, generation, signal, abortHandler });
+    signal?.addEventListener("abort", abortHandler, { once: true });
     try {
       worker.postMessage({ requestId, type, payload });
     } catch (cause) {
       window.clearTimeout(timeoutId);
       pendingRef.current.delete(requestId);
+      signal?.removeEventListener("abort", abortHandler);
       setProgress((current) => current?.requestId === requestId ? null : current);
       reject(cause instanceof Error ? cause : new DataWorkerError({ message: "Data worker request could not be sent." }));
     }
@@ -185,15 +202,15 @@ export function useDataWorker() {
     };
   }, [createWorker, rejectPending, sendDirect]);
 
-  const request = useCallback(async (type, payload) => {
+  const request = useCallback(async (type, payload, options = {}) => {
     if (recoveryRef.current) await recoveryRef.current;
     const timeoutMs = type === "load-file" || type === "inspect-file" || type === "load-demo" || type === "materialize-compose-prepared" || type === "materialize-rows-prepared" ? LOAD_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
     try {
-      return await sendDirect(type, payload, { timeoutMs });
+      return await sendDirect(type, payload, { timeoutMs, signal: options.signal });
     } catch (error) {
       if (!isRecoverableWorkerStateError(error)) throw error;
       await recover(error);
-      return sendDirect(type, payload, { recoverOnTimeout: false, timeoutMs });
+      return sendDirect(type, payload, { recoverOnTimeout: false, timeoutMs, signal: options.signal });
     }
   }, [recover, sendDirect]);
 
@@ -202,8 +219,8 @@ export function useDataWorker() {
     globalThis[SESSION_REGISTRY_KEY] = nextState;
   };
 
-  const loadFile = useCallback(async (file, identifiers = {}) => {
-    const result = await request("load-file", { file, ...identifiers });
+  const loadFile = useCallback(async (file, identifiers = {}, options = {}) => {
+    const result = await request("load-file", { file, ...identifiers }, options);
     rememberStableState(rememberLoadedSource(stableStateRef.current, {
       sourceId: result.sourceId,
       origin: "file",
@@ -213,7 +230,7 @@ export function useDataWorker() {
     }));
     return result;
   }, [request]);
-  const inspectFile = useCallback((file) => request("inspect-file", { file }), [request]);
+  const inspectFile = useCallback((file, options = {}) => request("inspect-file", { file }, options), [request]);
   const loadDemo = useCallback(async (identifiers = {}) => {
     const result = await request("load-demo", identifiers);
     rememberStableState(rememberLoadedSource(stableStateRef.current, {
@@ -225,8 +242,8 @@ export function useDataWorker() {
     }));
     return result;
   }, [request]);
-  const filter = useCallback(async (filters, aggregateColumns) => {
-    const result = await request("filter", { filters, aggregateColumns });
+  const filter = useCallback(async (filters, aggregateColumns, options = {}) => {
+    const result = await request("filter", { filters, aggregateColumns }, options);
     rememberStableState(rememberActiveFilters(stableStateRef.current, filters, result.aggregateColumns));
     return result;
   }, [request]);
@@ -235,9 +252,9 @@ export function useDataWorker() {
   const resolveAgentValue = useCallback((column, valueRef) => request("resolve-agent-value", { column, valueRef }), [request]);
   const previewPrepared = useCallback((filters, columns, options = {}) => request("prepare-preview", { filters, columns, ...options }), [request]);
   const profileData = useCallback((columns, semanticSchema = []) => request("data-profile", { columns, semanticSchema }), [request]);
-  const exportData = useCallback((format, filters, baseName) => request("export", { format, filters, baseName }), [request]);
-  const activatePrepared = useCallback(async (preparedId, filters = {}, aggregateColumns = []) => {
-    const result = await request("activate-prepared", { preparedId, filters, aggregateColumns });
+  const exportData = useCallback((format, filters, baseName, options = {}) => request("export", { format, filters, baseName }, options), [request]);
+  const activatePrepared = useCallback(async (preparedId, filters = {}, aggregateColumns = [], options = {}) => {
+    const result = await request("activate-prepared", { preparedId, filters, aggregateColumns }, options);
     rememberStableState(rememberActivePrepared(stableStateRef.current, {
       preparedId,
       recipe: result.recipe,
@@ -266,8 +283,8 @@ export function useDataWorker() {
     rememberStableState(createWorkerRegistry());
     return result;
   }, [request]);
-  const materializeComposePrepared = useCallback(async (graph, nodeId, identifiers) => {
-    const result = await request("materialize-compose-prepared", { graph, nodeId, identifiers });
+  const materializeComposePrepared = useCallback(async (graph, nodeId, identifiers, options = {}) => {
+    const result = await request("materialize-compose-prepared", { graph, nodeId, identifiers }, options);
     rememberStableState(rememberLoadedSource(stableStateRef.current, {
       sourceId: result.sourceId,
       origin: "compose",
@@ -288,8 +305,8 @@ export function useDataWorker() {
     }));
     return result;
   }, [request]);
-  const applyRecipe = useCallback(async (recipe, filters = {}, aggregateColumns = [], preparedId = stableStateRef.current.activePreparedId) => {
-    const result = await request("apply-recipe", { recipe, filters, aggregateColumns, preparedId });
+  const applyRecipe = useCallback(async (recipe, filters = {}, aggregateColumns = [], preparedId = stableStateRef.current.activePreparedId, options = {}) => {
+    const result = await request("apply-recipe", { recipe, filters, aggregateColumns, preparedId }, options);
     rememberStableState(rememberActivePrepared(stableStateRef.current, {
       preparedId,
       recipe,
@@ -299,9 +316,9 @@ export function useDataWorker() {
     return result;
   }, [request]);
   const previewRecipe = useCallback((recipe, stepIndex, options = {}) => request("preview-recipe", { recipe, stepIndex, options }), [request]);
-  const previewCompose = useCallback((graph, nodeId, options = {}) => request("compose-preview", { graph, nodeId, options }), [request]);
+  const previewCompose = useCallback((graph, nodeId, options = {}, requestOptions = {}) => request("compose-preview", { graph, nodeId, options }, requestOptions), [request]);
   const composeNodeQuality = useCallback((graph, nodeId) => request("compose-quality", { graph, nodeId }), [request]);
-  const exportCompose = useCallback((graph, nodeId, format) => request("compose-export", { graph, nodeId, format }), [request]);
+  const exportCompose = useCallback((graph, nodeId, format, options = {}) => request("compose-export", { graph, nodeId, format }, options), [request]);
   const composeConnectionOptions = useCallback((graph, nodeId) => request("compose-connection-options", { graph, nodeId }), [request]);
 
   return useMemo(() => ({

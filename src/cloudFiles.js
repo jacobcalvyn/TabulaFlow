@@ -25,8 +25,8 @@ export async function uploadCloudFile(file) {
   }));
 }
 
-export async function openCloudFile(file) {
-  const response = await fetch(`/api/cloud-files/${encodeURIComponent(file.id)}`);
+export async function openCloudFile(file, { signal } = {}) {
+  const response = await fetch(`/api/cloud-files/${encodeURIComponent(file.id)}`, { signal });
   if (!response.ok) await readJson(response);
   const blob = await response.blob();
   return new File([blob], file.name, {

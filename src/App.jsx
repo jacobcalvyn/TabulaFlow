@@ -2556,7 +2556,7 @@ export function App() {
 
     setLoading(true);
     try {
-      const inspected = await worker.inspectFile(nextFile);
+      const inspected = await worker.inspectFile(nextFile, { signal: beforeCommit?.signal });
       const matchingSource = findMatchingFileSource(flowRef.current, nextFile, inspected.sourceColumns);
       if (matchingSource) {
         const storedHandle = await loadStoredSourceHandle(matchingSource.id);
@@ -2567,7 +2567,7 @@ export function App() {
           return { ok: true, relinked: true };
         }
       }
-      const result = await worker.loadFile(nextFile);
+      const result = await worker.loadFile(nextFile, {}, { signal: beforeCommit?.signal });
       transientPreparedId = result.preparedId;
       beforeCommit?.();
       await activateDataset(result, {
@@ -2596,7 +2596,7 @@ export function App() {
     beforeCommit?.();
     const previousFilters = filtersRef.current;
     const previousAggregateColumns = dataset?.aggregateColumns ?? [];
-    const result = await worker.filter(filters, aggregateColumns);
+    const result = await worker.filter(filters, aggregateColumns, { signal: beforeCommit?.signal });
     try {
       beforeCommit?.();
     } catch (cause) {
@@ -2674,7 +2674,7 @@ export function App() {
       dataset?.aggregateColumnLimit ?? 200,
     );
     beforeCommit?.();
-    const result = await worker.applyRecipe(nextRecipe, filtersRef.current, nextAggregateColumns, preparedId);
+    const result = await worker.applyRecipe(nextRecipe, filtersRef.current, nextAggregateColumns, preparedId, { signal: beforeCommit?.signal });
     try {
       beforeCommit?.();
     } catch (cause) {
@@ -2726,6 +2726,7 @@ export function App() {
   };
 
   const openPrepared = async (preparedId, beforeCommit = null, throwOnError = false) => {
+    const previousPreparedId = activePreparedIdRef.current;
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === preparedId);
     const source = flowRef.current.sourceAssets.find((item) => item.id === prepared?.sourceAssetId);
     if (!prepared || !source) {
@@ -2757,6 +2758,7 @@ export function App() {
         source,
         filters: {},
         aggregateColumns: prepared.schema.map((column) => column.name),
+        signal: beforeCommit?.signal,
       });
       beforeCommit?.();
       setDataset(result);
@@ -2770,6 +2772,17 @@ export function App() {
       }), { semantic: false });
       setScreen("data");
     } catch (cause) {
+      if (cause?.code === "OPERATION_CANCELLED" && previousPreparedId && previousPreparedId !== preparedId) {
+        try {
+          await worker.activatePrepared(previousPreparedId, filtersRef.current, dataset?.aggregateColumns ?? []);
+        } catch {
+          // Preserve the cancellation error; worker recovery will reconcile an unavailable previous dataset.
+        }
+      }
+      if (cause?.code === "OPERATION_CANCELLED") {
+        if (throwOnError) throw cause;
+        return;
+      }
       setError(cause instanceof Error ? cause.message : t("fileReadFailed"));
       setScreen("input");
       if (throwOnError) throw cause;
@@ -2821,7 +2834,7 @@ export function App() {
         sourceId: candidate.sourceAsset.id,
         preparedId: candidate.preparedInput.id,
         filename: candidate.preparedInput.name,
-      });
+      }, { signal: beforeCommit?.signal });
       try {
         beforeCommit?.();
       } catch (cause) {
@@ -2891,7 +2904,7 @@ export function App() {
     setComposeLoading(true);
     setComposeError("");
     try {
-      const preview = await worker.previewCompose(nextFlow, nodeId);
+      const preview = await worker.previewCompose(nextFlow, nodeId, {}, { signal: beforeCommit?.signal });
       beforeCommit?.();
       const committedFlow = nextFlow.composeNodes.some((node) => node.id === nodeId)
         ? {
@@ -2915,7 +2928,7 @@ export function App() {
   const createComposeNode = async (draft, beforeCommit = null, activityContext = null) => {
     beforeCommit?.();
     const candidate = addComposeNode(flowRef.current, draft);
-    const preview = await worker.previewCompose(candidate.graph, candidate.node.id);
+    const preview = await worker.previewCompose(candidate.graph, candidate.node.id, {}, { signal: beforeCommit?.signal });
     beforeCommit?.();
     const committed = {
       ...candidate.graph,
@@ -2937,7 +2950,7 @@ export function App() {
   const updateComposeOperation = async (nodeId, draft, beforeCommit = null, activityContext = null) => {
     beforeCommit?.();
     const candidate = updateComposeNode(flowRef.current, nodeId, draft);
-    const preview = await worker.previewCompose(candidate.graph, nodeId);
+    const preview = await worker.previewCompose(candidate.graph, nodeId, {}, { signal: beforeCommit?.signal });
     beforeCommit?.();
     const descendantIds = collectDescendantNodeIds(candidate.graph, [nodeId]);
     const committed = {
@@ -3005,7 +3018,7 @@ export function App() {
 
   const exportComposeNode = async (format, nodeId = flowRef.current.activeNodeId, activityContext = null, beforeDownload = null) => {
     if (!nodeId) throw new Error("Select a Compose node before exporting.");
-    const result = await worker.exportCompose(flowRef.current, nodeId, format);
+    const result = await worker.exportCompose(flowRef.current, nodeId, format, { signal: beforeDownload?.signal });
     beforeDownload?.();
     downloadExport(result);
     const activity = await recordActivity({ action: "compose_exported", targetType: "compose-node", targetId: nodeId, summary: { format } }, activityContext ?? undefined);
@@ -3016,7 +3029,7 @@ export function App() {
     if (!dataset || preparedId !== activePreparedId) throw new Error(`Prepared dataset is not active: ${preparedId}`);
     setScreen("data");
     const preparedName = flowRef.current.preparedInputs.find((item) => item.id === preparedId)?.name;
-    const result = await worker.exportData(format, filters, preparedName ?? dataset.filename);
+    const result = await worker.exportData(format, filters, preparedName ?? dataset.filename, { signal: beforeDownload?.signal });
     beforeDownload?.();
     downloadExport(result);
     const activity = await recordActivity({ action: "prepared_exported", targetType: "prepared", targetId: preparedId, summary: { format, rowCount: dataset.filteredCount, columnCount: dataset.columns.length } }, activityContext ?? undefined);
@@ -3322,7 +3335,7 @@ export function App() {
     if (!cloud.authenticated) throw new Error("Cloud files require ChatGPT sign-in.");
     const metadata = cloud.files.find((item) => item.id === fileId);
     if (!metadata) throw new Error(`Cloud file not found: ${fileId}`);
-    const file = await openCloudFile(metadata);
+    const file = await openCloudFile(metadata, { signal: assertCurrent.signal });
     setScreen("input");
     await loadFile(file, null, true, assertCurrent, webMcpActivity(meta));
     return { fileId, name: metadata.name, size: metadata.size };

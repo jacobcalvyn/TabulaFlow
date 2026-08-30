@@ -5,9 +5,10 @@ export async function activatePreparedForFlow({
   source,
   filters = {},
   aggregateColumns = [],
+  signal = null,
 }) {
   try {
-    return await worker.activatePrepared(prepared.id, filters, aggregateColumns);
+    return await worker.activatePrepared(prepared.id, filters, aggregateColumns, { signal });
   } catch (error) {
     const canMaterializeComposeResult = error?.code === "SOURCE_REQUIRED"
       && source?.location === "compose-result"
@@ -18,7 +19,7 @@ export async function activatePreparedForFlow({
       sourceId: source.id,
       preparedId: prepared.id,
       filename: prepared.name,
-    });
-    return worker.activatePrepared(prepared.id, filters, aggregateColumns);
+    }, { signal });
+    return worker.activatePrepared(prepared.id, filters, aggregateColumns, { signal });
   }
 }

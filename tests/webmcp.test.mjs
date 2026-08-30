@@ -22,7 +22,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "3.2.5", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "3.2.6", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -47,7 +47,7 @@ function createContext() {
         async getActivityLog(options) { calls.push(["activity", options]); return { events: [{ sequence: 12, actor: "agent" }], cursor: 12, hasMore: false }; },
         async getChangesSince(cursor, options) { calls.push(["changes", cursor, options]); return { events: [], cursor, hasMore: false }; },
         async getOperationStatus(operationId) { calls.push(["operation-status", operationId]); return { operationId, status: "succeeded" }; },
-        async cancelOperation(operationId) { calls.push(["cancel-operation", operationId]); return { operationId, status: "cancelling" }; },
+        async cancelOperation(operationId) { calls.push(["cancel-operation", operationId]); return { operationId, status: "cancelling", cancelAccepted: true, reason: "CANCEL_ACCEPTED", terminalStatus: null }; },
         async cancelInteraction(interactionId) { calls.push(["cancel-interaction", interactionId]); return { interactionId, status: "cancelled" }; },
         async getPendingConfirmations() { calls.push(["pending-confirmations"]); return { confirmations: [] }; },
         async rejectConfirmation(confirmationId) { calls.push(["reject-confirmation", confirmationId]); return { confirmationId, status: "cancelled" }; },
@@ -154,6 +154,16 @@ test("WebMCP confirmation protocol is inspect-or-reject and never exposes agent 
   assert.equal(tools.some((tool) => /confirm.*delet|resolve.*confirm/i.test(tool.name)), false);
 });
 
+test("WebMCP cancellation reports whether the request was accepted", async () => {
+  const { calls, ref } = createContext();
+  const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
+  const result = await toolByName(tools, "tabulaflow_cancel_operation").execute({ operationId: "operation-a" });
+  assert.equal(result.structuredContent.cancelAccepted, true);
+  assert.equal(result.structuredContent.reason, "CANCEL_ACCEPTED");
+  assert.equal(result.structuredContent.terminalStatus, null);
+  assert.deepEqual(calls.at(-1), ["cancel-operation", "operation-a"]);
+});
+
 test("qualitative coding WebMCP uses one bounded dispatcher and keeps approval human-only", async () => {
   const { calls, ref } = createContext();
   const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
@@ -167,7 +177,7 @@ test("qualitative coding WebMCP uses one bounded dispatcher and keeps approval h
   assert.equal(coding.inputSchema.properties.action.enum.includes("approve"), false);
 });
 
-test("WebMCP 3.2.5 registers one small stable dispatcher surface", () => {
+test("WebMCP 3.2.6 registers one small stable dispatcher surface", () => {
   const { ref } = createContext();
   const stable = createWebMcpStableTools(ref);
   assert.deepEqual(stable.map((tool) => tool.name), WEBMCP_STABLE_TOOL_NAMES);
@@ -236,8 +246,9 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "3.2.5");
+  assert.equal(capabilities.structuredContent.contractVersion, "3.2.6");
   assert.deepEqual(capabilities.structuredContent.operationLifecycle.terminalStates, ["succeeded", "failed", "cancelled"]);
+  assert.deepEqual(capabilities.structuredContent.operationLifecycle.cancelOutcomes, ["CANCEL_ACCEPTED", "ALREADY_TERMINAL", "TOO_LATE_TO_CANCEL"]);
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");

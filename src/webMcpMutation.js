@@ -20,6 +20,18 @@ function digestFingerprint(value) {
   return `fnv1a64:${hash.toString(16).padStart(16, "0")}`;
 }
 
+function cancellationResult(operation, cancelAccepted, reason) {
+  const status = operationStatusForAgent(operation);
+  return {
+    ...status,
+    cancelAccepted,
+    reason,
+    terminalStatus: ["succeeded", "failed", "cancelled"].includes(operation.status)
+      ? operation.status
+      : null,
+  };
+}
+
 export function createWebMcpMutationRunner({
   getRevision,
   getFlowId = () => null,
@@ -99,6 +111,7 @@ export function createWebMcpMutationRunner({
       completedAt: null,
       result: null,
       error: null,
+      abortController: new AbortController(),
     };
     operations.set(operationId, operation);
     persist(operation);
@@ -132,6 +145,10 @@ export function createWebMcpMutationRunner({
           persist(operation);
         }
       };
+      Object.defineProperties(assertCurrent, {
+        operationId: { value: operationId, enumerable: true },
+        signal: { value: operation.abortController.signal, enumerable: true },
+      });
       const result = await execute(assertCurrent);
       if (operation.cancelRequested || (operationClass !== "confirmation-request" && operation.writeEpoch !== writeEpoch)) {
         throw mutationError("The operation was cancelled before its commit boundary.", "OPERATION_CANCELLED");
@@ -156,7 +173,7 @@ export function createWebMcpMutationRunner({
       ? Promise.resolve().then(executeOperation)
       : mutationQueue.then(executeOperation);
     const promise = scheduled.catch((cause) => {
-      operation.status = cause?.code === "OPERATION_CANCELLED" ? "cancelled" : "failed";
+      operation.status = operation.cancelRequested || cause?.code === "OPERATION_CANCELLED" ? "cancelled" : "failed";
       operation.phase = operation.status === "cancelled" ? "cancelled" : "failed";
       operation.completedAt = new Date().toISOString();
       operation.error = operation.status === "cancelled" ? null : sanitizeWebMcpError(cause);
@@ -198,14 +215,19 @@ export function createWebMcpMutationRunner({
   runWebMcpMutation.cancelOperation = (operationId) => {
     const operation = operations.get(String(operationId ?? ""));
     if (!operation) throw mutationError(`Mutation operation not found: ${operationId}`, "OPERATION_NOT_FOUND");
-    if (["succeeded", "failed", "cancelled"].includes(operation.status)) return operationStatusForAgent(operation);
-    if (operation.status === "committing") throw mutationError("The operation has crossed its commit boundary.", "TOO_LATE_TO_CANCEL");
+    if (["succeeded", "failed", "cancelled"].includes(operation.status)) {
+      return cancellationResult(operation, false, "ALREADY_TERMINAL");
+    }
+    if (operation.status === "committing") {
+      return cancellationResult(operation, false, "TOO_LATE_TO_CANCEL");
+    }
     operation.cancelRequested = true;
     operation.status = "cancelling";
     operation.phase = "cancelling";
+    operation.abortController?.abort(mutationError("The operation was cancelled before its commit boundary.", "OPERATION_CANCELLED"));
     if (activeWriterOperationId === operation.operationId) writeEpoch += 1;
     persist(operation);
-    return operationStatusForAgent(operation);
+    return cancellationResult(operation, true, "CANCEL_ACCEPTED");
   };
 
   runWebMcpMutation.fenceMutations = () => {
@@ -220,6 +242,7 @@ export function createWebMcpMutationRunner({
       operation.cancelRequested = true;
       operation.status = "cancelling";
       operation.phase = "cancelling";
+      operation.abortController?.abort(mutationError("The operation was cancelled before its commit boundary.", "OPERATION_CANCELLED"));
       persist(operation);
     }
     return cancellable.map((operation) => operation.operationId);
@@ -249,6 +272,7 @@ export function createWebMcpMutationRunner({
     for (const stored of records.slice(0, maximumEntries * 2)) {
       if (!stored?.operationId || !stored?.requestId || (!stored?.fingerprintHash && !stored?.fingerprint)) continue;
       const operation = structuredClone(stored);
+      operation.abortController = new AbortController();
       operation.fingerprintHash ??= digestFingerprint(operation.fingerprint);
       delete operation.fingerprint;
       if (operation.status === "committed") operation.status = "succeeded";

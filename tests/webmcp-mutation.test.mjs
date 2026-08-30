@@ -297,9 +297,11 @@ test("operation status never exposes raw fingerprints or mutation payloads", asy
 test("cancellation fences a running writer before commit", async () => {
   let revision = 20;
   let release;
+  let operationSignal;
   const gate = new Promise((resolve) => { release = resolve; });
   const run = createWebMcpMutationRunner({ getRevision: () => revision });
   const accepted = await run({ expectedRevision: 20, requestId: "cancel-writer-001", executionMode: "async" }, async (assertCurrent) => {
+    operationSignal = assertCurrent.signal;
     assertCurrent();
     await gate;
     assertCurrent();
@@ -307,11 +309,98 @@ test("cancellation fences a running writer before commit", async () => {
     return { ok: true };
   }, "recipe:cancel");
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(run.cancelOperation(accepted.operationId).status, "cancelling");
+  const cancellation = run.cancelOperation(accepted.operationId);
+  assert.equal(cancellation.status, "cancelling");
+  assert.equal(cancellation.cancelAccepted, true);
+  assert.equal(cancellation.reason, "CANCEL_ACCEPTED");
+  assert.equal(cancellation.terminalStatus, null);
+  assert.equal(operationSignal.aborted, true);
   release();
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(run.getOperationStatus(accepted.operationId).status, "cancelled");
   assert.equal(revision, 20);
+});
+
+test("cancelling a terminal operation reports that no cancellation was accepted", async () => {
+  let revision = 5;
+  const run = createWebMcpMutationRunner({ getRevision: () => revision });
+  const result = await run({ expectedRevision: 5, requestId: "cancel-terminal-001" }, async () => {
+    revision += 1;
+    return { ok: true };
+  }, "recipe:terminal");
+  const cancellation = run.cancelOperation(result.operationId);
+  assert.equal(cancellation.cancelAccepted, false);
+  assert.equal(cancellation.reason, "ALREADY_TERMINAL");
+  assert.equal(cancellation.status, "succeeded");
+  assert.equal(cancellation.terminalStatus, "succeeded");
+  assert.equal(cancellation.cancelRequested, false);
+});
+
+test("cancelling a queued writer prevents it from starting", async () => {
+  let revision = 12;
+  let releaseFirst;
+  let secondExecuted = false;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const run = createWebMcpMutationRunner({ getRevision: () => revision });
+  const first = await run({ expectedRevision: 12, requestId: "cancel-queue-first", executionMode: "async" }, async () => {
+    await firstGate;
+    revision += 1;
+    return { ok: true };
+  }, "recipe:first");
+  const second = await run({ expectedRevision: 12, requestId: "cancel-queue-second", executionMode: "async" }, async () => {
+    secondExecuted = true;
+    return { ok: true };
+  }, "recipe:second");
+  const cancellation = run.cancelOperation(second.operationId);
+  assert.equal(cancellation.cancelAccepted, true);
+  assert.equal(cancellation.reason, "CANCEL_ACCEPTED");
+  releaseFirst();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(run.getOperationStatus(first.operationId).status, "succeeded");
+  assert.equal(run.getOperationStatus(second.operationId).status, "cancelled");
+  assert.equal(secondExecuted, false);
+  assert.equal(revision, 13);
+});
+
+test("an aborted dependency is classified as cancelled instead of failed", async () => {
+  const run = createWebMcpMutationRunner({ getRevision: () => 14 });
+  const accepted = await run({ expectedRevision: 14, requestId: "cancel-abort-error-001", executionMode: "async" }, async (assertCurrent) => {
+    await new Promise((resolve, reject) => {
+      assertCurrent.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    });
+  }, "cloud:open");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(run.cancelOperation(accepted.operationId).cancelAccepted, true);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const terminal = run.getOperationStatus(accepted.operationId);
+  assert.equal(terminal.status, "cancelled");
+  assert.equal(terminal.error, null);
+  assert.equal(terminal.diagnostics.length, 0);
+});
+
+test("cancelling after the commit boundary returns a structured too-late result", async () => {
+  let revision = 8;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const run = createWebMcpMutationRunner({ getRevision: () => revision });
+  const accepted = await run({ expectedRevision: 8, requestId: "cancel-committing-001", executionMode: "async" }, async (assertCurrent) => {
+    assertCurrent();
+    assertCurrent();
+    await gate;
+    revision += 1;
+    return { ok: true };
+  }, "compose:committing");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const cancellation = run.cancelOperation(accepted.operationId);
+  assert.equal(cancellation.cancelAccepted, false);
+  assert.equal(cancellation.reason, "TOO_LATE_TO_CANCEL");
+  assert.equal(cancellation.status, "committing");
+  assert.equal(cancellation.terminalStatus, null);
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(run.getOperationStatus(accepted.operationId).status, "succeeded");
+  assert.equal(revision, 9);
 });
 
 test("a registration-generation fence prevents an older writer from committing", async () => {

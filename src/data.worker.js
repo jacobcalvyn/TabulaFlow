@@ -39,6 +39,8 @@ let stepStates = [];
 let engineVersion = "";
 let requestQueue = Promise.resolve();
 let activeRequestId = null;
+const knownRequestIds = new Set();
+const cancelledRequestIds = new Set();
 const sourceRegistry = new Map();
 const preparedRegistry = new Map();
 let activePreparedId = null;
@@ -47,6 +49,13 @@ const agentValueRefs = new Map();
 function reportProgress(phase, percent) {
   if (activeRequestId === null) return;
   self.postMessage({ kind: "progress", requestId: activeRequestId, phase, percent });
+}
+
+function assertRequestActive(requestId = activeRequestId) {
+  if (requestId === null || !cancelledRequestIds.has(requestId)) return;
+  const error = new Error("The data operation was cancelled before its commit boundary.");
+  error.code = "OPERATION_CANCELLED";
+  throw error;
 }
 
 function registryTableName(sequence) {
@@ -317,6 +326,7 @@ async function loadRows(rows, filename, identifiers = {}) {
     preparedRegistry.set(preparedId, { id: preparedId, sourceId, recipe: [], sourceColumns: [...sourceColumns], sourceSchema, filename });
     const result = await buildDataset();
     reportProgress("commit_data", 95);
+    assertRequestActive();
     await query("COMMIT");
     await query(`CREATE OR REPLACE TEMP VIEW ${SOURCE_TABLE} AS SELECT * FROM ${quoteIdentifier(tableName)}`);
     return { ...result, sourceId, preparedId };
@@ -698,6 +708,7 @@ async function activatePrepared(preparedId, filters = {}, requestedAggregateColu
     aggregateColumns = normalizeAggregateColumns(requestedAggregateColumns);
     const filterState = reconcileWorkerFilters(filters);
     const result = await buildDataset(filterState.appliedFilters, aggregateColumns);
+    assertRequestActive();
     await query("COMMIT");
     return { ...result, ...filterState, recipeError: compiled.recipeError };
   } catch (error) {
@@ -736,6 +747,7 @@ async function resetWorkspace() {
     await query(`DROP VIEW IF EXISTS ${WORKING_VIEW}`);
     await query(`DROP VIEW IF EXISTS ${SOURCE_TABLE}`);
     for (const tableName of tableNames) await query(`DROP TABLE IF EXISTS ${quoteIdentifier(tableName)}`);
+    assertRequestActive();
     await query("COMMIT");
   } catch (error) {
     try { await query("ROLLBACK"); } catch { /* recovery owns a failed rollback */ }
@@ -780,6 +792,7 @@ async function materializeComposePrepared(graph, nodeId, identifiers) {
     const sourceColumns = schema.map((column) => column.name);
     sourceRegistry.set(sourceId, { id: sourceId, tableName, filename, sourceColumns, sourceSchema: schema });
     preparedRegistry.set(preparedId, { id: preparedId, sourceId, recipe: [], sourceColumns, sourceSchema: schema, filename });
+    assertRequestActive();
     await query("COMMIT");
     return { sourceId, preparedId, schema, rowCount: Number(count[0]?.row_count ?? 0) };
   } catch (error) {
@@ -1100,6 +1113,7 @@ async function applyRecipe(recipe, filters = {}, requestedAggregateColumns, prep
     qualityCache = null;
     const filterState = reconcileWorkerFilters(filters);
     const result = await buildDataset(filterState.appliedFilters, aggregateColumns);
+    assertRequestActive();
     await query("COMMIT");
     if (activePreparedId && preparedRegistry.has(activePreparedId)) {
       preparedRegistry.set(activePreparedId, { ...preparedRegistry.get(activePreparedId), recipe: cloneRecipe(recipe) });
@@ -1168,6 +1182,7 @@ async function previewRecipe(recipe, stepIndex, options = {}) {
 }
 
 async function handleRequest(type, payload) {
+  assertRequestActive();
   if (type === "initialize") return initializeDuckDB().then(() => ({ engineVersion }));
   if (type === "load-file") {
     reportProgress("read_file", 5);
@@ -1189,7 +1204,19 @@ async function handleRequest(type, payload) {
   if (type === "unregister-prepared") return unregisterPrepared(payload.preparedId);
   if (type === "reset-workspace") return resetWorkspace();
   if (type === "materialize-compose-prepared") return materializeComposePrepared(payload.graph, payload.nodeId, payload.identifiers);
-  if (type === "filter") return buildDataset(payload.filters, payload.aggregateColumns);
+  if (type === "filter") {
+    const previousAggregateColumns = aggregateColumns;
+    const previousQualityCache = qualityCache;
+    try {
+      const result = await buildDataset(payload.filters, payload.aggregateColumns);
+      assertRequestActive();
+      return result;
+    } catch (error) {
+      aggregateColumns = previousAggregateColumns;
+      qualityCache = previousQualityCache;
+      throw error;
+    }
+  }
   if (type === "search-aggregate") return searchAggregate(payload.column, payload.query, payload.filters, payload.offset, payload.limit);
   if (type === "search-aggregate-agent") return searchAggregateForAgent(payload.column, payload.query, payload.filters, payload.offset, payload.limit, payload.semanticSchema);
   if (type === "resolve-agent-value") return { raw: resolveAgentValueReference(payload.valueRef, payload.column) };
@@ -1206,17 +1233,28 @@ async function handleRequest(type, payload) {
 }
 
 self.addEventListener("message", (event) => {
-  const { requestId, type, payload = {} } = event.data;
+  const { requestId, type, payload = {}, kind } = event.data;
+  if (kind === "cancel") {
+    if (knownRequestIds.has(requestId)) cancelledRequestIds.add(requestId);
+    return;
+  }
+  knownRequestIds.add(requestId);
   requestQueue = requestQueue.then(async () => {
     activeRequestId = requestId;
     try {
+      assertRequestActive(requestId);
       const result = await handleRequest(type, payload);
+      assertRequestActive(requestId);
       self.postMessage({ requestId, ok: true, result }, type === "export" || type === "compose-export" ? [result.bytes] : []);
     } finally {
       activeRequestId = null;
+      knownRequestIds.delete(requestId);
+      cancelledRequestIds.delete(requestId);
     }
   }).catch((error) => {
     activeRequestId = null;
+    knownRequestIds.delete(requestId);
+    cancelledRequestIds.delete(requestId);
     self.postMessage({
       requestId,
       ok: false,

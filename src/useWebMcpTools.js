@@ -634,6 +634,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
   operationLifecycle: {
     states: ["accepted", "running", "committing", "succeeded", "failed", "cancelling", "cancelled"],
     terminalStates: ["succeeded", "failed", "cancelled"],
+    cancelOutcomes: ["CANCEL_ACCEPTED", "ALREADY_TERMINAL", "TOO_LATE_TO_CANCEL"],
     userInteractions: ["awaiting-user", "completed", "failed", "cancelled", "expired"],
   },
   safeguards: {
@@ -808,7 +809,7 @@ export function createWebMcpTools(contextRef, availability) {
   }, {
     name: "tabulaflow_cancel_operation",
     title: "Cancel pending TabulaFlow work",
-    description: "Cancel an accepted or running mutation before commit, or dismiss an awaiting-user Source interaction.",
+    description: "Cancel an accepted or running mutation before commit, or dismiss an awaiting-user Source interaction. Mutation results explicitly report whether cancellation was accepted, already terminal, or past the commit boundary.",
     inputSchema: CANCEL_PENDING_SCHEMA,
     annotations: { readOnlyHint: false, destructiveHint: false },
     async execute({ operationId, interactionId }) {
