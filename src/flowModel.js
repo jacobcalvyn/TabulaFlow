@@ -2,7 +2,7 @@ import { PREPARED_RECIPE_STATUS } from "./preparedRecipeState.js";
 import { compileComposeOperation } from "./composeSql.js";
 import { applySemanticModelToSchema, createSemanticModel, reconcileSemanticModel } from "./semanticModel.js";
 
-export const FLOW_SCHEMA_VERSION = 2;
+export const FLOW_SCHEMA_VERSION = 3;
 
 const CANVAS_NODE_WIDTH = 230;
 const CANVAS_NODE_HEIGHT = 104;
@@ -68,6 +68,7 @@ export function createFlowGraph() {
     composeNodes: [],
     semanticModels: {},
     metricDefinitions: [],
+    codingProjects: [],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -432,6 +433,60 @@ export function createPreparedFromCompose(graph, composeNodeId) {
   };
 }
 
+export function createPreparedFromGeneratedRows(graph, {
+  name,
+  schema,
+  rowCount,
+  codingProjectId,
+}) {
+  const sourceAssetId = createId("source");
+  const preparedInputId = createId("prepared");
+  const preparedName = uniquePreparedName(graph, name || "Coding review result");
+  const preparedSchema = (schema ?? []).map((column) => ({ ...column }));
+  const sourceAsset = {
+    id: sourceAssetId,
+    name: preparedName,
+    size: null,
+    lastModified: null,
+    location: "coding-result",
+    codingProjectId,
+    schemaFingerprint: schemaFingerprint(preparedSchema),
+    sourceColumns: preparedSchema.map((column) => column.name),
+    status: "linked",
+  };
+  const preparedInput = {
+    id: preparedInputId,
+    sourceAssetId,
+    name: preparedName,
+    recipeVersion: 1,
+    recipe: [],
+    recipeStatus: PREPARED_RECIPE_STATUS.APPLIED,
+    rowCount: Math.max(0, Number(rowCount) || 0),
+    schema: preparedSchema,
+    position: nextAvailablePosition(INITIAL_PREPARED_POSITION, [
+      ...graph.preparedInputs.map((item) => item.position),
+      ...graph.composeNodes.map((item) => item.position),
+    ]),
+  };
+  const semanticModel = createSemanticModel(preparedInputId, preparedSchema);
+  preparedInput.schema = applySemanticModelToSchema(preparedSchema, semanticModel);
+  return {
+    graph: {
+      ...graph,
+      revision: graph.revision + 1,
+      activeNodeId: graph.activeNodeId,
+      sourceAssets: [...graph.sourceAssets, sourceAsset],
+      preparedInputs: [...graph.preparedInputs, preparedInput],
+      semanticModels: { ...(graph.semanticModels ?? {}), [preparedInput.id]: semanticModel },
+      metricDefinitions: graph.metricDefinitions ?? [],
+      codingProjects: graph.codingProjects ?? [],
+      updatedAt: new Date().toISOString(),
+    },
+    sourceAsset,
+    preparedInput,
+  };
+}
+
 export function addComposeNode(graph, node) {
   const next = {
     ...node,
@@ -516,6 +571,11 @@ export function removePreparedInput(graph, preparedInputId) {
     preparedInputs,
     semanticModels: Object.fromEntries(Object.entries(graph.semanticModels ?? {}).filter(([targetId]) => targetId !== preparedInputId)),
     metricDefinitions: (graph.metricDefinitions ?? []).filter((metric) => metric.targetId !== preparedInputId),
+    codingProjects: (graph.codingProjects ?? [])
+      .filter((project) => project.preparedId !== preparedInputId)
+      .map((project) => project.materializedPreparedId === preparedInputId
+        ? { ...project, materializedPreparedId: null }
+        : project),
     updatedAt: new Date().toISOString(),
   };
   validateFlowGraph(candidate);
@@ -544,6 +604,7 @@ function inputIds(node) {
 
 export function validateFlowGraph(graph) {
   if (!graph || graph.schemaVersion !== FLOW_SCHEMA_VERSION) throw new Error("Versi flow tidak didukung.");
+  if (!Array.isArray(graph.codingProjects)) throw new Error("Coding projects must be an array.");
   const allNodes = [...graph.preparedInputs, ...graph.composeNodes];
   const ids = new Set();
   for (const node of allNodes) {
@@ -562,6 +623,10 @@ export function validateFlowGraph(graph) {
     if (unaryKinds.has(node.kind) && inputs.length !== 1) throw new Error(`Node ${node.name ?? node.id} memerlukan tepat satu input.`);
     if (binaryKinds.has(node.kind) && inputs.length !== 2) throw new Error(`Node ${node.name ?? node.id} memerlukan tepat dua input.`);
     if (node.kind === "append" && inputs.length < 2) throw new Error(`Node ${node.name ?? node.id} memerlukan minimal dua input.`);
+  }
+  const preparedIds = new Set(graph.preparedInputs.map((item) => item.id));
+  for (const project of graph.codingProjects) {
+    if (!project?.id || !preparedIds.has(project.preparedId)) throw new Error("Coding project refers to an unavailable prepared dataset.");
   }
   const visiting = new Set();
   const visited = new Set();

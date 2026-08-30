@@ -18,7 +18,7 @@ function createContext() {
     calls,
     ref: { current: {
       state: {
-        contractVersion: "3.1.1", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
+        contractVersion: "3.2.0", workspaceRevision: REVISION, activityCursor: 12, flowId: "flow-a", flowRevision: 4,
         workspace: "prepare", worker: { ready: true, recovering: false }, flowDirty: false, diagnostics: [],
         activePreparedId: "prepared-a", activeNodeId: "operation-a",
         selection: { prepareContext: { preparedId: "prepared-a" }, composeSelection: { nodeId: "operation-a" }, relationship: "independent-workspace-contexts" },
@@ -65,6 +65,10 @@ function createContext() {
         async getDataProfile(preparedId, columns) { calls.push(["profile", preparedId, columns]); return { columns: [{ name: "status" }] }; },
         async queryColumnValues(preparedId, column, search, options) { calls.push(["values", preparedId, column, search, options]); return { column, values: [{ value: "open", count: 4 }], matchCount: 1 }; },
         async getPreparePreview(preparedId, columns, options) { calls.push(["prepare-preview", preparedId, columns, options]); return { previewRowCount: 1, rows: [{ status: "open" }] }; },
+        async getCodingProject(projectId) { calls.push(["coding-project", projectId]); return { id: projectId ?? "coding-a", name: "Survey coding", revision: 2, codebookRevision: 1, progress: { pending: 0 } }; },
+        async getCodingProgress(projectId) { calls.push(["coding-progress", projectId]); return { id: projectId ?? "coding-a", revision: 2, codebookRevision: 1, progress: { pending: 0 } }; },
+        async getCodingBatch(projectId, options) { calls.push(["coding-batch", projectId, options]); return { items: [{ responseRef: "response-a", text: "redacted response" }] }; },
+        async submitCodingBatch(projectId, batchId, submissions, meta) { calls.push(["coding-submit", projectId, batchId, submissions, meta]); return result({ pendingReviewCount: submissions.length }); },
         async previewRecipeChange(preparedId, recipe, stepIndex, options) { calls.push(["recipe-preview", preparedId, recipe, stepIndex, options]); return { valid: true, output: { rowCount: 4, columnCount: 2 }, schemaDelta: {}, diagnostics: [], saved: false }; },
         async applyFilters(preparedId, filters, meta) { calls.push(["filters", preparedId, filters, meta]); return result({ rowCount: 10, filteredCount: Object.keys(filters).length ? 4 : 10 }); },
         async setAggregateColumns(preparedId, columns, meta) { calls.push(["aggregate-columns", preparedId, columns, meta]); return result({ aggregateColumns: columns, hiddenAggregateColumnCount: 2 - columns.length }); },
@@ -115,7 +119,7 @@ const ALL_TOOL_NAMES = [
   ...GLOBAL_TOOL_NAMES,
   "tabulaflow_select_prepared_dataset", "tabulaflow_get_recipe", "tabulaflow_get_semantic_model", "tabulaflow_update_semantic_field", "tabulaflow_list_metric_definitions", "tabulaflow_upsert_metric_definition", "tabulaflow_delete_metric_definition", "tabulaflow_replace_recipe", "tabulaflow_duplicate_prepared_dataset",
   "tabulaflow_get_prepare_dataset", "tabulaflow_get_data_profile", "tabulaflow_query_column_values",
-  "tabulaflow_get_prepare_preview", "tabulaflow_preview_recipe_change", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter",
+  "tabulaflow_get_prepare_preview", "tabulaflow_qualitative_coding", "tabulaflow_preview_recipe_change", "tabulaflow_set_aggregate_columns", "tabulaflow_set_preview_filter",
   "tabulaflow_remove_preview_filter", "tabulaflow_clear_preview_filters", "tabulaflow_export_prepare",
   "tabulaflow_add_recipe_step", "tabulaflow_request_delete_all_recipe_steps", "tabulaflow_update_recipe_step", "tabulaflow_set_recipe_step_enabled",
   "tabulaflow_move_recipe_step", "tabulaflow_undo_recipe", "tabulaflow_redo_recipe", "tabulaflow_apply_value_action",
@@ -131,7 +135,7 @@ test("WebMCP exposes contextual Agent-Ready v2 tools", () => {
   assert.deepEqual(createWebMcpTools(ref, { hasDataset: false, hasPrepared: false, hasComposeNodes: false }).map((tool) => tool.name), GLOBAL_TOOL_NAMES);
   const allTools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
   assert.deepEqual(allTools.map((tool) => tool.name), ALL_TOOL_NAMES);
-  assert.equal(new Set(ALL_TOOL_NAMES).size, 61);
+  assert.equal(new Set(ALL_TOOL_NAMES).size, 62);
 });
 
 test("WebMCP confirmation protocol is inspect-or-reject and never exposes agent confirmation", async () => {
@@ -143,6 +147,19 @@ test("WebMCP confirmation protocol is inspect-or-reject and never exposes agent 
   await toolByName(tools, "tabulaflow_reject_confirmation").execute({ confirmationId: "confirmation-a" });
   assert.ok(calls.some((call) => call[0] === "reject-confirmation" && call[1] === "confirmation-a"));
   assert.equal(tools.some((tool) => /confirm.*delet|resolve.*confirm/i.test(tool.name)), false);
+});
+
+test("qualitative coding WebMCP uses one bounded dispatcher and keeps approval human-only", async () => {
+  const { calls, ref } = createContext();
+  const tools = createWebMcpTools(ref, { hasDataset: true, hasPrepared: true, hasComposeNodes: true });
+  const coding = toolByName(tools, "tabulaflow_qualitative_coding");
+  const project = await coding.execute({ action: "get-project", projectId: "coding-a" });
+  assert.equal(project.structuredContent.name, "Survey coding");
+  const batch = await coding.execute({ action: "get-batch", projectId: "coding-a", offset: 0, limit: 10 });
+  assert.equal(batch.structuredContent.items[0].responseRef, "response-a");
+  await coding.execute({ action: "submit-batch", projectId: "coding-a", batchId: "batch-a", submissions: [{ responseRef: "response-a", codeIds: ["code-a"], evidence: "redacted response", confidence: 0.8 }], ...mutation("coding-request-a") });
+  assert.ok(calls.some((call) => call[0] === "coding-submit"));
+  assert.equal(coding.inputSchema.properties.action.enum.includes("approve"), false);
 });
 
 test("WebMCP registers a small permanent core and only the active workspace bundle", () => {
@@ -204,7 +221,7 @@ test("WebMCP read plane observes workflow, Prepare data, and Compose data", asyn
   await toolByName(tools, "tabulaflow_get_connection_options").execute({ nodeId: "prepared-a" });
 
   assert.equal(state.structuredContent.workspaceRevision, REVISION);
-  assert.equal(capabilities.structuredContent.contractVersion, "3.1.1");
+  assert.equal(capabilities.structuredContent.contractVersion, "3.2.0");
   assert.equal(calculationCatalog.structuredContent.expressionVersion, 1);
   assert.ok(calculationCatalog.structuredContent.functions.some((item) => item.name === "try_cast"));
   assert.equal(state.structuredContent.selection.relationship, "independent-workspace-contexts");

@@ -82,6 +82,21 @@ test("recovery reloads every file source, re-registers copies, then restores the
   assert.deepEqual(activate.payload.filters, { city: { key: "empty:", raw: null } });
 });
 
+test("recovery rematerializes generated reviewed coding rows", () => {
+  const rows = [{ response_id: "R001", code: "Communication" }];
+  const registry = rememberLoadedSource(createWorkerRegistry(), {
+    sourceId: "source-coding",
+    origin: "rows",
+    payload: { rows, filename: "Survey coding reviewed", identifiers: { sourceId: "source-coding", preparedId: "prepared-coding" } },
+    primaryPreparedId: "prepared-coding",
+    aggregateColumns: [],
+  });
+  const plan = buildRecoveryPlan(registry);
+  const materialize = plan.find((step) => step.type === "materialize-rows-prepared");
+  assert.deepEqual(materialize.payload.rows, rows);
+  assert.equal(materialize.payload.identifiers.preparedId, "prepared-coding");
+});
+
 test("forgetting the last prepared input of a source drops that source from recovery", () => {
   let registry = rememberLoadedSource(createWorkerRegistry(), {
     sourceId: "source-orders",

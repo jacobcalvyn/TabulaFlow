@@ -1180,6 +1180,10 @@ async function handleRequest(type, payload) {
     return { sourceColumns: collectSourceColumns(rows) };
   }
   if (type === "load-demo") return loadRows(makeDemoRows(), "penjualan_agustus.xlsx", payload);
+  if (type === "materialize-rows-prepared") {
+    const rows = normalizeEmptyValues(Array.isArray(payload.rows) ? payload.rows : []);
+    return loadRows(rows, payload.filename ?? "generated-data", payload.identifiers ?? {});
+  }
   if (type === "activate-prepared") return activatePrepared(payload.preparedId, payload.filters, payload.aggregateColumns);
   if (type === "register-prepared-copy") return registerPreparedCopy(payload.preparedId, payload.sourcePreparedId, payload.recipe);
   if (type === "unregister-prepared") return unregisterPrepared(payload.preparedId);

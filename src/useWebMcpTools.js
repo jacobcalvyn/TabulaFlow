@@ -27,6 +27,7 @@ const ACTION_TOOL_DEPENDENCIES = Object.freeze({
   "create-unary-operation": ["tabulaflow_create_compose_operation"],
   "connect-binary-operation": ["tabulaflow_create_compose_operation"],
   update: ["tabulaflow_update_compose_operation"],
+  "qualitative-coding": ["tabulaflow_qualitative_coding"],
 });
 
 function applyRuntimeHealthToActions(result, health) {
@@ -116,10 +117,42 @@ const COMPOSE_NODE_INPUT_SCHEMA = Object.freeze({
 
 const OPERATION_KINDS = ["append", "join", "difference", "aggregate", "filter-rows", "distinct-rows", "pivot", "unpivot"];
 const MUTATION_META = {
-  expectedRevision: { type: "integer", minimum: 0, description: "Latest workspace revision." },
-  requestId: { type: "string", minLength: 8, maxLength: 160, description: "Unique idempotency key." },
+  expectedRevision: { type: "integer", minimum: 0 },
+  requestId: { type: "string", minLength: 8, maxLength: 160 },
 };
-const MUTATION_EXECUTION_MODE = { type: "string", enum: ["wait", "async"], default: "async", description: "Long work defaults to async; poll operation status." };
+const MUTATION_EXECUTION_MODE = { type: "string", enum: ["wait", "async"], default: "async" };
+
+const CODING_SUBMISSION_SCHEMA = Object.freeze(strictObject({
+  responseRef: { type: "string", minLength: 1 },
+  codeIds: { type: "array", items: { type: "string", minLength: 1 }, uniqueItems: true },
+  evidence: { type: "string", minLength: 1, maxLength: 1000 },
+  confidence: { type: "number", minimum: 0, maximum: 1 },
+  uncertain: { type: "boolean", default: false },
+  rationale: { type: "string", maxLength: 280 },
+}, ["responseRef", "codeIds", "evidence", "confidence"]));
+
+const SUBMIT_CODING_BATCH_SCHEMA = Object.freeze(strictObject({
+  projectId: { type: "string", minLength: 1 },
+  batchId: { type: "string", minLength: 1 },
+  submissions: { type: "array", items: CODING_SUBMISSION_SCHEMA, minItems: 1, maxItems: 100 },
+  ...MUTATION_META,
+}, ["projectId", "batchId", "submissions", "expectedRevision", "requestId"]));
+
+const QUALITATIVE_CODING_SCHEMA = Object.freeze({
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["get-project", "get-batch", "submit-batch", "get-progress"] },
+    projectId: { type: "string", minLength: 1 },
+    batchId: { type: "string", minLength: 1 },
+    offset: { type: "integer", minimum: 0, default: 0 },
+    limit: { type: "integer", minimum: 1, maximum: 50, default: 25 },
+    submissions: SUBMIT_CODING_BATCH_SCHEMA.properties.submissions,
+    expectedRevision: MUTATION_META.expectedRevision,
+    requestId: MUTATION_META.requestId,
+  },
+  required: ["action"],
+  additionalProperties: false,
+});
 
 const VALUE_SCHEMA = {
   oneOf: [
@@ -478,6 +511,10 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     "inspect-compose-quality",
     "manage-reusable-metrics",
     "inspect-calculation-language",
+    "inspect-qualitative-codebook",
+    "read-approved-qualitative-batches",
+    "submit-qualitative-coding-suggestions",
+    "inspect-qualitative-review-progress",
   ],
   safeguards: {
     localFileSelection: "user-action-required",
@@ -488,6 +525,7 @@ const WEBMCP_CAPABILITIES = Object.freeze({
     recipeLiterals: "opaque-preserve-only",
     exports: "revision-and-idempotency-required",
     idempotency: "flow-scoped-and-persistent-across-reload",
+    qualitativeCoding: "human-codebook-and-human-review-required",
   },
 });
 
@@ -495,7 +533,7 @@ const WORKFLOW_GUIDE = Object.freeze({
   contractVersion: WEBMCP_CONTRACT_VERSION,
   flow: [
     { workspace: "source", purpose: "Open local or signed-in cloud files and maintain source references. Local selection and relinking require a user gesture." },
-    { workspace: "prepare", purpose: "Inspect one prepared dataset, apply temporary filters, and maintain its independent ordered recipe." },
+    { workspace: "prepare", purpose: "Inspect one prepared dataset, maintain its recipe, and review optional qualitative coding suggestions against a human-owned codebook." },
     { workspace: "compose", purpose: "Create a dependency graph across prepared datasets and operation results without mutating upstream inputs." },
   ],
   collaboration: {
@@ -504,6 +542,7 @@ const WORKFLOW_GUIDE = Object.freeze({
     visibility: "Every successful action updates the same visible state used by the user.",
     activity: "UI and WebMCP changes share one privacy-safe persistent ledger. Read it before continuing after user interaction.",
     userControlled: ["local file selection", "source relinking", "cloud upload file selection", "deletion confirmation"],
+    qualitativeCoding: "AI receives only time-bounded pseudonymized batches and can submit suggestions; only human-accepted assignments can be materialized for Compose.",
   },
 });
 
@@ -552,6 +591,7 @@ const WEBMCP_WORKSPACE_TOOL_NAMES = Object.freeze({
     "tabulaflow_get_data_profile",
     "tabulaflow_query_column_values",
     "tabulaflow_get_prepare_preview",
+    "tabulaflow_qualitative_coding",
     "tabulaflow_preview_recipe_change",
     "tabulaflow_set_aggregate_columns",
     "tabulaflow_set_preview_filter",
@@ -603,7 +643,7 @@ export function createWebMcpTools(contextRef, availability) {
   const tools = [{
     name: "tabulaflow_get_workspace_state",
     title: "Get TabulaFlow workspace state",
-    description: "Inspect the visible TabulaFlow workspace, active dataset or Compose node, temporary filters, and available dataset and operation IDs. Use this before choosing another TabulaFlow tool.",
+    description: "Inspect the visible workspace, active IDs, filters, data summary, diagnostics, and runtime health before acting.",
     inputSchema: EMPTY_INPUT_SCHEMA,
     annotations: { readOnlyHint: true, untrustedContentHint: true },
     execute() {
@@ -642,7 +682,7 @@ export function createWebMcpTools(contextRef, availability) {
   }, {
     name: "tabulaflow_get_calculation_catalog",
     title: "Get the Formula column language catalog",
-    description: "Read the complete safe Formula column syntax, allowlisted functions, cast types, examples, and expression contract version before drafting a calculated-field recipe step. Formula column is row-level and create-only in Prepare.",
+    description: "Read the safe row-level Formula column syntax, function allowlist, types, examples, and expression version.",
     inputSchema: EMPTY_INPUT_SCHEMA,
     annotations: { readOnlyHint: true },
     execute() {
@@ -693,7 +733,7 @@ export function createWebMcpTools(contextRef, availability) {
   }, {
     name: "tabulaflow_get_operation_status",
     title: "Get mutation operation status",
-    description: "Poll a long-running WebMCP mutation accepted with executionMode async. Returns accepted, running, committing, succeeded, cancelled, or failed with its final result or diagnostic.",
+    description: "Poll an async mutation for status, progress, terminal result, or safe diagnostic.",
     inputSchema: OPERATION_STATUS_SCHEMA,
     annotations: { readOnlyHint: true },
     async execute({ operationId }) {
@@ -704,7 +744,7 @@ export function createWebMcpTools(contextRef, availability) {
   }, {
     name: "tabulaflow_cancel_operation",
     title: "Cancel a pending TabulaFlow operation",
-    description: "Request cancellation of an accepted or running mutation before its commit boundary. Cancellation never reverses an operation that is already committing or terminal.",
+    description: "Cancel an accepted or running mutation before its commit boundary.",
     inputSchema: OPERATION_STATUS_SCHEMA,
     annotations: { readOnlyHint: false, destructiveHint: false },
     async execute({ operationId }) {
@@ -748,7 +788,7 @@ export function createWebMcpTools(contextRef, availability) {
   }, {
     name: "tabulaflow_request_source_file",
     title: "Choose a source file in TabulaFlow",
-    description: "Open Source and place keyboard focus on the file chooser. The user must choose the local file because WebMCP cannot read an arbitrary device file without a browser permission gesture.",
+    description: "Open Source and focus its file chooser. The user must choose the local file.",
     inputSchema: EMPTY_INPUT_SCHEMA,
     annotations: { readOnlyHint: false },
     async execute() {
@@ -770,7 +810,7 @@ export function createWebMcpTools(contextRef, availability) {
   }, {
     name: "tabulaflow_request_reset_all",
     title: "Request a complete flow reset",
-    description: "Open Source and show the visible Reset all confirmation. This requests deletion of every source, Prepare recipe, filter, and Compose node in the current flow, but never confirms the destructive action for the user.",
+    description: "Open the visible Reset all confirmation. AI requests but never confirms this destructive action.",
     inputSchema: RESET_ALL_SCHEMA,
     annotations: { readOnlyHint: false, destructiveHint: true },
     async execute({ expectedRevision, requestId }) {
@@ -852,7 +892,7 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_update_semantic_field",
       title: "Update semantic field metadata",
-      description: "Update one field's business role, unit, sensitivity, or allowed aggregations. WebMCP may only keep or tighten sensitivity; declassification remains a visible user action. Derived Compose nodes inherit the override through schema lineage.",
+      description: "Update field role, unit, sensitivity, or aggregations. AI cannot lower sensitivity.",
       inputSchema: UPDATE_SEMANTIC_FIELD_SCHEMA,
       annotations: { readOnlyHint: false },
       async execute({ targetId, fieldName, changes, expectedRevision, requestId }) {
@@ -896,7 +936,7 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_replace_recipe",
       title: "Replace a Prepare recipe atomically",
-      description: "Validate and commit one complete ordered recipe as a single mutation. Requires both current workspace and recipe revisions, so rapid agent edits cannot reorder or overwrite steps silently.",
+      description: "Validate and atomically commit a complete recipe using current workspace and recipe revisions.",
       inputSchema: REPLACE_RECIPE_SCHEMA,
       annotations: { readOnlyHint: false },
       async execute({ preparedId, recipe, expectedRecipeRevision, expectedRevision, requestId, executionMode = "async" }) {
@@ -935,7 +975,7 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_get_data_profile",
       title: "Profile prepared data",
-      description: "Read per-column missing, distinct, mixed-type, and conservative sensitivity metadata. Raw min/max values are returned only for heuristically non-sensitive typed measures.",
+      description: "Read missing, distinct, mixed-type, and conservative sensitivity metadata by column.",
       inputSchema: DATA_PROFILE_SCHEMA,
       annotations: { readOnlyHint: true, untrustedContentHint: true },
       async execute({ preparedId, columns }) {
@@ -966,9 +1006,39 @@ export function createWebMcpTools(contextRef, availability) {
         return webMcpResult(`Returned ${result.previewRowCount} prepared-data rows.`, result);
       },
     }, {
+      name: "tabulaflow_qualitative_coding",
+      title: "Work with qualitative coding",
+      description: "Read codebook, pseudonymized batches, or progress; submit suggestions. AI cannot approve them.",
+      inputSchema: QUALITATIVE_CODING_SCHEMA,
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
+      async execute({ action, projectId, batchId, offset = 0, limit = 25, submissions, expectedRevision, requestId }) {
+        const { actions } = activeContext(contextRef);
+        if (action === "get-project") {
+          const result = await actions.getCodingProject(projectId);
+          return webMcpResult(`Read qualitative coding project ${result.name}.`, result);
+        }
+        if (action === "get-progress") {
+          const result = await actions.getCodingProgress(projectId);
+          return webMcpResult("Read qualitative coding review progress.", { projectId: result.id, projectRevision: result.revision, codebookRevision: result.codebookRevision, progress: result.progress, workspaceRevision: result.workspaceRevision });
+        }
+        if (action === "get-batch") {
+          if (!projectId) throw Object.assign(new Error("projectId is required for get-batch."), { code: "INVALID_CODING_REQUEST" });
+          const result = await actions.getCodingBatch(projectId, { offset, limit });
+          return webMcpResult(`Returned ${result.items.length} pseudonymized responses for coding.`, result);
+        }
+        if (action === "submit-batch") {
+          if (!projectId || !batchId || !Array.isArray(submissions) || expectedRevision === undefined || !requestId) {
+            throw Object.assign(new Error("projectId, batchId, submissions, expectedRevision, and requestId are required for submit-batch."), { code: "INVALID_CODING_REQUEST" });
+          }
+          const result = await actions.submitCodingBatch(projectId, batchId, submissions, { expectedRevision, requestId });
+          return webMcpResult(`Submitted ${submissions.length} qualitative coding suggestions for human review.`, result);
+        }
+        throw Object.assign(new Error(`Unsupported qualitative coding action: ${action}`), { code: "INVALID_CODING_REQUEST" });
+      },
+    }, {
       name: "tabulaflow_preview_recipe_change",
       title: "Preview a complete recipe",
-      description: "Dry-run a complete ordered recipe without saving it. The default response contains only diagnostics, output counts, and schema delta; rows require explicit previewColumns and are limited to 20.",
+      description: "Dry-run a complete recipe. Returns diagnostics, counts, schema delta, and only explicitly requested bounded rows.",
       inputSchema: RECIPE_PREVIEW_SCHEMA,
       annotations: { readOnlyHint: true, untrustedContentHint: true },
       async execute({ preparedId, recipe, stepIndex, previewColumns, previewLimit = 10 }) {
@@ -990,7 +1060,7 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_set_preview_filter",
       title: "Filter the prepared-data preview",
-      description: "Set or replace one temporary value filter on the active Prepare preview. Filters on different columns use AND logic and are shown as removable chips in the UI.",
+      description: "Set or replace one visible temporary Prepare filter; columns combine with AND.",
       inputSchema: FILTER_MUTATION_SCHEMA,
       annotations: { readOnlyHint: false },
       async execute({ preparedId, column, value, expectedRevision, requestId }) {
@@ -1036,7 +1106,7 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_export_prepare",
       title: "Export the prepared dataset",
-      description: "Download the active Prepare result, including its current temporary filters, as CSV or Excel. Requires the latest workspace revision and an idempotency key so retries do not trigger duplicate downloads.",
+      description: "Export the filtered Prepare result as CSV or Excel with revision and idempotency guards.",
       inputSchema: PREPARE_EXPORT_V2_SCHEMA,
       annotations: { readOnlyHint: false },
       async execute({ preparedId, format, expectedRevision, requestId, executionMode = "async" }) {
@@ -1060,7 +1130,7 @@ export function createWebMcpTools(contextRef, availability) {
     }, {
       name: "tabulaflow_request_delete_all_recipe_steps",
       title: "Request deletion of all Prepare recipe steps",
-      description: "Open the visible Delete all confirmation for the active prepared dataset. This tool never confirms or deletes the recipe itself; the user must approve it in the Steps panel, and one Undo can restore the complete recipe.",
+      description: "Open visible Delete all confirmation for the active recipe. AI never confirms it; Undo can restore it.",
       inputSchema: DELETE_ALL_RECIPE_STEPS_SCHEMA,
       annotations: { readOnlyHint: false, destructiveHint: true },
       async execute({ preparedId, expectedRevision, requestId }) {
@@ -1309,7 +1379,7 @@ export function createWebMcpTools(contextRef, availability) {
     tools.push({
       name: "tabulaflow_request_delete",
       title: "Request deletion in TabulaFlow",
-      description: "Open the visible confirmation control for a recipe step, prepared dataset, Compose operation, or reusable metric definition. This tool never confirms or performs the deletion itself.",
+      description: "Open visible deletion confirmation for a recipe step, dataset, operation, or metric. AI never confirms it.",
       inputSchema: DELETE_REQUEST_SCHEMA,
       annotations: { readOnlyHint: false, destructiveHint: true },
       async execute({ target, targetId, expectedRevision, requestId }) {

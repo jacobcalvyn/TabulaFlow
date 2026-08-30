@@ -9,6 +9,7 @@ import {
   createFlowGraph,
   createPreparedInput,
   createPreparedFromCompose,
+  createPreparedFromGeneratedRows,
   duplicatePreparedInput,
   findMatchingFileSource,
   getAncestors,
@@ -25,6 +26,26 @@ import {
   updateNodePosition,
   validateFlowGraph,
 } from "../src/flowModel.js";
+
+test("new flows include persistent qualitative coding projects", () => {
+  const graph = createFlowGraph();
+  assert.equal(graph.schemaVersion, 3);
+  assert.deepEqual(graph.codingProjects, []);
+});
+
+test("accepted coding rows become an independent prepared dataset without changing selection", () => {
+  const graph = createFlowGraph();
+  const result = createPreparedFromGeneratedRows(graph, {
+    name: "Survey coding reviewed",
+    schema: [{ name: "response_id", type: "VARCHAR" }, { name: "code", type: "VARCHAR" }],
+    rowCount: 4,
+    codingProjectId: "coding-a",
+  });
+  assert.equal(result.graph.activeNodeId, graph.activeNodeId);
+  assert.equal(result.sourceAsset.location, "coding-result");
+  assert.equal(result.sourceAsset.codingProjectId, "coding-a");
+  assert.equal(result.preparedInput.rowCount, 4);
+});
 import {
   PREPARED_RECIPE_STATUS,
   recipeForExecution,

@@ -187,7 +187,7 @@ export function useDataWorker() {
 
   const request = useCallback(async (type, payload) => {
     if (recoveryRef.current) await recoveryRef.current;
-    const timeoutMs = type === "load-file" || type === "inspect-file" || type === "load-demo" || type === "materialize-compose-prepared" ? LOAD_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+    const timeoutMs = type === "load-file" || type === "inspect-file" || type === "load-demo" || type === "materialize-compose-prepared" || type === "materialize-rows-prepared" ? LOAD_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
     try {
       return await sendDirect(type, payload, { timeoutMs });
     } catch (error) {
@@ -277,6 +277,17 @@ export function useDataWorker() {
     }));
     return result;
   }, [request]);
+  const materializeRowsPrepared = useCallback(async (rows, filename, identifiers) => {
+    const result = await request("materialize-rows-prepared", { rows, filename, identifiers });
+    rememberStableState(rememberLoadedSource(stableStateRef.current, {
+      sourceId: result.sourceId,
+      origin: "rows",
+      payload: { rows, filename, identifiers },
+      primaryPreparedId: result.preparedId,
+      aggregateColumns: [],
+    }));
+    return result;
+  }, [request]);
   const applyRecipe = useCallback(async (recipe, filters = {}, aggregateColumns = [], preparedId = stableStateRef.current.activePreparedId) => {
     const result = await request("apply-recipe", { recipe, filters, aggregateColumns, preparedId });
     rememberStableState(rememberActivePrepared(stableStateRef.current, {
@@ -305,6 +316,7 @@ export function useDataWorker() {
     unregisterPrepared,
     resetWorkspace,
     materializeComposePrepared,
+    materializeRowsPrepared,
     filter,
     searchAggregate,
     searchAggregateForAgent,
@@ -318,5 +330,5 @@ export function useDataWorker() {
     composeNodeQuality,
     exportCompose,
     composeConnectionOptions,
-  }), [ready, recovering, progress, loadFile, inspectFile, loadDemo, activatePrepared, registerPreparedCopy, unregisterPrepared, resetWorkspace, materializeComposePrepared, filter, searchAggregate, searchAggregateForAgent, resolveAgentValue, previewPrepared, profileData, exportData, applyRecipe, previewRecipe, previewCompose, composeNodeQuality, exportCompose, composeConnectionOptions]);
+  }), [ready, recovering, progress, loadFile, inspectFile, loadDemo, activatePrepared, registerPreparedCopy, unregisterPrepared, resetWorkspace, materializeComposePrepared, materializeRowsPrepared, filter, searchAggregate, searchAggregateForAgent, resolveAgentValue, previewPrepared, profileData, exportData, applyRecipe, previewRecipe, previewCompose, composeNodeQuality, exportCompose, composeConnectionOptions]);
 }

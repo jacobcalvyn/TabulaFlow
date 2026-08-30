@@ -123,7 +123,7 @@ export function forgetPrepared(registry, preparedId) {
 }
 
 function loadTimeoutFor(type) {
-  return type === "load-file" || type === "load-demo" || type === "materialize-compose-prepared" || type === "initialize"
+  return type === "load-file" || type === "load-demo" || type === "materialize-compose-prepared" || type === "materialize-rows-prepared" || type === "initialize"
     ? "load"
     : "request";
 }
@@ -133,8 +133,10 @@ export function buildRecoveryPlan(registry) {
   const sources = [...registry.sources.values()];
   for (const source of sources.filter((item) => item.origin !== "compose")) {
     requests.push({
-      type: source.origin === "demo" ? "load-demo" : "load-file",
-      payload: { ...source.payload, sourceId: source.sourceId, preparedId: source.primaryPreparedId },
+      type: source.origin === "demo" ? "load-demo" : source.origin === "rows" ? "materialize-rows-prepared" : "load-file",
+      payload: source.origin === "rows"
+        ? { ...source.payload, identifiers: { ...source.payload.identifiers, sourceId: source.sourceId, preparedId: source.primaryPreparedId } }
+        : { ...source.payload, sourceId: source.sourceId, preparedId: source.primaryPreparedId },
       timeout: "load",
     });
   }

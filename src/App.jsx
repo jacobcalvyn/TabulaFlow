@@ -32,6 +32,21 @@ import { createWebMcpInteractionRegistry } from "./webMcpInteractions.js";
 import { composeNodeSummaryForAgent, paginateAgentSchema } from "./webMcpDto.js";
 import { StepsPanel, TransformationForm } from "./StepsPanel.jsx";
 import { FormulaColumnEditor } from "./FormulaColumnEditor.jsx";
+import { QualitativeCodingPanel } from "./QualitativeCodingPanel.jsx";
+import {
+  codingProjectForAgent,
+  createCodingBatch,
+  createCodingProject,
+  grantCodingAccess,
+  hashCodingText,
+  materializeAcceptedCodingRows,
+  normalizeCodingProject,
+  redactQualitativeText,
+  reviewCodingAssignment,
+  revokeCodingAccess,
+  submitCodingSuggestions,
+  updateCodingProject,
+} from "./qualitativeCoding.js";
 import { useRecipeHistory } from "./useRecipeHistory.js";
 import { fileFromDroppedItem, isSameFileEntry, pickSourceFile, restoreFileFromHandle } from "./sourceFileHandles.js";
 import {
@@ -82,6 +97,7 @@ import {
   createFlowGraph,
   createPreparedInput,
   createPreparedFromCompose,
+  createPreparedFromGeneratedRows,
   collectDescendantNodeIds,
   duplicatePreparedInput,
   findMatchingFileSource,
@@ -258,6 +274,12 @@ const ACTIVITY_LABEL_KEYS = Object.freeze({
   delete_confirmed: "activityDeleteConfirmed",
   prepared_deleted: "activityPreparedDeleted",
   compose_operation_deleted: "activityOperationDeleted",
+  coding_project_saved: "activityCodingProjectSaved",
+  coding_access_granted: "activityCodingAccessGranted",
+  coding_access_revoked: "activityCodingAccessRevoked",
+  coding_suggestions_submitted: "activityCodingSuggestionsSubmitted",
+  coding_assignment_reviewed: "activityCodingAssignmentReviewed",
+  coding_result_materialized: "activityCodingResultMaterialized",
 });
 
 function AccountScreen({ onOpenFile, uploadRequestToken, onUploadRequestShown, activityEvents, activityLoading, activityError }) {
@@ -1317,6 +1339,13 @@ function DataScreen({
   onRecipeRedo,
   onRecipePreview,
   onPreparedChange,
+  codingProject,
+  onSaveCodingProject,
+  onGrantCodingAccess,
+  onRevokeCodingAccess,
+  onReviewCodingAssignment,
+  onLoadCodingEvidence,
+  onMaterializeCodingProject,
   deleteRequest,
   onDeleteRequestShown,
   onDeleteConfirmation,
@@ -1343,6 +1372,9 @@ function DataScreen({
   const [formulaEditorOpen, setFormulaEditorOpen] = useState(false);
   const [formulaApplying, setFormulaApplying] = useState(false);
   const [formulaError, setFormulaError] = useState("");
+  const [codingPanelOpen, setCodingPanelOpen] = useState(false);
+  const [codingBusy, setCodingBusy] = useState(false);
+  const [codingError, setCodingError] = useState("");
   const splitRef = useRef(null);
   const preparedSelectorRef = useRef(null);
   const columnPickerRef = useRef(null);
@@ -1362,6 +1394,8 @@ function DataScreen({
     setColumnMenuOpen(false);
     setTransformPopover(null);
     setFormulaEditorOpen(false);
+    setCodingPanelOpen(false);
+    setCodingError("");
     setFormulaError("");
     setTransformError("");
     setAggregateColumns(dataset.aggregateColumns);
@@ -1803,6 +1837,55 @@ function DataScreen({
         document.body,
       )}
 
+      {codingPanelOpen && createPortal(
+        <QualitativeCodingPanel
+          project={codingProject}
+          preparedName={preparedName}
+          columns={dataset.columns}
+          totalResponses={dataset.rowCount}
+          busy={codingBusy}
+          error={codingError}
+          onClose={() => { if (!codingBusy) { setCodingPanelOpen(false); setCodingError(""); } }}
+          onSave={async (draft) => {
+            setCodingBusy(true);
+            setCodingError("");
+            try { await onSaveCodingProject(draft); }
+            catch (cause) { setCodingError(cause instanceof Error ? cause.message : t("codingSaveFailed")); }
+            finally { setCodingBusy(false); }
+          }}
+          onGrantAccess={async () => {
+            setCodingBusy(true);
+            setCodingError("");
+            try { await onGrantCodingAccess(); }
+            catch (cause) { setCodingError(cause instanceof Error ? cause.message : t("codingSaveFailed")); }
+            finally { setCodingBusy(false); }
+          }}
+          onRevokeAccess={async () => {
+            setCodingBusy(true);
+            setCodingError("");
+            try { await onRevokeCodingAccess(); }
+            catch (cause) { setCodingError(cause instanceof Error ? cause.message : t("codingSaveFailed")); }
+            finally { setCodingBusy(false); }
+          }}
+          onReview={async (assignmentId, decision) => {
+            setCodingBusy(true);
+            setCodingError("");
+            try { await onReviewCodingAssignment(assignmentId, decision); }
+            catch (cause) { setCodingError(cause instanceof Error ? cause.message : t("codingSaveFailed")); }
+            finally { setCodingBusy(false); }
+          }}
+          onLoadEvidence={onLoadCodingEvidence}
+          onMaterialize={async () => {
+            setCodingBusy(true);
+            setCodingError("");
+            try { await onMaterializeCodingProject(); }
+            catch (cause) { setCodingError(cause instanceof Error ? cause.message : t("codingMaterializeFailed")); }
+            finally { setCodingBusy(false); }
+          }}
+        />,
+        document.body,
+      )}
+
       {transformPopover && createPortal(
         <section
           ref={transformPopoverRef}
@@ -1861,9 +1944,13 @@ function DataScreen({
               <button ref={formulaTriggerRef} className="aggregate-heading__button aggregate-heading__button--formula" type="button" onClick={() => { setColumnMenuOpen(false); setTransformPopover(null); setPreparedMenuOpen(false); setFormulaError(""); setFormulaEditorOpen((current) => !current); }} disabled={loading || recipeApplying} aria-label={t("formulaColumn")} title={t("formulaColumn")} aria-expanded={formulaEditorOpen}>
                 <MagicWand weight="bold" /> {t("formulaColumn")}
               </button>
+              <button className="aggregate-heading__button" type="button" onClick={() => { setColumnMenuOpen(false); setTransformPopover(null); setPreparedMenuOpen(false); setFormulaEditorOpen(false); setFormulaError(""); setCodingError(""); setCodingPanelOpen(true); }} disabled={loading || recipeApplying} aria-label={t("qualitativeCoding")} title={t("qualitativeCoding")} aria-expanded={codingPanelOpen}>
+                <Robot weight="bold" /> {t("qualitativeCoding")}
+              </button>
               <div className="column-picker" ref={columnPickerRef}>
                 <button type="button" className="column-picker__trigger" onClick={() => {
                   setFormulaEditorOpen(false);
+                  setCodingPanelOpen(false);
                   setFormulaError("");
                   setColumnDraft(aggregateColumns);
                   setColumnQuery("");
@@ -2020,6 +2107,7 @@ export function App() {
   const activityEventsRef = useRef([]);
   const pendingDeleteConfirmationsRef = useRef(new Map());
   const pendingResetConfirmationRef = useRef(null);
+  const codingBatchesRef = useRef(new Map());
   const sourceInteractionsRef = useRef(null);
   if (!sourceInteractionsRef.current) sourceInteractionsRef.current = createWebMcpInteractionRegistry();
   const webMcpMutationRunnerRef = useRef(null);
@@ -2156,8 +2244,10 @@ export function App() {
         const stored = await loadStoredFlow();
         if (cancelled || !stored) return;
         const storedFlow = structuredClone(stored);
+        if (storedFlow.schemaVersion === 2) storedFlow.schemaVersion = 3;
         storedFlow.semanticModels ??= {};
         storedFlow.metricDefinitions ??= [];
+        storedFlow.codingProjects = (storedFlow.codingProjects ?? []).map(normalizeCodingProject);
         delete storedFlow.validationRules;
         delete storedFlow.validationRuns;
         delete storedFlow.analyses;
@@ -2325,6 +2415,29 @@ export function App() {
           nextFlow = {
             ...flowRef.current,
             sourceAssets: flowRef.current.sourceAssets.map((item) => item.id === source.id ? { ...item, status: "unlinked" } : item),
+          };
+          flowRef.current = nextFlow;
+          setFlow(nextFlow);
+        }
+      }
+      for (const source of nextFlow.sourceAssets.filter((item) => item.location === "coding-result")) {
+        const prepared = nextFlow.preparedInputs.find((item) => item.sourceAssetId === source.id);
+        const project = (nextFlow.codingProjects ?? []).find((item) => item.id === source.codingProjectId);
+        if (!prepared || !project) continue;
+        try {
+          const rows = materializeAcceptedCodingRows(project);
+          await worker.materializeRowsPrepared(rows, prepared.name, { sourceId: source.id, preparedId: prepared.id });
+          if (prepared.recipe?.length) await worker.applyRecipe(recipeForExecution(prepared, []), {}, prepared.schema.map((column) => column.name), prepared.id);
+          nextFlow = {
+            ...flowRef.current,
+            sourceAssets: flowRef.current.sourceAssets.map((item) => item.id === source.id ? { ...item, status: "linked" } : item),
+          };
+          flowRef.current = nextFlow;
+          setFlow(nextFlow);
+        } catch {
+          nextFlow = {
+            ...flowRef.current,
+            sourceAssets: flowRef.current.sourceAssets.map((item) => item.id === source.id ? { ...item, status: "error" } : item),
           };
           flowRef.current = nextFlow;
           setFlow(nextFlow);
@@ -2917,6 +3030,195 @@ export function App() {
     return result && typeof result === "object" ? { ...result, workspaceRevision: revision } : { result, workspaceRevision: revision };
   };
 
+  const findCodingProject = (projectId = null) => {
+    const projects = flowRef.current.codingProjects ?? [];
+    return projectId
+      ? projects.find((project) => project.id === projectId)
+      : projects.find((project) => project.preparedId === activePreparedIdRef.current);
+  };
+
+  const commitCodingProject = async (project, activity, context = undefined) => {
+    const graph = flowRef.current;
+    const existing = graph.codingProjects ?? [];
+    const codingProjects = existing.some((item) => item.id === project.id)
+      ? existing.map((item) => item.id === project.id ? project : item)
+      : [...existing, project];
+    const committed = await commitFlow({
+      ...graph,
+      codingProjects,
+      revision: graph.revision + 1,
+      updatedAt: new Date().toISOString(),
+    });
+    if (activity) await recordActivity(activity, context);
+    return committed.codingProjects.find((item) => item.id === project.id);
+  };
+
+  const saveCodingProject = async (draft) => {
+    const prepared = flowRef.current.preparedInputs.find((item) => item.id === activePreparedIdRef.current);
+    if (!prepared) throw new Error("Open a prepared dataset before creating a coding project.");
+    const available = new Set(prepared.schema.map((column) => column.name));
+    for (const column of [draft.responseIdColumn, draft.responseTextColumn, draft.questionColumn].filter(Boolean)) {
+      if (!available.has(column)) throw new Error(`Column not found: ${column}`);
+    }
+    if (draft.responseIdColumn === draft.responseTextColumn) throw new Error("Response ID and response text must use different columns.");
+    const validCodes = (draft.codes ?? []).filter((code) => code.label?.trim() && code.definition?.trim());
+    const current = findCodingProject();
+    const project = current
+      ? updateCodingProject(current, { ...draft, codes: validCodes })
+      : createCodingProject({ ...draft, codes: validCodes, preparedId: prepared.id });
+    return commitCodingProject(project, {
+      action: "coding_project_saved",
+      targetType: "coding-project",
+      targetId: project.id,
+      summary: { preparedId: prepared.id, codeCount: project.codes.length, codebookRevision: project.codebookRevision },
+    });
+  };
+
+  const grantActiveCodingAccess = async () => {
+    const current = findCodingProject();
+    if (!current) throw new Error("Save the coding project before granting AI access.");
+    const project = grantCodingAccess(current);
+    return commitCodingProject(project, {
+      action: "coding_access_granted",
+      targetType: "coding-project",
+      targetId: project.id,
+      summary: { expiresAt: project.accessGrant.expiresAt, purpose: project.accessGrant.purpose },
+    });
+  };
+
+  const revokeActiveCodingAccess = async () => {
+    const current = findCodingProject();
+    if (!current) throw new Error("Coding project not found.");
+    const project = revokeCodingAccess(current);
+    for (const [batchId, batch] of codingBatchesRef.current) {
+      if (batch.projectId === project.id) codingBatchesRef.current.delete(batchId);
+    }
+    return commitCodingProject(project, {
+      action: "coding_access_revoked",
+      targetType: "coding-project",
+      targetId: project.id,
+      summary: {},
+    });
+  };
+
+  const reviewActiveCodingAssignment = async (assignmentId, decision) => {
+    const current = findCodingProject();
+    if (!current) throw new Error("Coding project not found.");
+    const project = reviewCodingAssignment(current, assignmentId, decision);
+    return commitCodingProject(project, {
+      action: "coding_assignment_reviewed",
+      targetType: "coding-project",
+      targetId: project.id,
+      summary: { assignmentId, decision },
+    });
+  };
+
+  const loadCodingEvidence = useCallback(async (assignment) => {
+    const project = (flowRef.current.codingProjects ?? []).find((item) => item.preparedId === activePreparedIdRef.current);
+    if (!project || !assignment?.responseId) return null;
+    const selection = { key: `coding:${assignment.responseId}`, raw: assignment.responseId, label: assignment.responseId };
+    const page = await worker.previewPrepared(
+      { [project.responseIdColumn]: selection },
+      [project.responseTextColumn],
+      { offset: 0, limit: 1, agentMode: false },
+    );
+    const redacted = redactQualitativeText(page.preview?.[0]?.[project.responseTextColumn]);
+    const evidence = redacted.slice(assignment.evidenceStart, assignment.evidenceEnd);
+    return await hashCodingText(evidence) === assignment.evidenceHash ? evidence : null;
+  }, [worker]);
+
+  const materializeActiveCodingProject = async () => {
+    const current = findCodingProject();
+    if (!current) throw new Error("Coding project not found.");
+    const rows = materializeAcceptedCodingRows(current);
+    if (!rows.length) throw new Error("Accept at least one coding suggestion before creating a dataset.");
+    const schema = [
+      { name: "response_id", type: "VARCHAR" },
+      { name: "code_id", type: "VARCHAR" },
+      { name: "code", type: "VARCHAR" },
+      { name: "confidence", type: "DOUBLE" },
+      { name: "uncertain", type: "BOOLEAN" },
+      { name: "review_status", type: "VARCHAR" },
+      { name: "evidence_hash", type: "VARCHAR" },
+      { name: "coding_project_id", type: "VARCHAR" },
+      { name: "codebook_revision", type: "BIGINT" },
+    ];
+    const candidate = createPreparedFromGeneratedRows(flowRef.current, {
+      name: `${current.name} reviewed`,
+      schema,
+      rowCount: rows.length,
+      codingProjectId: current.id,
+    });
+    const materialized = await worker.materializeRowsPrepared(rows, candidate.preparedInput.name, {
+      sourceId: candidate.sourceAsset.id,
+      preparedId: candidate.preparedInput.id,
+    });
+    const refreshedProject = { ...current, materializedPreparedId: candidate.preparedInput.id, revision: current.revision + 1, updatedAt: new Date().toISOString() };
+    const nextGraph = {
+      ...candidate.graph,
+      codingProjects: (candidate.graph.codingProjects ?? []).map((item) => item.id === current.id ? refreshedProject : item),
+      sourceAssets: candidate.graph.sourceAssets.map((item) => item.id === candidate.sourceAsset.id
+        ? { ...item, sourceColumns: materialized.schema.map((column) => column.name), schemaFingerprint: schemaFingerprint(materialized.schema) }
+        : item),
+      preparedInputs: candidate.graph.preparedInputs.map((item) => item.id === candidate.preparedInput.id
+        ? { ...item, rowCount: materialized.rowCount, schema: materialized.schema.map((column) => ({ ...column })) }
+        : item),
+    };
+    await commitFlow(nextGraph);
+    await worker.activatePrepared(activePreparedIdRef.current, filtersRef.current, dataset?.aggregateColumns ?? []);
+    await recordActivity({
+      action: "coding_result_materialized",
+      targetType: "prepared",
+      targetId: candidate.preparedInput.id,
+      summary: { codingProjectId: current.id, rowCount: materialized.rowCount, columnCount: materialized.schema.length },
+    });
+    return { preparedInputId: candidate.preparedInput.id, rowCount: materialized.rowCount, columnCount: materialized.schema.length, selectionChanged: false };
+  };
+
+  const getCodingProjectFromTool = async (projectId = null) => {
+    const project = findCodingProject(projectId);
+    if (!project) throw Object.assign(new Error("Coding project not found for the active prepared dataset."), { code: "CODING_PROJECT_NOT_FOUND" });
+    const prepared = assertActivePreparedForTool(project.preparedId);
+    return { ...codingProjectForAgent(project, prepared.rowCount), workspaceRevision: workspaceRevisionRef.current };
+  };
+
+  const getCodingBatchFromTool = async (projectId, { offset = 0, limit = 25 } = {}) => {
+    const project = findCodingProject(projectId);
+    if (!project) throw Object.assign(new Error("Coding project not found."), { code: "CODING_PROJECT_NOT_FOUND" });
+    assertActivePreparedForTool(project.preparedId);
+    const columns = [project.responseIdColumn, project.responseTextColumn, project.questionColumn].filter(Boolean);
+    const page = await runWebMcpRead(() => worker.previewPrepared({}, columns, { offset, limit: Math.min(50, limit), agentMode: false }));
+    const batch = await createCodingBatch(project, page.preview, { limit: Math.min(50, limit) });
+    codingBatchesRef.current.set(batch.batchId, batch);
+    return {
+      batchId: batch.batchId,
+      projectId: batch.projectId,
+      codebookRevision: batch.codebookRevision,
+      expiresAt: batch.expiresAt,
+      offset: page.offset,
+      totalResponses: page.totalRowCount,
+      items: batch.items.map(({ responseRef, text, question, textHash }) => ({ responseRef, text, question, textHash })),
+      workspaceRevision: workspaceRevisionRef.current,
+    };
+  };
+
+  const submitCodingBatchFromTool = async (projectId, batchId, submissions, meta) => runWebMcpMutation(meta, async (assertCurrent) => {
+    const project = findCodingProject(projectId);
+    const batch = codingBatchesRef.current.get(batchId);
+    if (!project || !batch) throw Object.assign(new Error("Coding batch was not found or has expired."), { code: "CODING_BATCH_NOT_FOUND" });
+    assertActivePreparedForTool(project.preparedId);
+    const updated = await submitCodingSuggestions(project, batch, submissions, { agent: "webmcp" });
+    assertCurrent();
+    await commitCodingProject(updated, {
+      action: "coding_suggestions_submitted",
+      targetType: "coding-project",
+      targetId: updated.id,
+      summary: { batchId, suggestionCount: updated.assignments.length - project.assignments.length },
+    }, webMcpActivity(meta));
+    codingBatchesRef.current.delete(batchId);
+    return { projectId: updated.id, projectRevision: updated.revision, pendingReviewCount: updated.assignments.filter((item) => item.status === "pending-review").length, workspaceRevision: workspaceRevisionRef.current };
+  }, `coding:submit:${projectId}:${batchId}`);
+
   const autoArrangeComposeFromTool = async (meta) => runWebMcpMutation(meta, async (assertCurrent) => {
     setScreen("compose");
     const graph = await autoArrangeComposeNodes(assertCurrent, webMcpActivity(meta));
@@ -3209,7 +3511,7 @@ export function App() {
   const getAvailableActionsFromTool = async (targetId) => {
     if (!targetId) {
       const workspace = screen === "input" ? "source" : screen === "data" ? "prepare" : screen;
-      const actions = screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", ...(recipeHistory.recipe.length ? ["request-delete-all-recipe-steps"] : []), "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", ...(flowRef.current.sourceAssets.length ? ["request-reset-all"] : []), "inspect-activity"];
+      const actions = screen === "data" ? ["inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", "qualitative-coding", ...(recipeHistory.recipe.length ? ["request-delete-all-recipe-steps"] : []), "export", "inspect-activity"] : screen === "compose" ? ["inspect-graph", "select-node", "get-connection-options", "validate-operation", "create-operation", "auto-arrange", "inspect-activity"] : screen === "account" ? ["list-cloud-files", "open-cloud-file", "request-cloud-upload", "inspect-activity"] : ["request-source-file", "request-source-relink", ...(flowRef.current.sourceAssets.length ? ["request-reset-all"] : []), "inspect-activity"];
       const hasUnlinkedSource = flowRef.current.sourceAssets.some((source) => isFlowFileSource(source) && source.status === "unlinked");
       return {
         workspace,
@@ -3232,7 +3534,7 @@ export function App() {
       };
     }
     const prepared = flowRef.current.preparedInputs.find((item) => item.id === targetId);
-    if (prepared) return { targetId, kind: "dataset", actions: ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", ...((prepared.recipe?.length ?? 0) > 0 ? ["request-delete-all-recipe-steps"] : []), "export", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
+    if (prepared) return { targetId, kind: "dataset", actions: ["open-prepare", "duplicate", "inspect", "query-column-values", "set-aggregate-columns", "filter", "recipe", "formula-column", "qualitative-coding", ...((prepared.recipe?.length ?? 0) > 0 ? ["request-delete-all-recipe-steps"] : []), "export", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
     const operation = flowRef.current.composeNodes.find((item) => item.id === targetId);
     if (operation) return { targetId, kind: operation.kind, actions: ["inspect", "preview", "update", "export", "promote-result", "create-unary-operation", "connect-binary-operation", "request-delete"], workspaceRevision: workspaceRevisionRef.current };
     throw new Error(`Target not found: ${targetId}`);
@@ -3658,7 +3960,7 @@ export function App() {
 
   useWebMcpTools({
     state: {
-      contractVersion: "3.1.1",
+      contractVersion: "3.2.0",
       workspaceRevision,
       flowId: flow.id,
       flowRevision: flow.revision,
@@ -3714,6 +4016,10 @@ export function App() {
         ...flow.composeNodes.map((item) => ({ id: item.id, name: item.name, kind: item.kind, inputIds: [...item.inputIds], totalRowCount: item.rowCount, columnCount: item.schema?.length ?? null, validationStatus: item.validationStatus ?? null, dataStatus: item.dataStatus ?? "ready" })),
       ],
       metricDefinitions: (flow.metricDefinitions ?? []).map((item) => ({ id: item.id, name: item.name, targetId: item.targetId })),
+      codingProjects: (flow.codingProjects ?? []).map((project) => codingProjectForAgent(
+        project,
+        flow.preparedInputs.find((item) => item.id === project.preparedId)?.rowCount ?? null,
+      )),
       sourceAssets: flow.sourceAssets.map((item) => ({ id: item.id, name: item.name, location: item.location, status: item.status, size: item.size ?? null })),
     },
     actions: {
@@ -3740,6 +4046,10 @@ export function App() {
       getDataProfile: getDataProfileFromTool,
       queryColumnValues: queryColumnValuesFromTool,
       getPreparePreview: getPreparePreviewFromTool,
+      getCodingProject: getCodingProjectFromTool,
+      getCodingBatch: getCodingBatchFromTool,
+      submitCodingBatch: submitCodingBatchFromTool,
+      getCodingProgress: getCodingProjectFromTool,
       previewRecipeChange: previewRecipeChangeFromTool,
       applyFilters: applyFiltersFromTool,
       setAggregateColumns: setAggregateColumnsFromTool,
@@ -3859,6 +4169,13 @@ export function App() {
           onRecipeRedo={redoRecipe}
           onRecipePreview={previewRecipe}
           onPreparedChange={openPrepared}
+          codingProject={(flow.codingProjects ?? []).find((project) => project.preparedId === activePreparedId) ?? null}
+          onSaveCodingProject={saveCodingProject}
+          onGrantCodingAccess={grantActiveCodingAccess}
+          onRevokeCodingAccess={revokeActiveCodingAccess}
+          onReviewCodingAssignment={reviewActiveCodingAssignment}
+          onLoadCodingEvidence={loadCodingEvidence}
+          onMaterializeCodingProject={materializeActiveCodingProject}
           deleteRequest={["recipe-step", "prepare-recipe"].includes(webMcpDeleteRequest?.target) ? webMcpDeleteRequest : null}
           onDeleteRequestShown={acknowledgeDeleteRequest}
           onDeleteConfirmation={resolveDeleteConfirmation}

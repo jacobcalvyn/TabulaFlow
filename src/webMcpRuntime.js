@@ -1,9 +1,9 @@
-export const WEBMCP_CONTRACT_VERSION = "3.1.1";
+export const WEBMCP_CONTRACT_VERSION = "3.2.0";
 
 export const WEBMCP_REGISTRATION_BUDGET = Object.freeze({
   maxToolCount: 48,
-  // 70% of the strictest 50 KB host configuration observed by the QC harness.
-  maxSchemaBytes: 35_000,
+  // Keep every active catalog under the measured 32 KiB application-schema ceiling.
+  maxSchemaBytes: 32_768,
   maxPropertyCount: 420,
   maxSchemaDepth: 18,
 });
